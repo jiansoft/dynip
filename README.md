@@ -176,18 +176,22 @@ When `ddns.redis.enabled = false`:
 AFRAID_ENABLED=true
 AFRAID_URL=https://freedns.afraid.org
 AFRAID_PATH=/dynamic/update.php?
-AFRAID_TOKEN=your-afraid-token
+AFRAID_TOKEN=<set-in-env>
 
 DYNU_ENABLED=true
 DYNU_URL=https://api.dynu.com/nic/update
-DYNU_USERNAME=your-dynu-username
-DYNU_PASSWORD=your-dynu-password
+DYNU_USERNAME=<set-in-env>
+DYNU_PASSWORD=<set-in-env>
 
 NOIP_ENABLED=true
 NOIP_URL=https://dynupdate.no-ip.com/nic/update
-NOIP_USERNAME=your-noip-username
-NOIP_PASSWORD=your-noip-password
+NOIP_USERNAME=<set-in-env>
+NOIP_PASSWORD=<set-in-env>
 NOIP_HOSTNAMES=["example.ddns.net","example.zapto.org"]
+
+REDIS_ADDR=127.0.0.1:6379
+REDIS_ACCOUNT=<optional>
+REDIS_PASSWORD=<set-if-needed>
 
 REDIS_ENABLED=false
 DDNS_REFRESH_INTERVAL_SECONDS=60

@@ -564,20 +564,20 @@ test "dotenv text overrides config values" {
     const dotenv_text =
         \\# comment
         \\AFRAID_ENABLED=false
-        \\AFRAID_TOKEN=dotenv-afraid-token
+        \\AFRAID_TOKEN=example-afraid-token
         \\DYNU_ENABLED=1
         \\DYNU_URL=https://dynu.example.com/nic/update
-        \\DYNU_USERNAME=dotenv-user
-        \\DYNU_PASSWORD=dotenv-pass
+        \\DYNU_USERNAME=example-dynu-user
+        \\DYNU_PASSWORD=example-dynu-secret
         \\NOIP_ENABLED=off
         \\NOIP_URL=https://noip.example.com/nic/update
-        \\NOIP_USERNAME=dotenv-noip-user
-        \\NOIP_PASSWORD=dotenv-noip-pass
+        \\NOIP_USERNAME=example-noip-user
+        \\NOIP_PASSWORD=example-noip-secret
         \\NOIP_HOSTNAMES=["a.ddns.net","b.zapto.org"]
         \\REDIS_ENABLED=false
         \\REDIS_ADDR=127.0.0.1:6379
-        \\REDIS_ACCOUNT=dotenv-redis-user
-        \\REDIS_PASSWORD=dotenv-redis-password
+        \\REDIS_ACCOUNT=example-redis-user
+        \\REDIS_PASSWORD=example-redis-secret
         \\REDIS_DB=5
         \\DDNS_DEDUPE_TTL_SECONDS=86400
         \\DDNS_REFRESH_INTERVAL_SECONDS=90
@@ -587,18 +587,18 @@ test "dotenv text overrides config values" {
 
     // 最後逐項確認：每個 key 都有落到正確欄位。
     try std.testing.expect(!config.afraid.enabled);
-    try std.testing.expectEqualStrings("dotenv-afraid-token", config.afraid.token);
+    try std.testing.expectEqualStrings("example-afraid-token", config.afraid.token);
     try std.testing.expect(config.dyny.enabled);
     try std.testing.expectEqualStrings("https://dynu.example.com/nic/update", config.dyny.url);
-    try std.testing.expectEqualStrings("dotenv-user", config.dyny.username);
+    try std.testing.expectEqualStrings("example-dynu-user", config.dyny.username);
     try std.testing.expect(!config.noip.enabled);
     try std.testing.expectEqualStrings("https://noip.example.com/nic/update", config.noip.url);
-    try std.testing.expectEqualStrings("dotenv-noip-user", config.noip.username);
+    try std.testing.expectEqualStrings("example-noip-user", config.noip.username);
     try std.testing.expectEqual(@as(usize, 2), config.noip.hostnames.len);
     try std.testing.expect(!config.ddns.redis.enabled);
     try std.testing.expectEqualStrings("127.0.0.1:6379", config.ddns.redis.addr);
-    try std.testing.expectEqualStrings("dotenv-redis-user", config.ddns.redis.account);
-    try std.testing.expectEqualStrings("dotenv-redis-password", config.ddns.redis.password);
+    try std.testing.expectEqualStrings("example-redis-user", config.ddns.redis.account);
+    try std.testing.expectEqualStrings("example-redis-secret", config.ddns.redis.password);
     try std.testing.expectEqual(@as(u32, 5), config.ddns.redis.db);
     try std.testing.expectEqual(@as(u64, 86400), config.ddns.dedupe_ttl_seconds);
     try std.testing.expectEqual(@as(u64, 90), config.ddns.refresh_interval_seconds);
