@@ -251,7 +251,6 @@ dynip service --config app.json
 
 - 每日依等級分檔
 - 換日 rollover
-- 單檔超過 `10 MB` 會切 generation suffix
 - 自動清除超過 `7` 天的舊日誌
 - service 啟動時輸出實際載入的設定 JSON
 - 記錄各 DDNS 供應商回應摘要

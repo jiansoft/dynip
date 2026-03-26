@@ -3,7 +3,6 @@
 //! 這份 Zig 版主要移植 Rust 專案 logging 的核心能力：
 //! - 依等級分流到不同檔案：info / warn / error / debug
 //! - 依日期切換檔名
-//! - 單檔超過大小時，使用 generation 檔名輪替
 //! - 清理超過保留天數的舊日誌
 //! - 透過 `std_options.logFn` 接管 `std.log`
 
@@ -43,10 +42,6 @@ pub const default_log_dir = "log";
 /// `2026-03-25_dynip_info.log`
 pub const default_log_name = "dynip";
 
-/// 單一日誌檔的最大大小，單位是 byte。
-///
-/// 這裡設成 10 MB。超過就切到下一個 generation 檔。
-const default_max_size: u64 = 10 * 1024 * 1024;
 /// 舊日誌保留天數。
 ///
 /// 超過這個天數的舊檔會被清掉。
@@ -108,8 +103,6 @@ const Rotate = struct {
     current_month: u8 = 0,
     /// 目前打開的檔案屬於哪一天。
     current_day: u8 = 0,
-    /// 同一天內，如果檔案太大，就往 `.1.log`、`.2.log` 增加 generation。
-    generation: u32 = 0,
     /// 目前這個檔案已經寫了多少 byte。
     current_size: u64 = 0,
     /// 目前真正打開中的檔案 handle。
@@ -152,14 +145,6 @@ const Rotate = struct {
         var line_buffer: [8192]u8 = undefined;
         const line = try formatLogLine(&line_buffer, now, level, scope_name, message);
 
-        // 如果這筆 log 再寫下去就會超過上限，
-        // 那就把 generation 加一，並重新打開下一個檔案。
-        if (self.current_size + line.len > default_max_size) {
-            self.generation += 1;
-            self.current_size = 0;
-            try self.openCurrentFile(io, now);
-        }
-
         // 取出目前打開中的檔案。
         const file = self.file orelse return error.LoggerFileNotOpen;
         // 以串流方式把整行文字完整寫入。
@@ -183,8 +168,6 @@ const Rotate = struct {
             self.current_year = now.year;
             self.current_month = now.month;
             self.current_day = now.day;
-            // 換日後 generation 從 0 重新開始。
-            self.generation = 0;
             // 新檔案的大小也要重新計算。
             self.current_size = 0;
             // 打開今天對應的檔案。
@@ -194,7 +177,7 @@ const Rotate = struct {
         }
     }
 
-    /// 打開目前 generation 對應的日誌檔。
+    /// 打開目前日期對應的日誌檔。
     fn openCurrentFile(self: *Rotate, io: std.Io, now: LocalDateTime) !void {
         // 先把之前可能打開的檔案關掉，避免檔案 handle 泄漏。
         self.deinit(io);
@@ -225,26 +208,17 @@ const Rotate = struct {
         self.current_size = existing_size;
     }
 
-    /// 根據日期、等級與 generation 組出檔名。
+    /// 根據日期與等級組出檔名。
     fn buildCurrentPath(self: *Rotate, now: LocalDateTime) ![]const u8 {
         // `bufPrint` 的整數格式化比較習慣用 unsigned，
         // 所以先把 year 轉成 `u32`。
         const year: u32 = @intCast(now.year);
 
-        // generation = 0 時，用最基本的檔名。
-        return if (self.generation == 0)
-            std.fmt.bufPrint(
-                &self.path_buffer,
-                "{s}/{d:0>4}-{d:0>2}-{d:0>2}_{s}_{s}.log",
-                .{ default_log_dir, year, now.month, now.day, default_log_name, self.level_name },
-            )
-            // generation > 0 時，在副檔名之前加上 `.數字`。
-        else
-            std.fmt.bufPrint(
-                &self.path_buffer,
-                "{s}/{d:0>4}-{d:0>2}-{d:0>2}_{s}_{s}.{d}.log",
-                .{ default_log_dir, year, now.month, now.day, default_log_name, self.level_name, self.generation },
-            );
+        return std.fmt.bufPrint(
+            &self.path_buffer,
+            "{s}/{d:0>4}-{d:0>2}-{d:0>2}_{s}_{s}.log",
+            .{ default_log_dir, year, now.month, now.day, default_log_name, self.level_name },
+        );
     }
 
     /// 清掉超過保留天數的舊日誌。
@@ -521,10 +495,7 @@ fn localNow() !LocalDateTime {
     }
 }
 
-test "build file name uses generation suffix" {
-    // 這個測試用來確認：
-    // - generation = 0 時，檔名沒有 `.數字`
-    // - generation > 0 時，檔名會多出 `.數字`
+test "build file name uses one file per day" {
     var rotate = Rotate.init("info");
     const now = LocalDateTime{
         .unix_seconds = 0,
@@ -536,17 +507,8 @@ test "build file name uses generation suffix" {
         .second = 0,
     };
 
-    // 先測試最基本的檔名格式。
-    rotate.generation = 0;
     try std.testing.expectEqualStrings(
         "log/2026-03-25_dynip_info.log",
-        try rotate.buildCurrentPath(now),
-    );
-
-    // 再測試 generation 版檔名格式。
-    rotate.generation = 2;
-    try std.testing.expectEqualStrings(
-        "log/2026-03-25_dynip_info.2.log",
         try rotate.buildCurrentPath(now),
     );
 }

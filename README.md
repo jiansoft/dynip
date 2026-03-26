@@ -251,7 +251,6 @@ Current logging behavior includes:
 
 - one log file per level per day
 - daily rollover
-- generation suffixes after `10 MB`
 - cleanup for logs older than `7` days
 - formatted dump of the loaded runtime config on service startup
 - provider response summaries
