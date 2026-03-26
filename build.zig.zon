@@ -1,0 +1,32 @@
+.{
+    // `.name` 是這個 Zig package 自己的名稱。
+    // 這裡填的是 `dynip`，也就是目前專案主要對外使用的名字。
+    .name = .dynip,
+
+    // `.version` 是這份 package manifest 自己宣告的版本字串。
+    // 這裡目前沿用這個專案建立時使用的 Zig 版本字樣。
+    .version = "0.16.0-dev.2979+e93834410",
+
+    // `.dependencies` 用來列出這個專案依賴的其他 package。
+    // 如果專案沒有任何第三方依賴，這裡就可以是空的。
+    .dependencies = .{
+        // `.okredis` 是這個 dependency 在本專案裡使用的名稱。
+        // 後面 `build.zig` 會透過這個名字去抓依賴。
+        .okredis = .{
+            // `.path` 代表這個依賴不是從網路下載，
+            // 而是直接使用專案裡的本地資料夾。
+            // 目前我們把 okredis 放在 `vendor/okredis`。
+            .path = "vendor/okredis",
+        },
+    },
+
+    // `.paths` 用來告訴 Zig：
+    // 這個 package 哪些檔案與資料夾算是「屬於這個 package 的內容」。
+    //
+    // `""` 代表整個專案根目錄。
+    .paths = .{""},
+
+    // `.fingerprint` 是這份 `build.zig.zon` 的指紋值。
+    // 只要這個檔案內容改變，Zig 可能就會要求你更新這個值。
+    .fingerprint = 0x1ad48e7ec64baf0e,
+}

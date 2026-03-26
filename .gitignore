@@ -1,0 +1,14 @@
+# Zig build cache and output directories.
+.zig-cache/
+zig-cache/
+zig-out/
+zig-pkg/
+
+# Project-local runtime and deployment outputs.
+bin/
+log/
+.idea/
+
+# Local environment file.
+.env
+

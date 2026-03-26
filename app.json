@@ -1,0 +1,32 @@
+{
+  "afraid": {
+    "enabled": true,
+    "url": "https://freedns.afraid.org",
+    "path": "/dynamic/update.php?",
+    "token": ""
+  },
+  "dyny": {
+    "enabled": true,
+    "url": "https://api.dynu.com/nic/update",
+    "username": "",
+    "password": ""
+  },
+  "noip": {
+    "enabled": true,
+    "url": "https://dynupdate.no-ip.com/nic/update",
+    "username": "",
+    "password": "",
+    "hostnames": []
+  },
+  "ddns": {
+    "refresh_interval_seconds": 60,
+    "dedupe_ttl_seconds": 86400,
+    "redis": {
+      "enabled": false,
+      "addr": "localhost:6379",
+      "account": "",
+      "password": "",
+      "db": 0
+    }
+  }
+}
