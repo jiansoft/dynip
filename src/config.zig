@@ -27,7 +27,7 @@ pub const AppConfig = struct {
     dyny: Dynu = .{},
     /// No-IP 相關設定。
     noip: NoIp = .{},
-    /// DDNS service 自己的執行設定。
+    /// DDNS 服務本身的執行設定。
     ddns: Ddns = .{},
 };
 
@@ -36,7 +36,7 @@ pub const Afraid = struct {
     /// 是否啟用 Afraid 更新。
     ///
     /// 設成 `false` 時，就算 IP 真的改變，
-    /// 這輪 refresh 也不會去打 Afraid API。
+    /// 這輪更新也不會去打 Afraid API。
     enabled: bool = true,
     /// Afraid API 的基底網址。
     url: []const u8 = "https://freedns.afraid.org",
@@ -72,13 +72,13 @@ pub const NoIp = struct {
     hostnames: []const []const u8 = &.{},
 };
 
-/// Redis 去重設定。
+/// Redis 防重複更新設定。
 ///
 /// Zig 版現在改成真的連 Redis，不再用本地 `.ddns_state.json` 模擬。
 pub const Redis = struct {
-    /// 是否啟用 Redis 去重。
+    /// 是否啟用 Redis 防重複更新。
     ///
-    /// 設成 `false` 時，DDNS 會退回成本機記憶體去重。
+    /// 設成 `false` 時，DDNS 會退回成本機記憶體防重複更新。
     enabled: bool = true,
     /// Redis 位址，格式通常是 `host:port`。
     addr: []const u8 = "localhost:6379",
@@ -92,9 +92,9 @@ pub const Redis = struct {
 
 /// Zig 版額外補的 DDNS 執行設定。
 pub const Ddns = struct {
-    /// 每輪 refresh 之間要等幾秒。
+    /// 每輪更新之間要等幾秒。
     refresh_interval_seconds: u64 = 60,
-    /// Redis 去重 key 的 TTL 秒數。
+    /// Redis 防重複更新 key 的 TTL 秒數。
     dedupe_ttl_seconds: u64 = 60 * 60 * 24,
     /// Redis 連線設定。
     redis: Redis = .{},
@@ -131,7 +131,7 @@ pub fn loadLeaky(
 
     // 然後套用 `.env` 裡的值。
     try applyDotEnvFileOverridesLeaky(allocator, io, &config, default_dotenv_path);
-    // 最後再用目前 process 的環境變數覆蓋一次。
+    // 最後再用目前執行環境的環境變數覆蓋一次。
     // 這樣環境變數的優先權最高。
     try applyProcessEnvOverridesLeaky(allocator, &config);
     // 回傳最後生效的設定。
@@ -152,7 +152,7 @@ pub fn loadLeaky(
 ///   而是交給外面的 allocator 一次回收。
 ///
 /// 這個專案很適合用 `Leaky`，因為設定通常只在啟動時載入一次，
-/// 然後整個 service 生命週期都會一直使用它。
+/// 然後整個服務生命週期都會一直使用它。
 ///
 /// 如果你改用 `std.json.parseFromSlice(...)`，
 /// 它會回傳一個需要 `deinit()` 的包裝物件，比較適合短生命週期資料。
@@ -181,7 +181,7 @@ fn applyDotEnvFileOverridesLeaky(
         else => return err,
     };
 
-    // 如果專案根目錄沒有 `.env`，就直接略過，不當成錯誤。
+    // 如果專案根目錄沒有 `.env`，就直接跳過，不當成錯誤。
     const text = dotenv_text orelse return;
 
     // 真正逐行解析 `.env` 的工作，交給下一層函式。
@@ -245,7 +245,7 @@ fn unquoteDotEnvValue(value: []const u8) []const u8 {
     return value;
 }
 
-/// 套用目前 process 的環境變數覆寫。
+/// 套用目前執行環境的環境變數覆寫。
 fn applyProcessEnvOverridesLeaky(allocator: std.mem.Allocator, config: *AppConfig) !void {
     // 這一層是讀作業系統真的存在的環境變數，
     // 例如你在 shell 裡先 `export AFRAID_TOKEN=...` 那種。
@@ -361,7 +361,7 @@ fn applyOverrideValueLeaky(
     }
 
     if (std.mem.eql(u8, key, "DYNU_URL")) {
-        // Dynu API base URL。
+        // Dynu API 基底網址。
         config.dyny.url = value;
         return;
     }
@@ -385,7 +385,7 @@ fn applyOverrideValueLeaky(
     }
 
     if (std.mem.eql(u8, key, "NOIP_URL")) {
-        // No-IP API base URL。
+        // No-IP API 基底網址。
         config.noip.url = value;
         return;
     }
@@ -417,7 +417,7 @@ fn applyOverrideValueLeaky(
     }
 
     if (std.mem.eql(u8, key, "REDIS_ENABLED")) {
-        // `REDIS_ENABLED` 用來控制是否使用 Redis 去重。
+        // `REDIS_ENABLED` 用來控制是否使用 Redis 防重複更新。
         config.ddns.redis.enabled = parseBoolOrKeep(value, config.ddns.redis.enabled);
         return;
     }
@@ -442,14 +442,14 @@ fn applyOverrideValueLeaky(
     }
 
     if (std.mem.eql(u8, key, "DDNS_REFRESH_INTERVAL_SECONDS")) {
-        // 把 service refresh 間隔秒數轉成數字。
+        // 把服務更新間隔秒數轉成數字。
         config.ddns.refresh_interval_seconds =
             std.fmt.parseUnsigned(u64, value, 10) catch config.ddns.refresh_interval_seconds;
         return;
     }
 
     if (std.mem.eql(u8, key, "DDNS_DEDUPE_TTL_SECONDS")) {
-        // 把 Redis 去重 TTL 秒數轉成數字。
+        // 把 Redis 防重複更新 TTL 秒數轉成數字。
         config.ddns.dedupe_ttl_seconds =
             std.fmt.parseUnsigned(u64, value, 10) catch config.ddns.dedupe_ttl_seconds;
         return;

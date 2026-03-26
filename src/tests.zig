@@ -12,7 +12,7 @@ test {
     _ = @import("logging.zig");
     // 這一行讓 logging 相關測試被收進來。
     _ = @import("redis.zig");
-    // 這一行讓 redis client 相關測試被收進來。
+    // 這一行讓 Redis 客戶端相關測試被收進來。
     _ = @import("scheduler.zig");
     // 這一行讓 scheduler 相關測試被收進來。
 }

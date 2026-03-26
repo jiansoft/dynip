@@ -13,7 +13,7 @@ const std = @import("std");
 const config = @import("config.zig");
 /// 匯入日誌模組。
 ///
-/// 用來接管 `std.log`，並在 service 啟動時寫入設定內容。
+/// 用來接管 `std.log`，並在服務啟動時寫入設定內容。
 const logging = @import("logging.zig");
 /// 匯入排程模組。
 ///
@@ -22,7 +22,7 @@ const scheduler = @import("scheduler.zig");
 
 /// `std_options` 是 Zig 提供的一個特殊常數名稱。
 ///
-/// 如果你在 root module 宣告它，Zig 標準庫的一些行為就會依照這裡的設定調整。
+/// 如果你在根模組宣告它，Zig 標準庫的一些行為就會依照這裡的設定調整。
 /// 這個專案主要拿它來客製：
 /// - 預設 log 等級
 /// - `std.log` 最後要呼叫哪個函式
@@ -75,7 +75,7 @@ fn isHelpFlag(arg: []const u8) bool {
     return std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h");
 }
 
-/// 只允許 `service` 這個模式。
+/// 目前只支援 `service` 這個模式。
 fn runCommand(
     arena_allocator: std.mem.Allocator,
     allocator: std.mem.Allocator,
@@ -113,7 +113,7 @@ fn runCommand(
     }
 
     // 把第一個子命令 `service` 拿掉，
-    // 後面剩下的才是 service 自己的選項。
+    // 後面剩下的才是 `service` 子命令自己的選項。
     const option_args = args[1..];
 
     // 這個 switch 負責解析 `--config` 選項。
@@ -152,18 +152,18 @@ fn runCommand(
     const app_config = try config.loadLeaky(arena_allocator, io, config_path);
 
     // 啟動時把最後生效的設定寫進日誌，
-    // 方便之後確認 service 實際用了哪些值。
+    // 方便之後確認服務實際用了哪些值。
     try logLoadedConfig(allocator, app_config);
 
-    // 再寫一筆簡短訊息，說明這次 service 用的是哪個 config 路徑。
+    // 再寫一筆簡短訊息，說明這次服務用的是哪個設定檔路徑。
     std.log.info("ddns scheduler will use config: {s}", .{config_path});
 
     // 最後把控制權交給排程器。
-    // 這裡之後通常就不會回來，因為 service 會持續常駐。
+    // 這裡之後通常就不會回來，因為服務會持續常駐。
     try scheduler.runForever(allocator, io, app_config);
 }
 
-/// 在 service 啟動時，把實際載入到記憶體的設定輸出成格式化 JSON。
+/// 在服務啟動時，把實際載入到記憶體的設定輸出成格式化 JSON。
 fn logLoadedConfig(allocator: std.mem.Allocator, app_config: config.AppConfig) !void {
     // 先建立一個可成長的 byte 陣列，等等拿來裝 JSON 文字。
     var json_buffer = std.ArrayList(u8).empty;
@@ -181,7 +181,7 @@ fn logLoadedConfig(allocator: std.mem.Allocator, app_config: config.AppConfig) !
     try std.json.Stringify.value(app_config, .{ .whitespace = .indent_2 }, &writer.writer);
 
     // `fromArrayList` 模式下，真正的資料暫時握在 writer 手上。
-    // 所以這一步要把 ownership 拿回 `json_buffer`。
+    // 所以這一步要把所有權拿回 `json_buffer`。
     json_buffer = writer.toArrayList();
 
     // 再把「標題 + JSON 內容」組成一整段字串，方便一次寫進日誌。

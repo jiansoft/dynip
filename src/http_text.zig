@@ -1,62 +1,62 @@
 //! 共用的 HTTP 文字抓取與日誌輔助工具。
 //!
 //! 這個模組負責兩件事：
-//! - 發出簡單的 GET 請求，並把 body 收成字串。
+//! - 發出簡單的 GET 請求，並把回應內容收成字串。
 //! - 整理 HTTP 日誌，避免把敏感資訊直接寫進 log。
 
 /// 匯入 Zig 標準函式庫。
 ///
-/// HTTP client、ArrayList、字串處理與 log 都由這裡提供。
+/// HTTP 客戶端、ArrayList、字串處理與 log 都由這裡提供。
 const std = @import("std");
 
-/// 建立 HTTP 專用的 log scope。
+/// 建立 HTTP 專用的日誌分類。
 ///
 /// 之後用 `http_log.info(...)` 時，日誌會標記成 `(http)`。
 const http_log = std.log.scoped(.http);
 
-/// `urlForLog` 需要的暫存 buffer 長度。
+/// `urlForLog` 需要的暫存緩衝區長度。
 ///
 /// 因為這個模組不想為了寫 log 額外配置記憶體，
-/// 所以會先準備固定大小的 stack buffer 來複製網址。
+/// 所以會先準備固定大小的 stack 緩衝區來複製網址。
 pub const log_url_buffer_len: usize = 512;
 
-/// `bodyPreviewForLog` 需要的暫存 buffer 長度。
+/// `bodyPreviewForLog` 需要的暫存緩衝區長度。
 ///
-/// response body 可能很大，不適合整份都寫進 log，
+/// HTTP 回應內容可能很大，不適合整份都寫進 log，
 /// 所以只會取前面一小段做預覽。
 pub const body_preview_len: usize = 256;
 
 /// 單次 HTTP GET 的結果。
 ///
-/// `status` 是 HTTP 狀態碼，`body` 是整份 response body。
+/// `status` 是 HTTP 狀態碼，`body` 是整份 HTTP 回應內容。
 pub const FetchTextResponse = struct {
     /// 伺服器回的 HTTP 狀態碼，例如 200、404、500。
     status: std.http.Status,
-    /// 完整 response body。
+    /// 完整 HTTP 回應內容。
     ///
     /// 呼叫端拿到後，要自己決定何時 `allocator.free(...)`。
     body: []u8,
 };
 
-/// 發出單次 GET 請求並把 body 收成字串。
+/// 發出單次 GET 請求並把回應內容收成字串。
 pub fn fetchText(
-    // 這個 allocator 用來配置 response body 與暫時字串。
+    // 這個 allocator 用來配置 HTTP 回應內容與暫時字串。
     allocator: std.mem.Allocator,
-    // 呼叫端建立好的 HTTP client。
+    // 呼叫端建立好的 HTTP 客戶端。
     client: *std.http.Client,
     // 要請求的完整網址。
     url: []const u8,
     // 額外 HTTP header，例如 Authorization。
     extra_headers: []const std.http.Header,
 ) !FetchTextResponse {
-    // 先建立一個空的 ArrayList，稍後把 response body 一段一段寫進來。
+    // 先建立一個空的 ArrayList，稍後把 HTTP 回應內容一段一段寫進來。
     var body = std.ArrayList(u8).empty;
     // `errdefer` 的意思是：
     // 只有在函式以 error 提前結束時，才會執行這行清理。
     errdefer body.deinit(allocator);
 
     // `std.Io.Writer.Allocating.fromArrayList(...)` 會把 ArrayList 包成一個 writer。
-    // 這樣 HTTP client 在收到 body 時，就可以直接把資料寫進 `body`。
+    // 這樣 HTTP 客戶端在收到回應內容時，就可以直接把資料寫進 `body`。
     var response_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &body);
     // 如果中途發生錯誤，也要把 writer 自己持有的資源清掉。
     errdefer response_writer.deinit();
@@ -86,8 +86,8 @@ pub fn fetchText(
         return err;
     };
 
-    // `fromArrayList` 之後，response body 先暫時放在 `response_writer` 手上。
-    // 要把 ownership 交回 `body`，`body.items` 才會真正指向內容。
+    // `fromArrayList` 之後，HTTP 回應內容先暫時放在 `response_writer` 手上。
+    // 要把所有權交回 `body`，`body.items` 才會真正指向內容。
     body = response_writer.toArrayList();
     // 寫一筆 response log，內容包含 status code 和 body 預覽。
     logHttpResponse(log_url, result.status, body.items);
@@ -104,7 +104,7 @@ pub fn fetchText(
 pub fn ensureSuccessStatus(status: std.http.Status, body: []const u8) !void {
     // `status.class()` 會把 200、201 這種狀態碼歸類成 `.success`。
     if (status.class() != .success) {
-        // 先準備一塊 buffer，拿來做 body 預覽。
+        // 先準備一塊緩衝區，拿來做回應內容預覽。
         var preview_buffer: [body_preview_len]u8 = undefined;
         // 這裡不直接把整份 body 打進 log，
         // 避免 body 太長、太亂，或含有不適合完整輸出的內容。
@@ -119,7 +119,7 @@ pub fn ensureSuccessStatus(status: std.http.Status, body: []const u8) !void {
 
 /// 將 body 整理成一小段適合寫進 log 的預覽字串。
 pub fn bodyPreviewForLog(buffer: []u8, body: []const u8) []const u8 {
-    // 如果呼叫端給的 buffer 長度是 0，就不可能放進任何字元，
+    // 如果呼叫端給的緩衝區長度是 0，就不可能放進任何字元，
     // 直接回空字串。
     if (buffer.len == 0) return "";
 
@@ -129,11 +129,11 @@ pub fn bodyPreviewForLog(buffer: []u8, body: []const u8) []const u8 {
     // 如果要補 `...`，就要先預留 3 個字元的位置。
     const preview_limit = if (needs_ellipsis and buffer.len >= 3) buffer.len - 3 else buffer.len;
 
-    // `out_index` 指向目前寫到 buffer 的哪個位置。
+    // `out_index` 指向目前寫到緩衝區的哪個位置。
     var out_index: usize = 0;
     // `body_index` 指向目前讀到 body 的哪個位置。
     var body_index: usize = 0;
-    // 逐字掃過 body，把適合印出的字元寫進 buffer。
+    // 逐字掃過 body，把適合印出的字元寫進緩衝區。
     while (body_index < body.len and out_index < preview_limit) : (body_index += 1) {
         const char = body[body_index];
         // 把換行和 tab 轉成空白，避免 log 排版亂掉。
@@ -150,7 +150,7 @@ pub fn bodyPreviewForLog(buffer: []u8, body: []const u8) []const u8 {
         out_index -= 1;
     }
 
-    // 如果內容被截斷，而且 buffer 放得下，
+    // 如果內容被截斷，而且緩衝區放得下，
     // 就在尾端補上 `...`。
     if (needs_ellipsis and buffer.len >= 3) {
         buffer[out_index..][0] = '.';
@@ -187,7 +187,7 @@ fn logHttpResponse(
     status: std.http.Status,
     body: []const u8,
 ) void {
-    // 用固定大小 buffer 生一份 body 預覽，避免整份 body 直接進 log。
+    // 用固定大小的緩衝區產生一份 body 預覽，避免整份內容直接進 log。
     var preview_buffer: [body_preview_len]u8 = undefined;
     const body_preview = bodyPreviewForLog(&preview_buffer, body);
 

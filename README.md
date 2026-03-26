@@ -4,7 +4,7 @@
 
 # dynip
 
-A DDNS background service written in Zig.
+A Zig-based DDNS background service.
 
 `dynip` periodically checks the current public IP and updates configured DDNS providers:
 
@@ -12,28 +12,28 @@ A DDNS background service written in Zig.
 - Dynu
 - No-IP
 
-It supports layered configuration loading, structured logging, HTTP request tracing, and dedupe control through either Redis or in-process memory.
+It supports layered configuration loading, structured logging, HTTP request tracing, and duplicate-update prevention backed by either Redis or in-process memory.
 
 ## Features
 
 - Load configuration from `app.json`
 - Override config with `.env`
-- Override both with process environment variables
-- Run as a long-lived scheduler
+- Override both again with environment variables
+- Run as a long-running scheduled service
 - Update Afraid / Dynu / No-IP independently
-- Rotate across multiple public IP lookup providers
+- Rotate across multiple public IP sources
 - Write log files by level
-- Record HTTP request and response logs
-- Dedupe updates with Redis or local memory
+- Record HTTP request/response logs
+- Prevent duplicate updates with Redis or local memory
 
 ## How It Works
 
-For each refresh cycle, `dynip`:
+On each update cycle, `dynip`:
 
 1. Checks whether the current time is inside the maintenance window `02:00` to `02:04` local time.
-2. Fetches the current public IP from one of the built-in public IP providers.
-3. Builds a dedupe key in the form `MyPublicIP:{ip}`.
-4. Checks that key in Redis when `ddns.redis.enabled = true`, otherwise checks an in-memory local TTL cache.
+2. Fetches the current public IP from one of the built-in public IP sources.
+3. Builds a key in the form `MyPublicIP:{ip}` to prevent duplicate updates.
+4. Checks that key in Redis when `ddns.redis.enabled = true`, otherwise checks an in-memory TTL cache.
 5. Skips the update if the key already exists.
 6. Updates all enabled DDNS providers with complete credentials.
 7. Stores the key after at least one provider update succeeds.
@@ -42,23 +42,23 @@ For each refresh cycle, `dynip`:
 
 - `src/main.zig`: CLI entry point
 - `src/config.zig`: config loading, `.env` parsing, environment overrides
-- `src/ddns.zig`: DDNS refresh flow and provider update logic
+- `src/ddns.zig`: DDNS update flow and provider update logic
 - `src/redis.zig`: Redis client wrapper
 - `src/scheduler.zig`: fixed-interval scheduler
 - `src/logging.zig`: file logging and rotation
-- `src/tests.zig`: test entrypoint
+- `src/tests.zig`: test entry point
 - `build.zig`: build definition
 - `build.ps1`: Windows release build script
 - `build.bat`: Windows batch wrapper
 - `control.sh`: Docker-oriented helper script
-- `Dockerfile`: container image build
+- `Dockerfile`: container image build definition
 
 ## Requirements
 
 - Zig `0.16.0-dev.2979+e93834410` or a compatible nearby dev version
-- Network access to public IP lookup providers
+- Network access to public IP sources
 - Network access to the DDNS providers you enable
-- Redis only if you want Redis-backed dedupe
+- Redis only if you want Redis-backed duplicate prevention
 
 ## Configuration
 
@@ -107,9 +107,9 @@ Later sources override earlier ones.
 }
 ```
 
-### Provider Config Shape
+### Provider Configuration Shape
 
-All three DDNS providers follow the same structure:
+All three DDNS providers use the same top-level structure:
 
 - `enabled`
 - `url`
@@ -121,20 +121,20 @@ Provider-specific fields:
 - `dyny`: `username`, `password`
 - `noip`: `username`, `password`, `hostnames`
 
-### Redis Dedupe
+### Redis Duplicate Prevention
 
 When `ddns.redis.enabled = true`:
 
-- dedupe is stored in Redis
+- duplicate-prevention state is stored in Redis
 - key format is `MyPublicIP:{ip}`
 - the latest public IP is also stored in `MyPublicIP`
 - successful updates write the key with `SETEX`
 
 When `ddns.redis.enabled = false`:
 
-- dedupe is stored in local process memory
+- duplicate-prevention state is stored in local process memory
 - the same TTL logic still applies
-- dedupe state is lost after process restart
+- all duplicate-prevention state is lost after process restart
 
 ### Supported Environment Variables
 
@@ -206,7 +206,7 @@ DDNS_DEDUPE_TTL_SECONDS=86400
 zig build test
 ```
 
-If the repo is on a mounted WSL path such as `/mnt/d/...`, use Linux-native cache directories:
+If the project is on a mounted WSL path such as `/mnt/d/...`, use Linux-native cache directories:
 
 ```bash
 zig build test \
@@ -254,15 +254,15 @@ File naming pattern:
 Current logging behavior includes:
 
 - one log file per level per day
-- daily rollover
+- daily rotation
 - cleanup for logs older than `7` days
 - formatted dump of the loaded runtime config on service startup
 - provider response summaries
-- HTTP request and response logs
+- HTTP request/response logs
 
-## Public IP Providers
+## Public IP Sources
 
-Built-in lookup providers:
+Built-in public IP sources:
 
 - `https://api.ipify.org`
 - `https://ipconfig.io/ip`
@@ -271,7 +271,7 @@ Built-in lookup providers:
 - `https://api.myip.com`
 - `https://api.bigdatacloud.net/data/client-ip`
 
-The lookup start position rotates between refresh cycles instead of always starting from the first provider.
+The starting source rotates between update cycles instead of always beginning with the first one.
 
 ## Windows Build
 
@@ -293,7 +293,7 @@ The PowerShell build currently emits a stripped ARM64 Linux binary into `zig-out
 
 ## Docker
 
-`control.sh` is currently geared toward Docker workflows.
+`control.sh` is currently geared toward Docker-based workflows.
 
 Common commands:
 
@@ -308,7 +308,7 @@ bash control.sh docker_update
 Current assumptions:
 
 - `control.sh` and `dynip_linux_arm64` are placed in the same directory for deployment
-- `control.sh` does not build the binary in production
+- `control.sh` does not build the binary on the production host
 - `docker_build` packages the existing binary with `Dockerfile`
 
 Default names:

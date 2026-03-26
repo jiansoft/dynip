@@ -6,13 +6,13 @@
 
 以 Zig 撰寫的 DDNS 常駐背景服務。
 
-`dynip` 會定期檢查目前的公網 IP，並更新已設定的 DDNS 供應商：
+`dynip` 會定期檢查目前的公開 IP，並更新已設定的 DDNS 供應商：
 
 - Afraid.org
 - Dynu
 - No-IP
 
-它支援分層設定載入、結構化日誌、HTTP 請求追蹤，以及使用 Redis 或行程內記憶體的去重控制。
+它支援分層設定載入、結構化日誌、HTTP 請求追蹤，以及使用 Redis 或程式內記憶體來避免重複更新。
 
 ## 功能
 
@@ -21,44 +21,44 @@
 - 使用系統環境變數再覆蓋一次
 - 以常駐排程模式執行
 - 可獨立更新 Afraid / Dynu / No-IP
-- 在多個 public IP 來源站之間輪替
+- 在多個公開 IP 查詢來源之間輪替
 - 依日誌等級輸出檔案
-- 記錄 HTTP request / response 日誌
-- 以 Redis 或本機記憶體做更新去重
+- 記錄 HTTP 請求 / 回應日誌
+- 以 Redis 或本機記憶體避免重複更新
 
 ## 運作方式
 
-每一輪 refresh 流程如下：
+每一輪更新流程如下：
 
-1. 檢查目前是否落在本地時間 `02:00` 到 `02:04` 的維護略過時段。
-2. 從內建的 public IP 來源站取得目前公網 IP。
-3. 依照 `MyPublicIP:{ip}` 格式建立 dedupe key。
-4. 當 `ddns.redis.enabled = true` 時查 Redis，否則改查本機記憶體 TTL cache。
+1. 檢查目前是否落在本地時間 `02:00` 到 `02:04` 的維護跳過時段。
+2. 從內建的公開 IP 查詢來源取得目前公開 IP。
+3. 依照 `MyPublicIP:{ip}` 格式建立用來避免重複更新的 key。
+4. 當 `ddns.redis.enabled = true` 時查 Redis，否則改查本機記憶體 TTL 快取。
 5. 如果 key 已存在，就略過這次更新。
 6. 更新所有已啟用且認證資料完整的 DDNS 供應商。
-7. 只要至少一個供應商更新成功，就把 key 寫入 dedupe cache。
+7. 只要至少一個供應商更新成功，就把 key 寫入避免重複更新的快取。
 
 ## 專案結構
 
 - `src/main.zig`: CLI 入口
 - `src/config.zig`: 設定載入、`.env` 解析、環境變數覆寫
-- `src/ddns.zig`: DDNS refresh 主流程與供應商更新邏輯
-- `src/redis.zig`: Redis client 包裝
+- `src/ddns.zig`: DDNS 更新主流程與供應商更新邏輯
+- `src/redis.zig`: Redis 客戶端包裝
 - `src/scheduler.zig`: 固定間隔排程器
 - `src/logging.zig`: 檔案日誌與輪替
 - `src/tests.zig`: 測試入口
 - `build.zig`: 建置定義
-- `build.ps1`: Windows release 建置腳本
-- `build.bat`: Windows batch wrapper
+- `build.ps1`: Windows 釋出版建置腳本
+- `build.bat`: Windows 批次檔包裝腳本
 - `control.sh`: 偏向 Docker 流程的輔助腳本
 - `Dockerfile`: 容器映像建置檔
 
 ## 執行需求
 
-- Zig `0.16.0-dev.2979+e93834410` 或相近可相容的 dev 版本
-- 可連線到 public IP 查詢服務
+- Zig `0.16.0-dev.2979+e93834410` 或相近且相容的 dev 版本
+- 可連線到公開 IP 查詢服務
 - 可連線到你啟用的 DDNS 供應商
-- 只有在你要用 Redis 去重時，才需要 Redis
+- 只有在你要用 Redis 避免重複更新時，才需要 Redis
 
 ## 設定
 
@@ -109,7 +109,7 @@
 
 ### 供應商設定格式
 
-三家 DDNS 供應商統一採用這種欄位風格：
+三家 DDNS 供應商統一採用這種欄位格式：
 
 - `enabled`
 - `url`
@@ -121,20 +121,20 @@
 - `dyny`: `username`, `password`
 - `noip`: `username`, `password`, `hostnames`
 
-### Redis 去重
+### Redis 防重複更新
 
 當 `ddns.redis.enabled = true` 時：
 
-- 去重狀態存放在 Redis
+- 避免重複更新的狀態存放在 Redis
 - key 格式為 `MyPublicIP:{ip}`
-- 目前最新 public IP 也會同步寫到 `MyPublicIP`
+- 目前最新公開 IP 也會同步寫到 `MyPublicIP`
 - 更新成功後會用 `SETEX` 寫入 key
 
 當 `ddns.redis.enabled = false` 時：
 
-- 去重狀態只存放在本機行程記憶體
+- 避免重複更新的狀態只存放在程式本身的記憶體中
 - TTL 邏輯與 Redis 模式相同
-- 行程重啟後去重狀態會消失
+- 程式重新啟動後，這些狀態就會消失
 
 ### 支援的環境變數
 
@@ -206,7 +206,7 @@ DDNS_DEDUPE_TTL_SECONDS=86400
 zig build test
 ```
 
-如果專案放在 WSL 掛載路徑，例如 `/mnt/d/...`，建議把 cache 改放 Linux 原生檔案系統：
+如果專案放在 WSL 掛載路徑，例如 `/mnt/d/...`，建議把快取改放 Linux 原生檔案系統：
 
 ```bash
 zig build test \
@@ -234,7 +234,7 @@ zig build run -- service --config app.json
 zig build run -- --help
 ```
 
-直接執行編譯後的 binary：
+直接執行編譯後的執行檔：
 
 ```bash
 dynip service --config app.json
@@ -254,15 +254,15 @@ dynip service --config app.json
 目前日誌行為包含：
 
 - 每日依等級分檔
-- 換日 rollover
+- 換日輪替
 - 自動清除超過 `7` 天的舊日誌
-- service 啟動時輸出實際載入的設定 JSON
+- 服務啟動時輸出實際載入的設定 JSON
 - 記錄各 DDNS 供應商回應摘要
-- 記錄 HTTP request / response
+- 記錄 HTTP 請求 / 回應
 
-## Public IP 來源
+## 公開 IP 查詢來源
 
-目前內建的 public IP lookup 來源：
+目前內建的公開 IP 查詢來源：
 
 - `https://api.ipify.org`
 - `https://ipconfig.io/ip`
@@ -271,7 +271,7 @@ dynip service --config app.json
 - `https://api.myip.com`
 - `https://api.bigdatacloud.net/data/client-ip`
 
-每輪 refresh 不會永遠從同一個來源開始，而是會輪流切換起始站點。
+每一輪更新不會永遠從同一個來源開始，而是會輪流切換起始站點。
 
 ## Windows 建置
 
@@ -289,11 +289,11 @@ Set-Location D:\Project\Eddie\stock_zig
 powershell.exe -ExecutionPolicy Bypass -File .\build.ps1
 ```
 
-目前 PowerShell build 會把 strip 過的 ARM64 Linux binary 輸出到 `zig-out\bin\`。
+目前 PowerShell 建置會把經過 `strip` 的 ARM64 Linux 執行檔輸出到 `zig-out\bin\`。
 
 ## Docker
 
-`control.sh` 目前偏向 Docker 使用情境。
+`control.sh` 目前是以 Docker 使用情境為主的輔助腳本。
 
 常用指令：
 
@@ -308,8 +308,8 @@ bash control.sh docker_update
 目前的假設如下：
 
 - 部署時 `control.sh` 和 `dynip_linux_arm64` 在同一層目錄
-- `control.sh` 不負責在 production 端編譯 binary
-- `docker_build` 直接拿現成 binary 搭配 `Dockerfile` 打包
+- `control.sh` 不負責在正式環境端編譯執行檔
+- `docker_build` 直接拿現成執行檔搭配 `Dockerfile` 打包
 
 預設名稱：
 

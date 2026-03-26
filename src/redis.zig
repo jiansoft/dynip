@@ -1,14 +1,14 @@
 //! Redis 包裝模組。
 //!
 //! 這一版不再手寫 RESP 協定，
-//! 而是改用第三方套件 `zig-okredis` 當底層 client。
+//! 而是改用第三方套件 `zig-okredis` 當底層客戶端。
 //!
 //! 專案外部其實還是只看到三個主要 API：
 //! - `containsKey(...)`
 //! - `setEx(...)`
 //! - `ping(...)`
 //!
-//! 這樣其他模組，例如 `ddns.zig`，就不用知道底層 client 已經換掉。
+//! 這樣其他模組，例如 `ddns.zig`，就不用知道底層客戶端已經換掉。
 
 /// 匯入 Zig 標準函式庫。
 ///
@@ -24,12 +24,12 @@ const std = @import("std");
 const config_mod = @import("config.zig");
 /// 匯入 `zig-okredis`。
 ///
-/// 這個 module 是在 `build.zig` 透過 dependency 掛進來的。
+/// 這個模組是在 `build.zig` 透過 dependency 掛進來的。
 const okredis = @import("okredis");
 
-/// 建立 Redis 專用的 log scope。
+/// 建立 Redis 專用的日誌分類。
 ///
-/// 之後 log 會顯示成 `(redis)`，方便和 `(http)` 或一般 service log 區分。
+/// 之後 log 會顯示成 `(redis)`，方便和 `(http)` 或一般服務日誌區分。
 const redis_log = std.log.scoped(.redis);
 
 /// 每條 TCP 讀取緩衝區大小。
@@ -70,7 +70,7 @@ const Session = struct {
     reader: Stream.Reader,
     /// 綁在這條 stream 上的 writer。
     writer: Stream.Writer,
-    /// `zig-okredis` 提供的高階 Redis client。
+    /// `zig-okredis` 提供的高階 Redis 客戶端。
     client: Client,
 
     /// 建立一條新的 Redis session。
@@ -101,7 +101,7 @@ const Session = struct {
                 .pass = config.password,
             };
 
-        // 初始化 okredis client。
+        // 初始化 okredis 客戶端。
         //
         // `Client.init(...)` 會：
         // 1. 視情況先做 AUTH
@@ -158,8 +158,10 @@ pub fn containsKey(
 
 /// 對外提供的 `SETEX` 包裝。
 ///
-/// 成功時 Redis 會回 `OK`，而 `client.send(void, ...)`
-/// 在沒有錯誤或 nil 的情況下就會直接通過。
+/// 成功時 Redis 會回 `OK`。
+///
+/// 雖然程式裡呼叫的是 `client.send(void, ...)`，
+/// 但只要沒有錯誤或 nil，就會直接通過。
 pub fn setEx(
     allocator: std.mem.Allocator,
     io: std.Io,

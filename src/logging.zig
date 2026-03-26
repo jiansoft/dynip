@@ -345,7 +345,7 @@ pub fn logFn(
 
     // 如果全域 logger 已經初始化，就把這筆訊息寫進檔案。
     if (global_logger) |*logger| {
-        // `scope == .default` 代表沒有特別的 scope，就用 null 表示。
+        // `scope == .default` 代表沒有特別的分類，就用 null 表示。
         const scope_name = if (scope == .default) null else @tagName(scope);
         logger.writeRendered(level, scope_name, rendered);
     }
@@ -428,14 +428,14 @@ fn formatLogLine(
     // 先把年轉成 unsigned，方便後面用格式字串補零輸出。
     const year: u32 = @intCast(now.year);
 
-    // 如果有 scope，就輸出成 `info(ddns)` 這種格式。
+    // 如果有分類，就輸出成 `info(ddns)` 這種格式。
     return if (scope_name) |scope_text|
         std.fmt.bufPrint(
             buffer,
             "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} {s}({s}) {s}\n",
             .{ year, now.month, now.day, now.hour, now.minute, now.second, levelText(level), scope_text, message },
         )
-        // 沒有 scope 時，就只輸出等級與訊息。
+        // 沒有分類時，就只輸出等級與訊息。
     else
         std.fmt.bufPrint(
             buffer,
@@ -514,7 +514,7 @@ test "build file name uses one file per day" {
 }
 
 test "format log line includes scope when present" {
-    // 這個測試確認 scope 存在時，格式會長成 `info(ddns)`。
+    // 這個測試確認分類存在時，格式會長成 `info(ddns)`。
     var buffer: [256]u8 = undefined;
     const now = LocalDateTime{
         .unix_seconds = 0,

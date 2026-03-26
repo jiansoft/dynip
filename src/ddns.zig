@@ -1,9 +1,9 @@
 //! DDNS 更新流程。
 //!
 //! 職責包含：
-//! - 取得目前對外公網 IP。
-//! - 判斷是否需要略過凌晨維護時段。
-//! - 比對 Redis 內的 `MyPublicIP:{ip}` key，沿用 Rust 版去重邏輯。
+//! - 取得目前對外 IP。
+//! - 判斷是否需要跳過凌晨維護時段。
+//! - 比對 Redis 內的 `MyPublicIP:{ip}` key，沿用 Rust 版防重複更新邏輯。
 //! - 依序更新 Afraid / Dynu / No-IP。
 
 /// 匯入編譯期提供的目標平台資訊。
@@ -12,17 +12,17 @@
 const builtin = @import("builtin");
 /// 匯入 Zig 標準函式庫。
 ///
-/// HTTP client、字串處理、JSON、記憶體配置等通用能力都從這裡來。
+/// HTTP 客戶端、字串處理、JSON、記憶體配置等通用能力都從這裡來。
 const std = @import("std");
 /// 匯入本專案的設定模組。
 ///
 /// 這樣 DDNS 流程就能讀到 `app.json` / `.env` 載入後的設定值。
 const config_mod = @import("config.zig");
-/// 匯入本專案的 Redis client。
+/// 匯入本專案的 Redis 客戶端。
 ///
-/// DDNS 去重現在要真的查 Redis，所以 refresh 流程會呼叫這個模組。
+/// DDNS 防重複更新現在要真的查 Redis，所以更新流程會呼叫這個模組。
 const redis = @import("redis.zig");
-/// 建立 HTTP 專用的 log scope。
+/// 建立 HTTP 專用的日誌分類。
 ///
 /// 之後用 `http_log.info(...)` 時，日誌就會帶上 `(http)` 這個分類。
 const http_log = std.log.scoped(.http);
@@ -44,7 +44,7 @@ const win = if (builtin.os.tag == .windows)
 else
     struct {};
 
-/// 單次 refresh 的結果。
+/// 單次更新檢查的結果。
 pub const RefreshStatus = enum {
     /// 有真的更新到至少一個 DDNS 服務。
     updated,
@@ -54,7 +54,7 @@ pub const RefreshStatus = enum {
     skipped_maintenance_window,
 };
 
-/// 取得 public IP 時，可能依序嘗試的來源站。
+/// 取得對外 IP 時，可能依序嘗試的來源站。
 const PublicIpService = enum {
     /// `https://api.ipify.org`
     ipify,
@@ -78,11 +78,11 @@ const ServiceSummary = struct {
     succeeded: usize = 0,
 };
 
-/// 本地 `fetchText(...)` helper 回傳的資料。
+/// 本地 `fetchText(...)` 輔助函式回傳的資料。
 const FetchTextResponse = struct {
     /// HTTP 狀態碼，例如 200、404。
     status: std.http.Status,
-    /// 完整 response body。
+    /// 完整 HTTP 回應內容。
     body: []u8,
 };
 
@@ -90,26 +90,26 @@ const FetchTextResponse = struct {
 const http_log_url_buffer_len = 512;
 /// 寫 HTTP body 預覽時，最多保留的字元數。
 const http_log_body_preview_len = 256;
-/// Redis 關閉時，退回本機去重用的快取資料。
+/// Redis 關閉時，退回本機防重複更新用的快取資料。
 const LocalDedupeEntry = struct {
     key: []u8,
     expires_at: i64,
 };
-/// 本機去重狀態的互斥鎖。
+/// 本機防重複更新狀態的互斥鎖。
 var local_dedupe_mutex: std.atomic.Mutex = .unlocked;
-/// 本機去重用的記憶體快取。
+/// 本機防重複更新用的記憶體快取。
 var local_dedupe_entries: std.ArrayListUnmanaged(LocalDedupeEntry) = .empty;
 
 /// 集中管理這個模組會打到的第三方網址。
 ///
 /// 之後如果要：
-/// - 更換 public IP 來源站
-/// - 調整 Dynu / No-IP API base URL
+/// - 更換對外 IP 來源站
+/// - 調整 Dynu / No-IP API 基底網址
 /// - 統一檢查目前到底有哪些外部端點
 ///
 /// 就只需要看這一個區塊，不用在整份 `ddns.zig` 到處找字串常數。
 const Endpoint = struct {
-    /// 所有 public IP 來源站的網址。
+    /// 所有對外 IP 來源站的網址。
     const PublicIp = struct {
         /// 直接回傳純文字 IP。
         const ipify = "https://api.ipify.org";
@@ -125,15 +125,15 @@ const Endpoint = struct {
         const bigdatacloud = "https://api.bigdatacloud.net/data/client-ip";
     };
 
-    /// Dynu 更新 API base URL。
+    /// Dynu 更新 API 基底網址。
     const dynu_update = "https://api.dynu.com/nic/update";
-    /// No-IP 更新 API base URL。
+    /// No-IP 更新 API 基底網址。
     const noip_update = "https://dynupdate.no-ip.com/nic/update";
 };
 
-/// 下次抓 public IP 時，從哪個來源站開始嘗試。
+/// 下次抓對外 IP 時，從哪個來源站開始嘗試。
 ///
-/// 這樣每次 refresh 不會永遠都從第一個來源站開始打，
+/// 這樣每次更新檢查不會永遠都從第一個來源站開始打，
 /// 而是會做簡單的 round-robin。
 var next_public_ip_index: usize = 0;
 
@@ -143,29 +143,29 @@ pub fn refresh(
     io: std.Io,
     config: config_mod.AppConfig,
 ) !RefreshStatus {
-    // 先看現在是否落在「故意略過更新」的維護時間。
+    // 先看現在是否落在「刻意跳過更新」的維護時間。
     if (shouldSkipMaintenanceWindow()) {
         std.log.info("skip ddns refresh during 02:00-02:04 local maintenance window", .{});
         return .skipped_maintenance_window;
     }
 
-    // 建立一個 arena allocator，讓這一輪 refresh 內的暫時字串與 JSON 解析結果
+    // 建立一個 arena allocator，讓這一輪更新檢查內的暫時字串與 JSON 解析結果
     // 都集中配置在同一塊記憶體裡。
     var arena = std.heap.ArenaAllocator.init(allocator);
-    // 這一輪 refresh 結束時，把 arena 一次整包釋放掉。
+    // 這一輪更新檢查結束時，把 arena 一次整包釋放掉。
     defer arena.deinit();
-    // `scratch` 是這一輪 refresh 專用的 allocator。
+    // `scratch` 是這一輪更新檢查專用的 allocator。
     const scratch = arena.allocator();
 
-    // 建一個 HTTP client，後面抓 public IP 與更新 DDNS 都會用到它。
+    // 建一個 HTTP 客戶端，後面抓對外 IP 與更新 DDNS 都會用到它。
     var client: std.http.Client = .{
         .allocator = scratch,
         .io = io,
     };
-    // 用完後關掉 client。
+    // 用完後關掉客戶端。
     defer client.deinit();
 
-    // 先抓目前對外的公網 IP。
+    // 先抓目前對外 IP。
     const ip_now = try getPublicIp(scratch, &client);
     // 再組出和 Rust 專案相同格式的 Redis key。
     const cache_key = try buildPublicIpCacheKey(scratch, ip_now);
@@ -175,7 +175,7 @@ pub fn refresh(
     else
         config.ddns.dedupe_ttl_seconds;
 
-    // 先做 dedupe 檢查：
+    // 先做防重複更新檢查：
     // - Redis 啟用時走 Redis
     // - Redis 關閉時改成本機記憶體
     if (try isDedupeHit(scratch, io, config.ddns.redis, cache_key)) {
@@ -186,7 +186,7 @@ pub fn refresh(
     const summary = try updateDdnsServices(scratch, &client, config, ip_now);
     // 一個供應商都沒啟用，視為設定錯誤。
     if (summary.attempted == 0) return error.NoEnabledDdnsService;
-    // 有嘗試，但全部失敗，就把整輪 refresh 視為失敗。
+    // 有嘗試，但全部失敗，就把整輪更新檢查視為失敗。
     if (summary.succeeded == 0) return error.AllDdnsUpdatesFailed;
 
     // 至少有一個供應商更新成功後，才把這個 IP 寫進 dedupe cache。
@@ -200,17 +200,17 @@ pub fn refresh(
     return .updated;
 }
 
-/// 把目前公網 IP 轉成和 Rust 版相同的 Redis key 格式。
+/// 把目前對外 IP 轉成和 Rust 版相同的 Redis key 格式。
 fn buildPublicIpCacheKey(allocator: std.mem.Allocator, ip: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "MyPublicIP:{s}", .{ip});
 }
 
-/// 固定用來保存「目前最新 public IP」的 Redis key。
+/// 固定用來保存「目前最新對外 IP」的 Redis key。
 fn currentPublicIpRedisKey() []const u8 {
     return "MyPublicIP";
 }
 
-/// 檢查目前這個 IP 是否已經在去重快取裡。
+/// 檢查目前這個 IP 是否已經在防重複更新快取裡。
 fn isDedupeHit(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -230,7 +230,7 @@ fn isDedupeHit(
 
     // 這裡刻意沿用 Rust 版的容錯策略：
     // - 如果 Redis 查詢失敗，只記 warn
-    // - 但整個 DDNS refresh 仍然繼續跑
+    // - 但整個 DDNS 更新檢查仍然繼續跑
     return redis.containsKey(allocator, io, redis_config, cache_key) catch |err| blk: {
         std.log.warn(
             "failed to check redis key before ddns refresh: key={s}, error={}",
@@ -283,17 +283,17 @@ fn currentUnixSeconds() i64 {
     return @intCast(c.time(null));
 }
 
-/// 本機去重：檢查 key 是否還在 TTL 內。
+/// 本機防重複更新：檢查 key 是否還在 TTL 內。
 fn localDedupeContains(key: []const u8) bool {
     return localDedupeContainsAt(key, currentUnixSeconds());
 }
 
-/// 本機去重：把 key 記到 TTL 過期為止。
+/// 本機防重複更新：把 key 記到 TTL 過期為止。
 fn localDedupeSet(key: []const u8, ttl_seconds: u64) !void {
     try localDedupeSetAt(key, ttl_seconds, currentUnixSeconds());
 }
 
-/// 供正式流程與測試共用的本機去重查詢邏輯。
+/// 供正式流程與測試共用的本機防重複更新查詢邏輯。
 fn localDedupeContainsAt(key: []const u8, now_seconds: i64) bool {
     lockLocalDedupe();
     defer unlockLocalDedupe();
@@ -306,7 +306,7 @@ fn localDedupeContainsAt(key: []const u8, now_seconds: i64) bool {
     return false;
 }
 
-/// 供正式流程與測試共用的本機去重寫入邏輯。
+/// 供正式流程與測試共用的本機防重複更新寫入邏輯。
 fn localDedupeSetAt(key: []const u8, ttl_seconds: u64, now_seconds: i64) !void {
     lockLocalDedupe();
     defer unlockLocalDedupe();
@@ -327,7 +327,7 @@ fn localDedupeSetAt(key: []const u8, ttl_seconds: u64, now_seconds: i64) !void {
     });
 }
 
-/// 把已過期的本機去重項目從記憶體移除。
+/// 把已過期的本機防重複更新項目從記憶體移除。
 fn pruneExpiredLocalDedupeLocked(now_seconds: i64) void {
     var index: usize = 0;
     while (index < local_dedupe_entries.items.len) {
@@ -351,14 +351,14 @@ fn resetLocalDedupeState() void {
     local_dedupe_entries.clearRetainingCapacity();
 }
 
-/// 取得本機去重資料的短臨界區鎖。
+/// 取得本機防重複更新資料的短臨界區鎖。
 fn lockLocalDedupe() void {
     while (!local_dedupe_mutex.tryLock()) {
         std.Thread.yield() catch {};
     }
 }
 
-/// 釋放本機去重資料的短臨界區鎖。
+/// 釋放本機防重複更新資料的短臨界區鎖。
 fn unlockLocalDedupe() void {
     local_dedupe_mutex.unlock();
 }
@@ -499,7 +499,7 @@ fn updateNoIp(
         const url = try buildNoIpUrl(allocator, config, hostname, ip);
         // 再帶著 Basic Auth header 送出請求。
         const response = try fetchText(allocator, client, url, &headers);
-        // 每個 hostname 的 response body 用完都要釋放。
+        // 每個 hostname 的回應內容用完都要釋放。
         defer allocator.free(response.body);
 
         // 先確認 HTTP 本身有沒有成功。
@@ -517,12 +517,12 @@ fn updateNoIp(
     }
 }
 
-/// 取得目前外部公網 IP。
+/// 取得目前對外 IP。
 fn getPublicIp(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
 ) ![]const u8 {
-    // 這裡把所有 public IP 來源站集中成一個固定陣列，
+    // 這裡把所有對外 IP 來源站集中成一個固定陣列，
     // 之後會依序嘗試。
     const services = [_]PublicIpService{
         .ipify,
@@ -579,16 +579,16 @@ fn fetchPublicIpFromService(
 
     // `switch` 會根據來源站種類，決定要打哪個 API 或怎麼解析回應。
     return switch (service) {
-        // 這四個站都直接回純文字 IP，所以共用同一個 helper。
+        // 這四個站都直接回純文字 IP，所以共用同一個輔助函式。
         .ipify, .ipconfig, .ipinfo, .seeip => fetchTextIp(allocator, client, url),
-        // `myip` 會回 JSON，所以走 JSON 解析 helper。
+        // `myip` 會回 JSON，所以走 JSON 解析輔助函式。
         .myip => fetchMyIpJson(allocator, client, url),
-        // `bigdatacloud` 也回 JSON，但欄位名稱不同，所以另一個 helper。
+        // `bigdatacloud` 也回 JSON，但欄位名稱不同，所以走另一個輔助函式。
         .bigdatacloud => fetchBigDataCloudJson(allocator, client, url),
     };
 }
 
-/// 把 public IP 來源站 enum 轉成實際要打的網址。
+/// 把對外 IP 來源站 enum 轉成實際要打的網址。
 fn publicIpServiceUrl(service: PublicIpService) []const u8 {
     return switch (service) {
         // 每個 enum 值都對應到 `Endpoint.PublicIp` 裡集中管理的網址常數。
@@ -601,7 +601,7 @@ fn publicIpServiceUrl(service: PublicIpService) []const u8 {
     };
 }
 
-/// 從「直接回純文字 IP」的來源站抓取公網 IP。
+/// 從「直接回純文字 IP」的來源站抓取對外 IP。
 fn fetchTextIp(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
@@ -621,7 +621,7 @@ fn fetchTextIp(
     return allocator.dupe(u8, normalized);
 }
 
-/// 從 `api.myip.com` 的 JSON 回應中取出公網 IP。
+/// 從 `api.myip.com` 的 JSON 回應中取出對外 IP。
 fn fetchMyIpJson(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
@@ -640,7 +640,7 @@ fn fetchMyIpJson(
         // `api.myip.com` 的 JSON 會有 `"ip": "1.2.3.4"` 這種欄位。
         ip: []const u8,
     };
-    // 用標準庫 JSON parser 把 response body 反序列化。
+    // 用標準庫 JSON 解析器把回應內容反序列化。
     const parsed = try std.json.parseFromSlice(Parsed, allocator, response.body, .{
         // 其他欄位像 country / cc 我們目前沒用到，所以忽略它們。
         .ignore_unknown_fields = true,
@@ -654,7 +654,7 @@ fn fetchMyIpJson(
     return allocator.dupe(u8, normalized);
 }
 
-/// 從 BigDataCloud 的 JSON 回應中取出公網 IP。
+/// 從 BigDataCloud 的 JSON 回應中取出對外 IP。
 fn fetchBigDataCloudJson(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
@@ -735,19 +735,19 @@ fn serviceName(service: PublicIpService) []const u8 {
     };
 }
 
-/// 發出單次 GET 請求並把 body 收成字串。
+/// 發出單次 GET 請求並把回應內容收成字串。
 fn fetchText(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
     url: []const u8,
     extra_headers: []const std.http.Header,
 ) !FetchTextResponse {
-    // 建立一個空的 ArrayList，稍後讓 HTTP client 把 body 直接寫進去。
+    // 建立一個空的 ArrayList，稍後讓 HTTP 客戶端把回應內容直接寫進去。
     var body = std.ArrayList(u8).empty;
     // 如果中途失敗，才需要在錯誤路徑上清理它。
     errdefer body.deinit(allocator);
 
-    // 把 ArrayList 包成 writer，這樣 `client.fetch(...)` 才知道 body 要寫去哪裡。
+    // 把 ArrayList 包成 writer，這樣 `client.fetch(...)` 才知道回應內容要寫去哪裡。
     var response_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &body);
     errdefer response_writer.deinit();
 
@@ -757,11 +757,11 @@ fn fetchText(
     http_log.info("request GET {s}", .{log_url});
 
     const result = client.fetch(.{
-        // 告訴 HTTP client：這次要打的是哪個 URL。
+        // 告訴 HTTP 客戶端：這次要打的是哪個 URL。
         .location = .{ .url = url },
-        // 目前這個 helper 固定只做 GET。
+        // 目前這個輔助函式固定只做 GET。
         .method = .GET,
-        // 把 response body 寫到前面建立好的 `response_writer`。
+        // 把 HTTP 回應內容寫到前面建立好的 `response_writer`。
         .response_writer = &response_writer.writer,
         // 額外 header 例如 No-IP 的 Basic Auth 也從這裡帶入。
         .extra_headers = extra_headers,
@@ -772,7 +772,7 @@ fn fetchText(
     };
 
     // `fromArrayList` 之後，資料其實暫時握在 `response_writer` 手上。
-    // 要先把 ownership 交回 `body`，`body.items` 才會真的有 HTTP 回應內容。
+    // 要先把所有權交回 `body`，`body.items` 才會真的有 HTTP 回應內容。
     body = response_writer.toArrayList();
     // 根據狀態碼和 body 內容寫 response log。
     logHttpResponse(log_url, result.status, body.items);
@@ -786,7 +786,7 @@ fn fetchText(
     };
 }
 
-/// 根據 status code 與 body 內容寫出一筆 HTTP response 日誌。
+/// 根據狀態碼與回應內容寫出一筆 HTTP 回應日誌。
 fn logHttpResponse(
     log_url: []const u8,
     status: std.http.Status,
@@ -802,7 +802,7 @@ fn logHttpResponse(
             "response GET {s} status={d} bytes={d}",
             .{ log_url, @intFromEnum(status), body.len },
         );
-        // body 有內容時，再另外打一筆 debug 級別的 preview。
+        // 回應內容有資料時，再另外打一筆 debug 級別的預覽。
         if (body_preview.len != 0) {
             http_log.debug("response body GET {s}: {s}", .{ log_url, body_preview });
         }
@@ -810,7 +810,7 @@ fn logHttpResponse(
         return;
     }
 
-    // 非 2xx 就當錯誤，一次把狀態碼和 body preview 都記下來。
+    // 非 2xx 就當錯誤，一次把狀態碼和回應內容預覽都記下來。
     http_log.err(
         "response GET {s} status={d} bytes={d} body={s}",
         .{ log_url, @intFromEnum(status), body.len, body_preview },
@@ -885,19 +885,19 @@ fn maskSlice(text: []u8) void {
     }
 }
 
-/// 把 HTTP body 整理成一段短字串，適合寫進 log。
+/// 把 HTTP 回應內容整理成一段短字串，適合寫進 log。
 fn bodyPreviewForLog(buffer: []u8, body: []const u8) []const u8 {
     // buffer 長度如果是 0，就不可能產生預覽。
     if (buffer.len == 0) return "";
 
-    // 如果 body 比 buffer 還長，就代表最後需要截斷。
+    // 如果回應內容比 buffer 還長，就代表最後需要截斷。
     const needs_ellipsis = body.len > buffer.len;
     // 如果需要在尾端補 `...`，就先預留三個位置。
     const preview_limit = if (needs_ellipsis and buffer.len >= 3) buffer.len - 3 else buffer.len;
 
     // `out_index` 指向目前已經寫到 buffer 的哪個位置。
     var out_index: usize = 0;
-    // `body_index` 指向目前正在讀原始 body 的哪個位置。
+    // `body_index` 指向目前正在讀原始回應內容的哪個位置。
     var body_index: usize = 0;
     // 逐字掃描 body，把適合顯示的內容複製到 buffer。
     while (body_index < body.len and out_index < preview_limit) : (body_index += 1) {
@@ -934,7 +934,7 @@ fn buildAfraidUrl(
     allocator: std.mem.Allocator,
     config: config_mod.Afraid,
 ) ![]u8 {
-    // 先拿出設定裡的 base URL。
+    // 先拿出設定裡的基底網址。
     var prefix = config.url;
     // 如果尾端有多個 `/`，先修掉，避免最後網址變成 `//dynamic/...`。
     while (prefix.len != 0 and prefix[prefix.len - 1] == '/') {
@@ -972,7 +972,7 @@ fn buildDynuUrl(
     return std.fmt.allocPrint(
         allocator,
         "{s}?username={s}&password={s}&myip={s}",
-        // 這裡會把 base URL、username、雜湊後密碼、目前 IP 拼成完整網址。
+        // 這裡會把基底網址、username、雜湊後密碼、目前 IP 拼成完整網址。
         .{ prefix, config.username, &password_hex, ip },
     );
 }
@@ -994,7 +994,7 @@ fn buildNoIpUrl(
     return std.fmt.allocPrint(
         allocator,
         "{s}?hostname={s}&myip={s}",
-        // 這三個值依序就是：base URL、主機名稱、目前 IP。
+        // 這三個值依序就是：基底網址、主機名稱、目前 IP。
         .{ prefix, hostname, ip },
     );
 }
@@ -1023,14 +1023,14 @@ fn buildBasicAuthorization(
     return std.fmt.allocPrint(allocator, "Basic {s}", .{encoded});
 }
 
-/// 判斷是否落在 Rust 版原本會略過的凌晨維護時段。
+/// 判斷是否落在 Rust 版原本會跳過的凌晨維護時段。
 fn shouldSkipMaintenanceWindow() bool {
     // Windows 沒有 `localtime_r`，所以改走 Win32 API `GetLocalTime`。
     if (builtin.os.tag == .windows) {
         var local_time: win.SYSTEMTIME = undefined;
         // 把目前本地時間寫進 `local_time`。
         win.GetLocalTime(&local_time);
-        // 再把時、分丟給共用 helper 判斷。
+        // 再把時、分丟給共用輔助函式判斷。
         return shouldSkipMaintenanceWindowAt(local_time.wHour, local_time.wMinute);
     } else {
         // 非 Windows 走 POSIX 的 `localtime_r`。
@@ -1038,14 +1038,14 @@ fn shouldSkipMaintenanceWindow() bool {
         var now: c.time_t = c.time(null);
         // 再準備一個 `tm` 結構來接「拆開後的本地時間」。
         var local_tm: c.struct_tm = undefined;
-        // `orelse return false` 代表：如果 `localtime_r` 失敗，就乾脆不要略過。
+        // `orelse return false` 代表：如果 `localtime_r` 失敗，就乾脆不要跳過。
         _ = c.localtime_r(&now, &local_tm) orelse return false;
         return shouldSkipMaintenanceWindowAt(local_tm.tm_hour, local_tm.tm_min);
     }
 }
 
 /// 真正的規則很單純：
-/// 只要時間落在 02:00 到 02:04，就略過。
+/// 只要時間落在 02:00 到 02:04，就跳過。
 fn shouldSkipMaintenanceWindowAt(hour: c_int, minute: c_int) bool {
     return hour == 2 and minute >= 0 and minute < 5;
 }
@@ -1063,7 +1063,7 @@ test "normalize public ip accepts ipv6" {
 }
 
 test "maintenance window helper matches rust behavior" {
-    // 這個測試確認凌晨 2:00 到 2:04 都會被略過。
+    // 這個測試確認凌晨 2:00 到 2:04 都會被跳過。
     try std.testing.expect(shouldSkipMaintenanceWindowAt(2, 0));
     try std.testing.expect(shouldSkipMaintenanceWindowAt(2, 4));
     try std.testing.expect(!shouldSkipMaintenanceWindowAt(2, 5));
@@ -1143,7 +1143,7 @@ test "body preview for log removes line breaks" {
 
 test "public ip cache key matches rust format" {
     const allocator = std.testing.allocator;
-    // Redis 去重 key 必須和 Rust 版完全同格式，才能沿用同一套資料。
+    // Redis 防重複更新 key 必須和 Rust 版完全同格式，才能沿用同一套資料。
     const key = try buildPublicIpCacheKey(allocator, "1.2.3.4");
     // 記得釋放 `allocPrint(...)` 配出的字串。
     defer allocator.free(key);

@@ -29,18 +29,18 @@ pub fn build(b: *std.Build) void {
     // 這一行同樣會讓使用者可以用 `-Doptimize=...` 來覆寫。
     const optimize = b.standardOptimizeOption(.{});
 
-    // `strip` 代表要不要把除錯符號和 debug info 從產物裡拿掉。
-    // 這會讓 release 版本明顯變小，但除錯資訊也會跟著變少。
+    // `strip` 代表要不要把除錯符號和除錯資訊從產物裡拿掉。
+    // 這會讓釋出版明顯變小，但除錯資訊也會跟著變少。
     //
     // 這裡提供 `-Dstrip=true/false` 給使用者覆寫。
     // 如果使用者沒特別指定，就採用這個規則：
     // - Debug: 不 strip，方便開發與除錯
-    // - 非 Debug: 預設 strip，較接近正式部署版本
+    // - 非 Debug: 預設 strip，較接近正式部署時的版本
     const strip = b.option(bool, "strip", "Strip debug symbols from build artifacts") orelse
         (optimize != .Debug);
 
     // 讀取 `build.zig.zon` 裡宣告的第三方依賴。
-    // 這裡抓的是 vendored 在 `vendor/okredis` 裡的 `zig-okredis`，
+    // 這裡抓的是放在 `vendor/okredis` 裡的 `zig-okredis`，
     // 之後會把它匯入到主程式與測試模組。
     const okredis_dep = b.dependency("okredis", .{
         .target = target,
@@ -48,7 +48,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // 這裡先建立「主模組」。
-    // 你可以把 module 想成：這個可執行檔最上層的原始碼入口與編譯選項集合。
+    // 你可以把模組想成：這個可執行檔最上層的原始碼入口與編譯選項集合。
     const exe_module = b.createModule(.{
         // `root_source_file` 指定這個模組從哪支 Zig 檔開始。
         // 也就是說，整個程式的入口是 `src/main.zig`。
@@ -57,8 +57,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         // 把剛剛決定好的最佳化等級套進來。
         .optimize = optimize,
-        // 讓 executable 的 root module 依照上面的 strip 設定決定
-        // 要不要保留 debug info。
+        // 讓可執行檔的根模組依照上面的 strip 設定決定
+        // 要不要保留除錯資訊。
         .strip = strip,
         // 這個專案有用到 `@cImport` 與 libc 時間函式，
         // 所以這裡要明確要求連結 libc。
@@ -68,11 +68,11 @@ pub fn build(b: *std.Build) void {
     // 之後在原始碼裡就能直接寫 `@import("okredis")`。
     exe_module.addImport("okredis", okredis_dep.module("okredis"));
 
-    // 這裡才是把剛剛的 module 變成真正的 executable。
+    // 這裡才是把剛剛的模組變成真正的可執行檔。
     const exe = b.addExecutable(.{
         // `.name` 決定最後產出的執行檔名稱。
         .name = "dynip",
-        // `.root_module` 告訴 Zig：「這個執行檔要用哪個 module 當主體」。
+        // `.root_module` 告訴 Zig：「這個執行檔要用哪個模組當主體」。
         .root_module = exe_module,
     });
 
@@ -95,7 +95,7 @@ pub fn build(b: *std.Build) void {
         // 如果真的有帶參數，就把這些參數原封不動轉給程式本身。
         run_cmd.addArgs(args);
     } else {
-        // 如果完全沒帶參數，這個專案想要的預設行為是直接啟動 service。
+        // 如果完全沒帶參數，這個專案想要的預設行為是直接啟動服務。
         // 所以自動幫使用者補上一個 `"service"`。
         //
         // 這樣你在 IDE 直接按 Run，或在終端直接打 `zig build run`，
@@ -111,7 +111,7 @@ pub fn build(b: *std.Build) void {
     // 也就是先建出程式，再執行它。
     run_step.dependOn(&run_cmd.step);
 
-    // 測試也需要一個自己的 root module。
+    // 測試也需要一個自己的根模組。
     // 因為這個專案的測試散在多個檔案內，所以用 `src/tests.zig`
     // 當作「測試總入口」，在裡面把所有有 test 的模組都 import 進來。
     const test_module = b.createModule(.{
@@ -121,7 +121,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         // 測試也要知道最佳化等級。
         .optimize = optimize,
-        // 測試 module 也沿用同一個 strip 規則。
+        // 測試模組也沿用同一個 strip 規則。
         .strip = strip,
         // 測試裡一樣會碰到 libc 相關程式碼，所以也連結 libc。
         .link_libc = true,
@@ -130,13 +130,13 @@ pub fn build(b: *std.Build) void {
     test_module.addImport("okredis", okredis_dep.module("okredis"));
 
     // `addTest` 代表建立「編譯測試」這件事。
-    // 注意：這時還只是建立測試 artifact，還沒真的跑。
+    // 注意：這時還只是建立測試產物，還沒真的執行。
     const unit_tests = b.addTest(.{
-        // 告訴 Zig：「測試要從哪個 root module 開始」。
+        // 告訴 Zig：「測試要從哪個根模組開始」。
         .root_module = test_module,
     });
 
-    // 有了測試 artifact 之後，再建立「執行測試」的命令。
+    // 有了測試產物之後，再建立「執行測試」的命令。
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
     // 建立名字叫 `test` 的 build step。
