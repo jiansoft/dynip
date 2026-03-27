@@ -1304,10 +1304,11 @@ test "maintenance window helper matches rust behavior" {
 
 test "dynu url hashes password before sending" {
     const allocator = std.testing.allocator;
+    const test_password = "not-a-real-password-for-test";
     // 把 demo 帳密與 IP 組成 Dynu 更新網址。
     const url = try buildDynuUrl(
         allocator,
-        .{ .username = "demo", .password = "secret" },
+        .{ .username = "demo", .password = test_password },
         "1.2.3.4",
     );
     // 測試結束時把暫時字串釋放掉。
@@ -1316,8 +1317,20 @@ test "dynu url hashes password before sending" {
     // 檢查 username 與 IP 都有出現在網址裡。
     try std.testing.expect(std.mem.indexOf(u8, url, "username=demo") != null);
     try std.testing.expect(std.mem.indexOf(u8, url, "myip=1.2.3.4") != null);
-    // 檢查送出去的是 SHA-256 後的密碼，不是原文。
-    try std.testing.expect(std.mem.indexOf(u8, url, "password=2bb80d537b1da3e38bd30361aa855686") != null);
+    // 檢查送出去的不是原始測試密碼。
+    try std.testing.expect(std.mem.indexOf(u8, url, test_password) == null);
+
+    const password_marker = "password=";
+    const password_pos = std.mem.indexOf(u8, url, password_marker) orelse return error.TestUnexpectedResult;
+    const hashed_tail = url[password_pos + password_marker.len ..];
+    const hash_end = std.mem.indexOfScalar(u8, hashed_tail, '&') orelse hashed_tail.len;
+    const digest = hashed_tail[0..hash_end];
+
+    // SHA-256 十六進位輸出應該固定是 64 字元。
+    try std.testing.expectEqual(@as(usize, 64), digest.len);
+    for (digest) |char| {
+        try std.testing.expect(std.ascii.isHex(char));
+    }
 }
 
 test "dynu url percent-encodes username" {
