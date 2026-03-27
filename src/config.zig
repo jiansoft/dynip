@@ -31,6 +31,9 @@ pub const AppConfig = struct {
     ddns: Ddns = .{},
 };
 
+/// 寫進日誌前用來取代 token / password 的固定遮罩字串。
+pub const masked_secret = "*****";
+
 /// Afraid.org DDNS 設定。
 pub const Afraid = struct {
     /// 是否啟用 Afraid 更新。
@@ -136,6 +139,26 @@ pub fn loadLeaky(
     try applyProcessEnvOverridesLeaky(allocator, &config);
     // 回傳最後生效的設定。
     return config;
+}
+
+/// 建立一份適合寫進日誌的安全設定副本。
+///
+/// 這個函式會保留原本的功能性設定，
+/// 但把密碼與 token 欄位改成 [`masked_secret`]。
+pub fn redactedForLog(app_config: AppConfig) AppConfig {
+    // 先把整份設定做一次值複製，
+    // 這樣後面改的是副本，不會動到原本真的要拿來跑服務的設定。
+    var redacted = app_config;
+    // 如果 Afraid token 不是空字串，就把它換成固定遮罩字串。
+    redactIfPresent(&redacted.afraid.token);
+    // 如果 Dynu 密碼不是空字串，就把它換成固定遮罩字串。
+    redactIfPresent(&redacted.dyny.password);
+    // 如果 No-IP 密碼不是空字串，就把它換成固定遮罩字串。
+    redactIfPresent(&redacted.noip.password);
+    // 如果 Redis 密碼不是空字串，就把它換成固定遮罩字串。
+    redactIfPresent(&redacted.ddns.redis.password);
+    // 回傳這份「可安全寫進日誌」的設定副本。
+    return redacted;
 }
 
 /// 將 JSON 文字解析成設定結構。
@@ -255,70 +278,36 @@ fn applyProcessEnvOverridesLeaky(allocator: std.mem.Allocator, config: *AppConfi
     // 1. 先用 `getEnv("某個名稱")` 看環境變數有沒有存在
     // 2. 如果有，就把那個值交給 `applyOverrideValueLeaky(...)`
     // 3. 由後者決定要寫進 `AppConfig` 的哪個欄位
-    if (getEnv("AFRAID_URL")) |value| {
-        try applyOverrideValueLeaky(allocator, config, "AFRAID_URL", value);
-    }
-    if (getEnv("AFRAID_ENABLED")) |value| {
-        try applyOverrideValueLeaky(allocator, config, "AFRAID_ENABLED", value);
-    }
-    if (getEnv("AFRAID_PATH")) |value| {
-        try applyOverrideValueLeaky(allocator, config, "AFRAID_PATH", value);
-    }
-    if (getEnv("AFRAID_TOKEN")) |value| {
-        try applyOverrideValueLeaky(allocator, config, "AFRAID_TOKEN", value);
-    }
-
-    if (getEnv("DYNU_ENABLED")) |value| {
-        try applyOverrideValueLeaky(allocator, config, "DYNU_ENABLED", value);
-    }
-    if (getEnv("DYNU_URL")) |value| {
-        try applyOverrideValueLeaky(allocator, config, "DYNU_URL", value);
-    }
-    if (getEnv("DYNU_USERNAME")) |value| {
-        try applyOverrideValueLeaky(allocator, config, "DYNU_USERNAME", value);
-    }
-    if (getEnv("DYNU_PASSWORD")) |value| {
-        try applyOverrideValueLeaky(allocator, config, "DYNU_PASSWORD", value);
-    }
-
-    if (getEnv("NOIP_ENABLED")) |value| {
-        try applyOverrideValueLeaky(allocator, config, "NOIP_ENABLED", value);
-    }
-    if (getEnv("NOIP_URL")) |value| {
-        try applyOverrideValueLeaky(allocator, config, "NOIP_URL", value);
-    }
-    if (getEnv("NOIP_USERNAME")) |value| {
-        try applyOverrideValueLeaky(allocator, config, "NOIP_USERNAME", value);
-    }
-    if (getEnv("NOIP_PASSWORD")) |value| {
-        try applyOverrideValueLeaky(allocator, config, "NOIP_PASSWORD", value);
-    }
-    if (getEnv("NOIP_HOSTNAMES")) |value| {
-        try applyOverrideValueLeaky(allocator, config, "NOIP_HOSTNAMES", value);
-    }
-
-    if (getEnv("REDIS_ADDR")) |value| {
-        try applyOverrideValueLeaky(allocator, config, "REDIS_ADDR", value);
-    }
-    if (getEnv("REDIS_ENABLED")) |value| {
-        try applyOverrideValueLeaky(allocator, config, "REDIS_ENABLED", value);
-    }
-    if (getEnv("REDIS_ACCOUNT")) |value| {
-        try applyOverrideValueLeaky(allocator, config, "REDIS_ACCOUNT", value);
-    }
-    if (getEnv("REDIS_PASSWORD")) |value| {
-        try applyOverrideValueLeaky(allocator, config, "REDIS_PASSWORD", value);
-    }
-    if (getEnv("REDIS_DB")) |value| {
-        try applyOverrideValueLeaky(allocator, config, "REDIS_DB", value);
-    }
-    if (getEnv("DDNS_DEDUPE_TTL_SECONDS")) |value| {
-        try applyOverrideValueLeaky(allocator, config, "DDNS_DEDUPE_TTL_SECONDS", value);
-    }
-    if (getEnv("DDNS_REFRESH_INTERVAL_SECONDS")) |value| {
-        try applyOverrideValueLeaky(allocator, config, "DDNS_REFRESH_INTERVAL_SECONDS", value);
+    for (env_override_keys) |key| {
+        if (getEnv(key)) |value| {
+            try applyOverrideValueLeaky(allocator, config, key, value);
+        }
     }
 }
+
+/// 集中管理支援的環境變數名稱，避免在讀取流程散落重複 if。
+const env_override_keys = [_][:0]const u8{
+    "AFRAID_URL",
+    "AFRAID_ENABLED",
+    "AFRAID_PATH",
+    "AFRAID_TOKEN",
+    "DYNU_ENABLED",
+    "DYNU_URL",
+    "DYNU_USERNAME",
+    "DYNU_PASSWORD",
+    "NOIP_ENABLED",
+    "NOIP_URL",
+    "NOIP_USERNAME",
+    "NOIP_PASSWORD",
+    "NOIP_HOSTNAMES",
+    "REDIS_ADDR",
+    "REDIS_ENABLED",
+    "REDIS_ACCOUNT",
+    "REDIS_PASSWORD",
+    "REDIS_DB",
+    "DDNS_DEDUPE_TTL_SECONDS",
+    "DDNS_REFRESH_INTERVAL_SECONDS",
+};
 
 /// 依 key 把覆寫值寫進設定結構。
 fn applyOverrideValueLeaky(
@@ -484,6 +473,12 @@ fn getEnv(name: [*:0]const u8) ?[]const u8 {
     return std.mem.span(value);
 }
 
+/// 只有原值非空時才改成遮罩，避免把空字串誤寫成看似有秘密。
+fn redactIfPresent(value: *[]const u8) void {
+    if (value.*.len == 0) return;
+    value.* = masked_secret;
+}
+
 test "load config ignores unrelated rust settings" {
     // 這個測試確保：
     // Rust 原本 `app.json` 裡那些我們還沒移植的欄位，
@@ -533,6 +528,20 @@ test "load config ignores unrelated rust settings" {
     try std.testing.expectEqual(@as(usize, 2), config.noip.hostnames.len);
     try std.testing.expectEqualStrings("demo.ddns.net", config.noip.hostnames[0]);
     try std.testing.expect(!config.ddns.redis.enabled);
+}
+
+test "redacted config masks secrets only when present" {
+    const redacted = redactedForLog(.{
+        .afraid = .{ .token = "afraid-secret" },
+        .dyny = .{ .password = "dynu-secret" },
+        .noip = .{ .password = "noip-secret" },
+        .ddns = .{ .redis = .{ .password = "redis-secret" } },
+    });
+
+    try std.testing.expectEqualStrings(masked_secret, redacted.afraid.token);
+    try std.testing.expectEqualStrings(masked_secret, redacted.dyny.password);
+    try std.testing.expectEqualStrings(masked_secret, redacted.noip.password);
+    try std.testing.expectEqualStrings(masked_secret, redacted.ddns.redis.password);
 }
 
 test "parse noip hostnames from env style json" {

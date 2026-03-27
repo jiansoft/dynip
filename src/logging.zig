@@ -348,11 +348,15 @@ pub fn logFn(
         // `scope == .default` 代表沒有特別的分類，就用 null 表示。
         const scope_name = if (scope == .default) null else @tagName(scope);
         logger.writeRendered(level, scope_name, rendered);
+        // console 也直接用同一份已格式化字串輸出，
+        // 避免檔案和終端機顯示不同步。
+        writeRenderedToConsole(level, scope_name, rendered);
+        return;
     }
 
-    // 同時也保留 Zig 預設的 console log 行為，
-    // 所以終端機上仍然看得到訊息。
-    std.log.defaultLog(level, scope, format, args);
+    // 如果 logger 尚未初始化，仍然直接輸出到 console，
+    // 避免初始化前的錯誤訊息被吞掉。
+    writeRenderedToConsole(level, if (scope == .default) null else @tagName(scope), rendered);
 }
 
 /// 直接寫入 info 檔案。
@@ -406,6 +410,19 @@ fn consoleWithLevel(level_text: []const u8, message: []const u8) void {
     var timestamp_buffer: [32]u8 = undefined;
     const timestamp = formatConsoleTimestamp(&timestamp_buffer) catch "0000-00-00 00:00:00";
     std.debug.print("{s} {s} {s}\n", .{ timestamp, level_text, message });
+}
+
+/// 把 `std.log` 已格式化完成的訊息直接鏡像到 console。
+fn writeRenderedToConsole(
+    level: std.log.Level,
+    scope_name: ?[]const u8,
+    message: []const u8,
+) void {
+    if (scope_name) |scope_text| {
+        std.debug.print("{s}({s}): {s}\n", .{ levelText(level), scope_text, message });
+    } else {
+        std.debug.print("{s}: {s}\n", .{ levelText(level), message });
+    }
 }
 
 /// 產生 console 用的時間字串，例如 `2026-03-25 18:30:00`。

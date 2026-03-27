@@ -22,10 +22,8 @@ const config_mod = @import("config.zig");
 ///
 /// DDNS 防重複更新現在要真的查 Redis，所以更新流程會呼叫這個模組。
 const redis = @import("redis.zig");
-/// 建立 HTTP 專用的日誌分類。
-///
-/// 之後用 `http_log.info(...)` 時，日誌就會帶上 `(http)` 這個分類。
-const http_log = std.log.scoped(.http);
+/// 匯入共用 HTTP 文字抓取與日誌輔助。
+const http_text = @import("http_text.zig");
 
 /// 匯入 C 的 `time.h`。
 ///
@@ -78,18 +76,20 @@ const ServiceSummary = struct {
     succeeded: usize = 0,
 };
 
-/// 本地 `fetchText(...)` 輔助函式回傳的資料。
-const FetchTextResponse = struct {
-    /// HTTP 狀態碼，例如 200、404。
-    status: std.http.Status,
-    /// 完整 HTTP 回應內容。
-    body: []u8,
+/// 同一個行程內最近一次成功處理過的 public IP。
+const ProcessPublicIpState = struct {
+    /// 保護整份狀態的互斥鎖。
+    mutex: std.atomic.Mutex = .unlocked,
+    /// 是否已經記過至少一次 IP。
+    initialized: bool = false,
+    /// 最近一次成功處理過的 IP 長度。
+    len: usize = 0,
+    /// public IPv4 / IPv6 文字都很短，用固定 buffer 就夠。
+    buffer: [64]u8 = undefined,
 };
 
-/// 寫 HTTP request / response log 時，網址預覽用的暫存 buffer 長度。
-const http_log_url_buffer_len = 512;
 /// 寫 HTTP body 預覽時，最多保留的字元數。
-const http_log_body_preview_len = 256;
+const http_log_body_preview_len = http_text.body_preview_len;
 /// Public IP lookup 只需要很短的 DNS / TCP connect timeout。
 const public_ip_connect_timeout: std.Io.Timeout = .{ .duration = .{
     .raw = .fromSeconds(3),
@@ -113,6 +113,8 @@ var local_dedupe_entries: std.ArrayListUnmanaged(LocalDedupeEntry) = .empty;
 const local_dedupe_shrink_min_capacity: usize = 32;
 /// 當容量至少是目前長度的這個倍數時，才執行 shrink。
 const local_dedupe_shrink_slack_factor: usize = 4;
+/// 同一個服務行程內，記住最近一次成功處理的 public IP。
+var process_public_ip_state: ProcessPublicIpState = .{};
 
 /// 集中管理這個模組會打到的第三方網址。
 ///
@@ -183,20 +185,20 @@ pub fn refresh(
 
     // 先抓目前對外 IP。
     const ip_now = try getPublicIp(scratch, &client);
-    // 再組出和 Rust 專案相同格式的 Redis key。
-    const cache_key = try buildPublicIpCacheKey(scratch, ip_now);
+    // 如果同一個行程上次已經成功處理過相同 IP，
+    // 這一輪就直接跳過，不再碰 Redis。
+    if (isSameAsLastProcessedIp(ip_now)) {
+        std.log.info(
+            "skip ddns refresh because public ip is unchanged in current process: {s}",
+            .{ip_now},
+        );
+        return .skipped_cached_ip;
+    }
     // 先算出這次 dedupe 要用的 TTL。
     const ttl_seconds = if (config.ddns.dedupe_ttl_seconds == 0)
         @as(u64, 60 * 60 * 24)
     else
         config.ddns.dedupe_ttl_seconds;
-
-    // 先做防重複更新檢查：
-    // - Redis 啟用時走 Redis
-    // - Redis 關閉時改成本機記憶體
-    if (try isDedupeHit(scratch, io, config.ddns.redis, cache_key)) {
-        return .skipped_cached_ip;
-    }
 
     // 真的去更新所有有完成設定的 DDNS 供應商。
     const summary = try updateDdnsServices(scratch, &client, config, ip_now);
@@ -206,6 +208,7 @@ pub fn refresh(
     if (summary.succeeded == 0) return error.AllDdnsUpdatesFailed;
 
     // 至少有一個供應商更新成功後，才把這個 IP 寫進 dedupe cache。
+    const cache_key = try buildPublicIpCacheKey(scratch, ip_now);
     if (!config.ddns.redis.enabled) {
         try rememberDedupe(scratch, io, config.ddns.redis, cache_key, ip_now, ttl_seconds);
     } else {
@@ -218,6 +221,9 @@ pub fn refresh(
             ttl_seconds,
         );
     }
+    // 這次至少已經成功處理完一輪，就把目前 IP 記在行程內狀態，
+    // 之後同 IP 的輪次可以直接跳過，不必再碰 Redis。
+    rememberLastProcessedIp(ip_now);
 
     // 最後寫一筆總結 log，讓你知道這輪使用哪個 IP，以及成功幾個供應商。
     std.log.info(
@@ -235,6 +241,46 @@ fn buildPublicIpCacheKey(allocator: std.mem.Allocator, ip: []const u8) ![]u8 {
 /// 固定用來保存「目前最新對外 IP」的 Redis key。
 fn currentPublicIpRedisKey() []const u8 {
     return "MyPublicIP";
+}
+
+/// 判斷目前 IP 是否和同一個行程上次成功處理的 IP 相同。
+fn isSameAsLastProcessedIp(ip: []const u8) bool {
+    lockProcessPublicIpState();
+    defer process_public_ip_state.mutex.unlock();
+
+    if (!process_public_ip_state.initialized) return false;
+    return std.mem.eql(
+        u8,
+        process_public_ip_state.buffer[0..process_public_ip_state.len],
+        ip,
+    );
+}
+
+/// 把這次已成功處理的 public IP 記到行程內狀態。
+fn rememberLastProcessedIp(ip: []const u8) void {
+    lockProcessPublicIpState();
+    defer process_public_ip_state.mutex.unlock();
+
+    const copy_len = @min(ip.len, process_public_ip_state.buffer.len);
+    @memcpy(process_public_ip_state.buffer[0..copy_len], ip[0..copy_len]);
+    process_public_ip_state.len = copy_len;
+    process_public_ip_state.initialized = true;
+}
+
+/// 重設行程內 public IP 狀態，供測試使用。
+fn resetProcessPublicIpState() void {
+    lockProcessPublicIpState();
+    defer process_public_ip_state.mutex.unlock();
+
+    process_public_ip_state.initialized = false;
+    process_public_ip_state.len = 0;
+}
+
+/// 用和本模組其他 shared state 一致的方式取得 process IP mutex。
+fn lockProcessPublicIpState() void {
+    while (!process_public_ip_state.mutex.tryLock()) {
+        std.atomic.spinLoopHint();
+    }
 }
 
 /// 檢查目前這個 IP 是否已經在防重複更新快取裡。
@@ -529,19 +575,24 @@ fn updateAfraid(
     // 先把 Afraid 更新網址組出來。
     const url = try buildAfraidUrl(allocator, config);
     // 打 HTTP GET。
-    const response = try fetchText(allocator, client, url, &.{}, ddns_connect_timeout);
+    const response = try http_text.fetchText(allocator, client, url, &.{}, .{
+        .connect_timeout = ddns_connect_timeout,
+    });
     // 用完 body 後要記得釋放。
     defer allocator.free(response.body);
 
     // 先確認 HTTP 狀態碼是 2xx。
-    try ensureSuccessStatus(response.status, response.body);
-    // Afraid 回應如果包含 `Updated`，就把預覽內容打進 log。
-    if (std.mem.indexOf(u8, response.body, "Updated") != null) {
-        // 這塊 buffer 只是臨時拿來裝 log 預覽文字。
-        var preview_buffer: [http_log_body_preview_len]u8 = undefined;
-        // `bodyPreviewForLog(...)` 會把太長或有換行的內容整理成較安全的 log 文字。
-        std.log.info("afraid response: {s}", .{bodyPreviewForLog(&preview_buffer, response.body)});
+    try http_text.ensureSuccessStatus(response.status, response.body);
+    // Afraid 會把「真的更新」和「IP 沒變」都放在 body 裡，
+    // 所以不能只看 HTTP 200，還要檢查 body 是否屬於可接受結果。
+    if (!containsExpectedAfraidResponse(response.body)) {
+        // 如果 body 不是我們認得的成功/未變更訊息，就把它視為非預期回應。
+        return error.UnexpectedAfraidResponse;
     }
+    // 不論這次是 Updated 還是 Address has not changed，都明確寫一筆日誌，
+    // 這樣就不會看起來像 Afraid 這條路徑完全沒執行。
+    var preview_buffer: [http_log_body_preview_len]u8 = undefined;
+    std.log.info("afraid response: {s}", .{http_text.bodyPreviewForLog(&preview_buffer, response.body)});
 }
 
 /// 呼叫 Dynu 的 DDNS API。
@@ -554,12 +605,14 @@ fn updateDynu(
     // Dynu 需要把目前 IP 也組進更新網址。
     const url = try buildDynuUrl(allocator, config, ip);
     // 真正把請求送出去。
-    const response = try fetchText(allocator, client, url, &.{}, ddns_connect_timeout);
+    const response = try http_text.fetchText(allocator, client, url, &.{}, .{
+        .connect_timeout = ddns_connect_timeout,
+    });
     // 用完 body 之後歸還記憶體。
     defer allocator.free(response.body);
 
     // 先確保不是 404 / 500 這種 HTTP 層級錯誤。
-    try ensureSuccessStatus(response.status, response.body);
+    try http_text.ensureSuccessStatus(response.status, response.body);
     // Dynu 常見成功回應是 `good` 或 `nochg`。
     // 如果不是這兩種，就把它視為非預期內容。
     if (!containsGoodOrNochg(response.body)) {
@@ -567,7 +620,7 @@ fn updateDynu(
     }
     // 建一塊暫時 buffer，讓回應內容可以整理後寫進 log。
     var preview_buffer: [http_log_body_preview_len]u8 = undefined;
-    std.log.info("dynu response: {s}", .{bodyPreviewForLog(&preview_buffer, response.body)});
+    std.log.info("dynu response: {s}", .{http_text.bodyPreviewForLog(&preview_buffer, response.body)});
 }
 
 /// 呼叫 No-IP 的 DDNS API。
@@ -589,12 +642,14 @@ fn updateNoIp(
         // 先為這一個 hostname 組出更新網址。
         const url = try buildNoIpUrl(allocator, config, hostname, ip);
         // 再帶著 Basic Auth header 送出請求。
-        const response = try fetchText(allocator, client, url, &headers, ddns_connect_timeout);
+        const response = try http_text.fetchText(allocator, client, url, &headers, .{
+            .connect_timeout = ddns_connect_timeout,
+        });
         // 每個 hostname 的回應內容用完都要釋放。
         defer allocator.free(response.body);
 
         // 先確認 HTTP 本身有沒有成功。
-        try ensureSuccessStatus(response.status, response.body);
+        try http_text.ensureSuccessStatus(response.status, response.body);
         // No-IP 成功回應也會是 `good` 或 `nochg`。
         if (!containsGoodOrNochg(response.body)) {
             return error.UnexpectedNoIpResponse;
@@ -603,9 +658,18 @@ fn updateNoIp(
         var preview_buffer: [http_log_body_preview_len]u8 = undefined;
         std.log.info("no-ip response ({s}): {s}", .{
             hostname,
-            bodyPreviewForLog(&preview_buffer, response.body),
+            http_text.bodyPreviewForLog(&preview_buffer, response.body),
         });
     }
+}
+
+/// 判斷 Afraid 回應是否屬於「成功」或「IP 未變」這兩種可接受結果。
+fn containsExpectedAfraidResponse(body: []const u8) bool {
+    // Afraid 文件與實際行為常見兩種正文：
+    // 1. `Updated ...`
+    // 2. `ERROR: Address x.x.x.x has not changed.`
+    return std.mem.indexOf(u8, body, "Updated") != null or
+        std.mem.indexOf(u8, body, "has not changed") != null;
 }
 
 /// 取得目前對外 IP。
@@ -702,12 +766,14 @@ fn fetchTextIp(
     url: []const u8,
 ) ![]const u8 {
     // 這類來源站直接回傳純文字 IP，所以只要 GET 之後做基本檢查即可。
-    const response = try fetchText(allocator, client, url, &.{}, public_ip_connect_timeout);
+    const response = try http_text.fetchText(allocator, client, url, &.{}, .{
+        .connect_timeout = public_ip_connect_timeout,
+    });
     // `response.body` 是動態配置出來的字串，用完一定要釋放。
     defer allocator.free(response.body);
 
     // HTTP 不是 2xx 的話，這裡就會直接回錯。
-    try ensureSuccessStatus(response.status, response.body);
+    try http_text.ensureSuccessStatus(response.status, response.body);
     // 把 body 裡可能的空白、換行整理掉，順便驗證這真的是 IP。
     const normalized = try normalizePublicIp(response.body);
     // `normalized` 只是指向 `response.body` 裡的一段 slice。
@@ -723,11 +789,13 @@ fn fetchMyIpJson(
 ) ![]const u8 {
     // 這個來源站回的是 JSON，不是純文字 IP。
     // 真正網址不寫死在這裡，而是由呼叫端從集中管理區塊傳進來。
-    const response = try fetchText(allocator, client, url, &.{}, public_ip_connect_timeout);
+    const response = try http_text.fetchText(allocator, client, url, &.{}, .{
+        .connect_timeout = public_ip_connect_timeout,
+    });
     defer allocator.free(response.body);
 
     // 先處理 HTTP 層面的成功 / 失敗。
-    try ensureSuccessStatus(response.status, response.body);
+    try http_text.ensureSuccessStatus(response.status, response.body);
 
     // 這個匿名 struct 只描述我們這次真正要用到的欄位。
     const Parsed = struct {
@@ -756,11 +824,13 @@ fn fetchBigDataCloudJson(
 ) ![]const u8 {
     // 這個來源站也回 JSON。
     // 真正網址同樣由呼叫端從集中管理區塊傳進來。
-    const response = try fetchText(allocator, client, url, &.{}, public_ip_connect_timeout);
+    const response = try http_text.fetchText(allocator, client, url, &.{}, .{
+        .connect_timeout = public_ip_connect_timeout,
+    });
     defer allocator.free(response.body);
 
     // 先確認 HTTP 請求本身沒失敗。
-    try ensureSuccessStatus(response.status, response.body);
+    try http_text.ensureSuccessStatus(response.status, response.body);
 
     // BigDataCloud 的欄位名稱是 `ipString`。
     const Parsed = struct {
@@ -793,21 +863,6 @@ fn normalizePublicIp(text: []const u8) ![]const u8 {
     return trimmed;
 }
 
-/// 確認 HTTP 狀態碼是不是 2xx。
-fn ensureSuccessStatus(status: std.http.Status, body: []const u8) !void {
-    // `status.class()` 會把 200 / 201 / 204 這種歸到 `.success`。
-    if (status.class() != .success) {
-        // 非 2xx 時，先準備一小段 body 預覽幫助除錯。
-        var preview_buffer: [http_log_body_preview_len]u8 = undefined;
-        std.log.err("unexpected http status {d}: {s}", .{
-            @intFromEnum(status),
-            bodyPreviewForLog(&preview_buffer, body),
-        });
-        // 再把錯誤往外丟，讓上層知道這次 HTTP 失敗。
-        return error.UnexpectedHttpStatus;
-    }
-}
-
 /// 判斷某個 DDNS 回應內容是否代表成功或「已經是最新」。
 fn containsGoodOrNochg(text: []const u8) bool {
     // `good` 表示真的更新成功，`nochg` 表示對方認定已經是最新 IP。
@@ -827,293 +882,6 @@ fn serviceName(service: PublicIpService) []const u8 {
         .myip => "myip",
         .bigdatacloud => "bigdatacloud",
     };
-}
-
-/// 發出單次 GET 請求並把回應內容收成字串。
-fn fetchText(
-    allocator: std.mem.Allocator,
-    client: *std.http.Client,
-    url: []const u8,
-    extra_headers: []const std.http.Header,
-    connect_timeout: std.Io.Timeout,
-) !FetchTextResponse {
-    // 建立一個空的 ArrayList，稍後讓 HTTP 客戶端把回應內容直接寫進去。
-    var body = std.ArrayList(u8).empty;
-    // 如果中途失敗，才需要在錯誤路徑上清理它。
-    errdefer body.deinit(allocator);
-
-    // 把 ArrayList 包成 writer，這樣 `client.fetch(...)` 才知道回應內容要寫去哪裡。
-    var response_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &body);
-    errdefer response_writer.deinit();
-
-    // 先組出一份遮罩過敏感值的網址，專門拿來寫 log。
-    var log_url_buffer: [http_log_url_buffer_len]u8 = undefined;
-    const log_url = urlForLog(&log_url_buffer, url);
-    http_log.info("request GET {s}", .{log_url});
-
-    const response = executeGetRequest(
-        allocator,
-        client,
-        url,
-        extra_headers,
-        connect_timeout,
-        log_url,
-        &response_writer.writer,
-    ) catch |err| {
-        return err;
-    };
-
-    // `fromArrayList` 之後，資料其實暫時握在 `response_writer` 手上。
-    // 要先把所有權交回 `body`，`body.items` 才會真的有 HTTP 回應內容。
-    body = response_writer.toArrayList();
-    // 根據狀態碼和 body 內容寫 response log。
-    logHttpResponse(log_url, response.status, body.items);
-
-    // 把 ArrayList 轉成真正屬於呼叫端的 slice。
-    return .{
-        // 原封不動把 HTTP 狀態碼帶出去。
-        .status = response.status,
-        // `toOwnedSlice` 會把目前 ArrayList 裡的資料交成一塊獨立字串。
-        .body = try body.toOwnedSlice(allocator),
-    };
-}
-
-/// 執行不帶 payload 的單次 GET，並把回應寫到指定 writer。
-fn executeGetRequest(
-    allocator: std.mem.Allocator,
-    client: *std.http.Client,
-    url: []const u8,
-    extra_headers: []const std.http.Header,
-    connect_timeout: std.Io.Timeout,
-    log_url: []const u8,
-    response_writer: *std.Io.Writer,
-) !struct { status: std.http.Status } {
-    _ = allocator;
-
-    const uri = std.Uri.parse(url) catch |err| {
-        http_log.err("invalid request url {s}: {}", .{ log_url, err });
-        return err;
-    };
-    const protocol = std.http.Client.Protocol.fromUri(uri) orelse return error.UnsupportedUriScheme;
-    try ensureTlsClientReady(client, protocol);
-    var host_name_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
-    const host_name = try uri.getHost(&host_name_buffer);
-    const port: u16 = uri.port orelse switch (protocol) {
-        .plain => @as(u16, 80),
-        .tls => @as(u16, 443),
-    };
-    const connection = client.connectTcpOptions(.{
-        .host = host_name,
-        .port = port,
-        .protocol = protocol,
-        .timeout = connect_timeout,
-    }) catch |err| {
-        http_log.err("request connect GET {s} failed: {}", .{ log_url, err });
-        return err;
-    };
-
-    var request = client.request(.GET, uri, .{
-        .connection = connection,
-        .keep_alive = true,
-        .headers = .{
-            .accept_encoding = .omit,
-        },
-        .extra_headers = extra_headers,
-    }) catch |err| {
-        // 請求本身失敗時，先寫 error log，再把錯誤往外丟。
-        http_log.err("request GET {s} failed: {}", .{ log_url, err });
-        return err;
-    };
-    defer request.deinit();
-
-    request.sendBodiless() catch |err| {
-        http_log.err("request send GET {s} failed: {}", .{ log_url, err });
-        return err;
-    };
-
-    var redirect_buffer: [8 * 1024]u8 = undefined;
-    var response = request.receiveHead(&redirect_buffer) catch |err| {
-        http_log.err("request receive GET {s} failed: {}", .{ log_url, err });
-        return err;
-    };
-    const reader = response.reader(&.{});
-    _ = reader.streamRemaining(response_writer) catch |err| {
-        http_log.err("response read GET {s} failed: {}", .{ log_url, err });
-        return err;
-    };
-    return .{ .status = response.head.status };
-}
-
-/// 顯式走 `connectTcpOptions(...)` 前，先補齊 stdlib request() 會做的 TLS 初始化。
-fn ensureTlsClientReady(
-    client: *std.http.Client,
-    protocol: std.http.Client.Protocol,
-) !void {
-    if (protocol != .tls) return;
-    if (std.http.Client.disable_tls) return error.TlsInitializationFailed;
-
-    const io = client.io;
-    {
-        try client.ca_bundle_lock.lockShared(io);
-        defer client.ca_bundle_lock.unlockShared(io);
-        if (client.now != null) return;
-    }
-
-    var bundle: std.crypto.Certificate.Bundle = .empty;
-    defer bundle.deinit(client.allocator);
-    const now = std.Io.Clock.real.now(io);
-    bundle.rescan(client.allocator, io, now) catch |err| switch (err) {
-        error.Canceled => |e| return e,
-        else => return error.CertificateBundleLoadFailure,
-    };
-
-    try client.ca_bundle_lock.lock(io);
-    defer client.ca_bundle_lock.unlock(io);
-    client.now = now;
-    std.mem.swap(std.crypto.Certificate.Bundle, &client.ca_bundle, &bundle);
-}
-
-/// 根據狀態碼與回應內容寫出一筆 HTTP 回應日誌。
-fn logHttpResponse(
-    log_url: []const u8,
-    status: std.http.Status,
-    body: []const u8,
-) void {
-    // 先把 body 整理成適合輸出的短預覽。
-    var preview_buffer: [http_log_body_preview_len]u8 = undefined;
-    const body_preview = bodyPreviewForLog(&preview_buffer, body);
-
-    // 2xx 當成成功。
-    if (status.class() == .success) {
-        http_log.info(
-            "response GET {s} status={d} bytes={d}",
-            .{ log_url, @intFromEnum(status), body.len },
-        );
-        // 回應內容有資料時，再另外打一筆 debug 級別的預覽。
-        if (body_preview.len != 0) {
-            http_log.debug("response body GET {s}: {s}", .{ log_url, body_preview });
-        }
-        // 成功情況寫完就可以結束。
-        return;
-    }
-
-    // 非 2xx 就當錯誤，一次把狀態碼和回應內容預覽都記下來。
-    http_log.err(
-        "response GET {s} status={d} bytes={d} body={s}",
-        .{ log_url, @intFromEnum(status), body.len, body_preview },
-    );
-}
-
-/// 產生適合寫進 log 的網址版本，並把敏感資訊遮掉。
-fn urlForLog(buffer: []u8, url: []const u8) []const u8 {
-    // 如果網址長到超過 buffer，就回一個固定提示字串。
-    if (url.len > buffer.len) return "<http-url-too-long>";
-
-    // 先把原始網址複製到可修改的 buffer。
-    @memcpy(buffer[0..url.len], url);
-    const output = buffer[0..url.len];
-
-    // 依序遮掉 query string 或 path 裡的敏感欄位。
-    maskQueryValue(output, "username");
-    maskQueryValue(output, "password");
-    maskQueryValue(output, "token");
-    maskQueryTailAfterPrefix(output, "/dynamic/update.php?");
-    // 回傳的是「已遮罩」版本，不是原始網址。
-    return output;
-}
-
-/// 遮掉 query string 裡像 `password=...` 這種值。
-fn maskQueryValue(text: []u8, key: []const u8) void {
-    // `start_index` 表示：下一次從哪個位置開始往後找。
-    var start_index: usize = 0;
-
-    // 從 `start_index` 開始找下一個 `key` 出現位置。
-    while (std.mem.indexOfPos(u8, text, start_index, key)) |key_index| {
-        const equals_index = key_index + key.len;
-        // 後面不是 `=` 的話，就不是 `key=value` 格式。
-        if (equals_index >= text.len or text[equals_index] != '=') {
-            start_index = equals_index;
-            continue;
-        }
-
-        // 確保前一個字元是 `?` 或 `&`，避免誤遮到其他地方的同名片段。
-        if (key_index != 0 and text[key_index - 1] != '?' and text[key_index - 1] != '&') {
-            start_index = equals_index;
-            continue;
-        }
-
-        // 從 `=` 後面一路找到下一個 `&` 或 `#`。
-        var value_end = equals_index + 1;
-        while (value_end < text.len and text[value_end] != '&' and text[value_end] != '#') : (value_end += 1) {}
-
-        // 把真正的值改成 `*`。
-        maskSlice(text[equals_index + 1 .. value_end]);
-        // 下次從這次 value 的結尾往後繼續找。
-        start_index = value_end;
-    }
-}
-
-/// 遮掉像 `/dynamic/update.php?<token>` 這種 query 尾端 token。
-fn maskQueryTailAfterPrefix(text: []u8, prefix: []const u8) void {
-    const prefix_index = std.mem.indexOf(u8, text, prefix) orelse return;
-    const value_start = prefix_index + prefix.len;
-    var value_end = value_start;
-
-    while (value_end < text.len and text[value_end] != '&' and text[value_end] != '#') : (value_end += 1) {}
-    maskSlice(text[value_start..value_end]);
-}
-
-/// 把一段字串原地改成 `*****`。
-fn maskSlice(text: []u8) void {
-    // `|*char|` 表示我們拿到的是可寫入的字元指標。
-    for (text) |*char| {
-        // `char.*` 代表「把指標指到的那個字元改掉」。
-        char.* = '*';
-    }
-}
-
-/// 把 HTTP 回應內容整理成一段短字串，適合寫進 log。
-fn bodyPreviewForLog(buffer: []u8, body: []const u8) []const u8 {
-    // buffer 長度如果是 0，就不可能產生預覽。
-    if (buffer.len == 0) return "";
-
-    // 如果回應內容比 buffer 還長，就代表最後需要截斷。
-    const needs_ellipsis = body.len > buffer.len;
-    // 如果需要在尾端補 `...`，就先預留三個位置。
-    const preview_limit = if (needs_ellipsis and buffer.len >= 3) buffer.len - 3 else buffer.len;
-
-    // `out_index` 指向目前已經寫到 buffer 的哪個位置。
-    var out_index: usize = 0;
-    // `body_index` 指向目前正在讀原始回應內容的哪個位置。
-    var body_index: usize = 0;
-    // 逐字掃描 body，把適合顯示的內容複製到 buffer。
-    while (body_index < body.len and out_index < preview_limit) : (body_index += 1) {
-        const char = body[body_index];
-        // 把 CRLF / tab 改成空白，非可列印字元改成 `?`。
-        buffer[out_index] = switch (char) {
-            '\r', '\n', '\t' => ' ',
-            else => if (std.ascii.isPrint(char)) char else '?',
-        };
-        // 每寫入一個字元，就把輸出位置往後推一格。
-        out_index += 1;
-    }
-
-    // 移掉尾端多餘空白。
-    while (out_index > 0 and buffer[out_index - 1] == ' ') {
-        out_index -= 1;
-    }
-
-    // 如果有截斷，就在尾端補 `...`。
-    if (needs_ellipsis and buffer.len >= 3) {
-        buffer[out_index..][0] = '.';
-        buffer[out_index..][1] = '.';
-        buffer[out_index..][2] = '.';
-        // 三個點都算新寫進去的字元。
-        out_index += 3;
-    }
-
-    // 最後只回傳目前真的有寫入內容的那一段。
-    return buffer[0..out_index];
 }
 
 /// 依照設定組出 Afraid 的同步網址。
@@ -1355,24 +1123,6 @@ test "basic authorization header starts with basic" {
     try std.testing.expect(std.mem.startsWith(u8, value, "Basic "));
 }
 
-test "url for log masks afraid token and dynu password" {
-    // 先測 Afraid 新語法 query token 是否會被遮掉。
-    var afraid_buffer: [http_log_url_buffer_len]u8 = undefined;
-    const afraid_url = urlForLog(&afraid_buffer, "https://freedns.afraid.org/dynamic/update.php?secret-token");
-    try std.testing.expectEqualStrings("https://freedns.afraid.org/dynamic/update.php?************", afraid_url);
-
-    // 再測 Dynu query string 裡的帳密是否會被遮掉。
-    var dynu_buffer: [http_log_url_buffer_len]u8 = undefined;
-    const dynu_url = urlForLog(
-        &dynu_buffer,
-        "https://api.dynu.com/nic/update?username=demo&password=abcdef&myip=1.2.3.4",
-    );
-    try std.testing.expectEqualStrings(
-        "https://api.dynu.com/nic/update?username=****&password=******&myip=1.2.3.4",
-        dynu_url,
-    );
-}
-
 test "build afraid url supports new freedns syntax" {
     const allocator = std.testing.allocator;
     const url = try buildAfraidUrl(
@@ -1391,6 +1141,12 @@ test "build afraid url supports new freedns syntax" {
     );
 }
 
+test "afraid response accepts updated and unchanged bodies" {
+    try std.testing.expect(containsExpectedAfraidResponse("Updated 1 host(s) to 1.2.3.4 in 0.123 seconds"));
+    try std.testing.expect(containsExpectedAfraidResponse("ERROR: Address 1.2.3.4 has not changed."));
+    try std.testing.expect(!containsExpectedAfraidResponse("ERROR: Invalid update URL"));
+}
+
 test "noip url percent-encodes hostname" {
     const allocator = std.testing.allocator;
     const url = try buildNoIpUrl(
@@ -1407,13 +1163,6 @@ test "noip url percent-encodes hostname" {
     );
 }
 
-test "body preview for log removes line breaks" {
-    // 預覽內容不應該把原本的 CRLF 直接帶進 log。
-    var buffer: [32]u8 = undefined;
-    const preview = bodyPreviewForLog(&buffer, "nochg 1.2.3.4\r\n");
-    try std.testing.expectEqualStrings("nochg 1.2.3.4", preview);
-}
-
 test "public ip cache key matches rust format" {
     const allocator = std.testing.allocator;
     // Redis 防重複更新 key 必須和 Rust 版完全同格式，才能沿用同一套資料。
@@ -1426,6 +1175,16 @@ test "public ip cache key matches rust format" {
 
 test "current public ip redis key matches expected format" {
     try std.testing.expectEqualStrings("MyPublicIP", currentPublicIpRedisKey());
+}
+
+test "process local public ip state skips unchanged ip" {
+    resetProcessPublicIpState();
+    defer resetProcessPublicIpState();
+
+    try std.testing.expect(!isSameAsLastProcessedIp("1.2.3.4"));
+    rememberLastProcessedIp("1.2.3.4");
+    try std.testing.expect(isSameAsLastProcessedIp("1.2.3.4"));
+    try std.testing.expect(!isSameAsLastProcessedIp("5.6.7.8"));
 }
 
 test "redis dedupe params keep legacy redis key and value format" {

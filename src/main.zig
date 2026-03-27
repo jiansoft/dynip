@@ -19,6 +19,10 @@ const logging = @import("logging.zig");
 ///
 /// 命令列解析完成後，真正的常駐循環會交給這個模組。
 const scheduler = @import("scheduler.zig");
+const c = @cImport({
+    @cInclude("signal.h");
+    @cInclude("stdlib.h");
+});
 
 /// `std_options` 是 Zig 提供的一個特殊常數名稱。
 ///
@@ -35,6 +39,9 @@ pub const std_options: std.Options = .{
     // 最終都會流到 `src/logging.zig`。
     .logFn = logging.logFn,
 };
+
+/// 全域 shutdown 旗標，signal handler 只做這一件事。
+var shutdown_requested: std.atomic.Value(bool) = .init(false);
 
 /// 將 CLI 用法寫到標準錯誤，供參數不正確時顯示。
 fn printUsage(io: std.Io) !void {
@@ -81,6 +88,7 @@ fn runCommand(
     allocator: std.mem.Allocator,
     io: std.Io,
     args: []const []const u8,
+    stop_token: ?scheduler.StopToken,
 ) !void {
     // 如果完全沒有帶任何子命令，
     // 代表使用者輸入的東西不符合我們這支 CLI 的需求。
@@ -160,41 +168,112 @@ fn runCommand(
 
     // 最後把控制權交給排程器。
     // 這裡之後通常就不會回來，因為服務會持續常駐。
-    try scheduler.runForever(allocator, io, app_config);
+    try scheduler.runForever(allocator, io, app_config, stop_token);
 }
 
 /// 在服務啟動時，把實際載入到記憶體的設定輸出成格式化 JSON。
 fn logLoadedConfig(allocator: std.mem.Allocator, app_config: config.AppConfig) !void {
+    // 為了安全，我們不直接印出原始設定，而是請 config 模組建立遮罩後的副本。
+    // 這樣所有敏感欄位規則都只維護在同一個地方。
+    const masked_config = config.redactedForLog(app_config);
+
     // 先建立一個可成長的 byte 陣列，等等拿來裝 JSON 文字。
     var json_buffer = std.ArrayList(u8).empty;
     // 函式結束前把這塊記憶體釋放掉。
     defer json_buffer.deinit(allocator);
 
     // `Allocating writer` 是一種會自動把內容寫進動態陣列的 writer。
-    // 你可以把它想成「把 writer 的輸出目的地接到 ArrayList 上」。
     var writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &json_buffer);
     // 如果中途失敗，先清掉 writer 自己握住的資源。
     errdefer writer.deinit();
 
-    // 把 `app_config` 這個 Zig struct 轉成格式化 JSON。
-    // `.indent_2` 代表縮排 2 格，讓人類比較好讀。
-    try std.json.Stringify.value(app_config, .{ .whitespace = .indent_2 }, &writer.writer);
+    // 把遮罩後的 masked_config 轉成格式化 JSON。
+    try std.json.Stringify.value(masked_config, .{ .whitespace = .indent_2 }, &writer.writer);
 
-    // `fromArrayList` 模式下，真正的資料暫時握在 writer 手上。
-    // 所以這一步要把所有權拿回 `json_buffer`。
+    // 把資料拿回 json_buffer。
+    // `toArrayList()` 的作用是把 writer 暫時接管的底層陣列還給我們。
     json_buffer = writer.toArrayList();
 
-    // 再把「標題 + JSON 內容」組成一整段字串，方便一次寫進日誌。
+    // 這裡再組出一段完整訊息，
+    // 目的是讓日誌裡會先出現一行標題，再接真正的 JSON 內容。
     const message = try std.fmt.allocPrint(
         allocator,
-        "service loaded config:\n{s}",
+        "service loaded config (sensitive data masked):\n{s}",
         .{json_buffer.items},
     );
-    // 寫完日誌後，把這段臨時字串釋放掉。
+    // 這段訊息字串是暫時配置的，所以函式離開前要釋放。
     defer allocator.free(message);
 
-    // 寫入 info 等級的日誌檔。
+    // 真正把整理好的訊息寫進 info 等級的檔案日誌。
     logging.infoFile(message);
+}
+
+/// 註冊 SIGINT / SIGTERM 的 signal handler。
+///
+/// handler 本身只會把全域 shutdown 旗標設成 `true`，
+/// 真正的收尾邏輯仍在主流程與 scheduler 內完成。
+fn installShutdownSignalHandlers() void {
+    // 註冊 Ctrl+C 對應的 SIGINT handler。
+    _ = c.signal(c.SIGINT, handleShutdownSignal);
+    // 有些平台也支援 SIGTERM，所以這裡先檢查 C import 裡有沒有這個常數。
+    if (@hasDecl(c, "SIGTERM")) {
+        // 如果有，就把它也接到同一個 shutdown handler。
+        _ = c.signal(c.SIGTERM, handleShutdownSignal);
+    }
+}
+
+/// C signal handler 入口。
+///
+/// 這裡只做 async-signal-safe 的最小工作：更新 atomic 旗標。
+fn handleShutdownSignal(_: c_int) callconv(.c) void {
+    // 這裡不能做太複雜的事情，
+    // 因為 signal handler 要盡量只做最小、最安全的工作。
+    // 所以我們只更新 atomic 旗標，讓正常流程自己觀察到後再收尾。
+    shutdown_requested.store(true, .monotonic);
+}
+
+/// 直接把一行訊息寫到 stderr。
+fn writeStderrLine(io: std.Io, text: []const u8) void {
+    // 先準備一塊固定大小 buffer，提供 stderr writer 使用。
+    var stderr_buffer: [256]u8 = undefined;
+    // 從標準錯誤建立 writer，這樣下面就能寫字到 stderr。
+    var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buffer);
+    // 取出通用 writer 介面，方便用 `writeAll`。
+    const stderr = &stderr_writer.interface;
+
+    // 先寫真正的訊息內容。
+    stderr.writeAll(text) catch return;
+    // 再補一個換行，讓終端輸出整齊。
+    stderr.writeAll("\n") catch return;
+    // 最後把 buffer 裡可能尚未送出的資料 flush 出去。
+    stderr.flush() catch {};
+}
+
+/// 用指定 exit status 結束程式，並先把訊息寫到 stderr。
+fn exitWithCliError(io: std.Io, status: c_int, text: []const u8) noreturn {
+    // 先把人看得懂的錯誤訊息印出來。
+    writeStderrLine(io, text);
+    // 再用指定的 exit code 結束整個程式。
+    c.exit(status);
+}
+
+/// 把常見啟動錯誤轉成較友善的 CLI 輸出。
+fn handleMainError(io: std.Io, err: anyerror) noreturn {
+    // 針對我們已知的常見錯誤，改成較友善、較穩定的 CLI 訊息。
+    switch (err) {
+        // 參數錯誤通常代表使用方式不對，所以回傳 exit code 2。
+        error.InvalidArguments => exitWithCliError(io, 2, "error: invalid arguments"),
+        // 沒有任何 DDNS 供應商可用時，明確提示是設定問題。
+        error.NoEnabledDdnsService => exitWithCliError(io, 1, "error: no DDNS provider is enabled or fully configured"),
+        else => {
+            // 其他錯誤就退而求其次，把 Zig 的 error name 轉成字串印出。
+            var buffer: [256]u8 = undefined;
+            // 用固定 buffer 組出 `error: 某某錯誤名`，避免這裡再額外配置記憶體。
+            const text = std.fmt.bufPrint(&buffer, "error: {s}", .{@errorName(err)}) catch "error: unexpected failure";
+            // 印完之後用 exit code 1 結束。
+            exitWithCliError(io, 1, text);
+        },
+    }
 }
 
 /// 主入口只做 DDNS 指令解析。
@@ -213,6 +292,7 @@ pub fn main(init: std.process.Init) !void {
         logging.errorConsoleFmt("failed to initialize logger: {}", .{err});
     };
     defer logging.deinit();
+    installShutdownSignalHandlers();
 
     // 把命令列參數轉成 slice，方便用陣列方式存取。
     // `args[0]` 通常是程式名稱本身。
@@ -221,8 +301,19 @@ pub fn main(init: std.process.Init) !void {
     // `init.arena.allocator()` 很適合拿來放「整個程式都會用到」的設定資料，
     // 例如 DDNS 的 config 字串。
     const arena_allocator = init.arena.allocator();
+    const stop_token = scheduler.StopToken{ .requested = &shutdown_requested };
 
     // 最後把真正的命令列解析工作交給 `runCommand(...)`。
     // 這裡用 `args[1..]` 是因為 `args[0]` 通常只是程式名稱本身。
-    try runCommand(arena_allocator, allocator, io, args[1..]);
+    runCommand(arena_allocator, allocator, io, args[1..], stop_token) catch |err| {
+        if (shutdown_requested.load(.monotonic)) {
+            std.log.info("service shutdown completed", .{});
+            return;
+        }
+        handleMainError(io, err);
+    };
+
+    if (shutdown_requested.load(.monotonic)) {
+        std.log.info("service shutdown completed", .{});
+    }
 }
