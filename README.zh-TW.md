@@ -8,9 +8,9 @@
 
 `dynip` 會定期檢查目前的公開 IP，並更新已設定的 DDNS 供應商：
 
-- Afraid.org
-- Dynu
-- No-IP
+- [Afraid.org](https://freedns.afraid.org/)
+- [Dynu](https://www.dynu.com/)
+- [No-IP](https://www.noip.com/)
 
 它支援分層設定載入、結構化日誌、HTTP 請求追蹤，以及使用 Redis 或程式內記憶體來避免重複更新。
 
@@ -138,21 +138,21 @@
 
 ### 支援的環境變數
 
-#### Afraid
+#### [Afraid.org](https://freedns.afraid.org/)
 
 - `AFRAID_ENABLED`
 - `AFRAID_URL`
 - `AFRAID_PATH`
 - `AFRAID_TOKEN`
 
-#### Dynu
+#### [Dynu](https://www.dynu.com/)
 
 - `DYNU_ENABLED`
 - `DYNU_URL`
 - `DYNU_USERNAME`
 - `DYNU_PASSWORD`
 
-#### No-IP
+#### [No-IP](https://www.noip.com/)
 
 - `NOIP_ENABLED`
 - `NOIP_URL`

@@ -8,9 +8,9 @@ A Zig-based DDNS background service.
 
 `dynip` periodically checks the current public IP and updates configured DDNS providers:
 
-- Afraid.org
-- Dynu
-- No-IP
+- [Afraid.org](https://freedns.afraid.org/)
+- [Dynu](https://www.dynu.com/)
+- [No-IP](https://www.noip.com/)
 
 It supports layered configuration loading, structured logging, HTTP request tracing, and duplicate-update prevention backed by either Redis or in-process memory.
 
@@ -138,21 +138,21 @@ When `ddns.redis.enabled = false`:
 
 ### Supported Environment Variables
 
-#### Afraid
+#### [Afraid.org](https://freedns.afraid.org/)
 
 - `AFRAID_ENABLED`
 - `AFRAID_URL`
 - `AFRAID_PATH`
 - `AFRAID_TOKEN`
 
-#### Dynu
+#### [Dynu](https://www.dynu.com/)
 
 - `DYNU_ENABLED`
 - `DYNU_URL`
 - `DYNU_USERNAME`
 - `DYNU_PASSWORD`
 
-#### No-IP
+#### [No-IP](https://www.noip.com/)
 
 - `NOIP_ENABLED`
 - `NOIP_URL`
