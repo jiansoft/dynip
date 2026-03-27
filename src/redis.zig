@@ -6,6 +6,7 @@
 //! 專案外部其實還是只看到三個主要 API：
 //! - `containsKey(...)`
 //! - `setEx(...)`
+//! - `ddnsDedupeCheckAndRemember(...)`
 //! - `ping(...)`
 //!
 //! 這樣其他模組，例如 `ddns.zig`，就不用知道底層客戶端已經換掉。
@@ -47,6 +48,19 @@ const Client = okredis.Client;
 const Auth = Client.Auth;
 /// `std.Io.net.Stream` 的簡短別名。
 const Stream = std.Io.net.Stream;
+
+/// DDNS dedupe 在 Redis 上單次往返需要的輸入。
+pub const DdnsDedupeParams = struct {
+    cache_key: []const u8,
+    cache_value: []const u8,
+    current_ip_key: []const u8,
+    ttl_seconds: u64,
+};
+
+/// DDNS dedupe 單 session 檢查結果。
+pub const DdnsDedupeResult = struct {
+    cache_hit: bool,
+};
 
 /// 一條短生命週期的 Redis 連線工作階段。
 ///
@@ -130,6 +144,19 @@ const Session = struct {
     fn deinit(self: *Session) void {
         self.stream.close(self.io);
     }
+
+    /// 同一條 Redis 連線上執行 `EXISTS key`。
+    fn containsKey(self: *Session, key: []const u8) !bool {
+        const count = try self.client.send(i64, .{ "EXISTS", key });
+        return count > 0;
+    }
+
+    /// 同一條 Redis 連線上執行 `SETEX key ttl value`。
+    fn setEx(self: *Session, key: []const u8, value: []const u8, ttl_seconds: u64) !void {
+        var ttl_buffer: [32]u8 = undefined;
+        const ttl_text = try std.fmt.bufPrint(&ttl_buffer, "{d}", .{ttl_seconds});
+        try self.client.send(void, .{ "SETEX", key, ttl_text, value });
+    }
 };
 
 /// 對外提供的 `EXISTS` 包裝。
@@ -152,8 +179,7 @@ pub fn containsKey(
     // `EXISTS key` 會回整數：
     // - 1 代表存在
     // - 0 代表不存在
-    const count = try session.client.send(i64, .{ "EXISTS", key });
-    return count > 0;
+    return session.containsKey(key);
 }
 
 /// 對外提供的 `SETEX` 包裝。
@@ -175,12 +201,36 @@ pub fn setEx(
     var session = try Session.connect(io, config);
     defer session.deinit();
 
-    // Redis 指令的 TTL 參數是字串，
-    // 所以先把數字轉成文字。
-    var ttl_buffer: [32]u8 = undefined;
-    const ttl_text = try std.fmt.bufPrint(&ttl_buffer, "{d}", .{ttl_seconds});
+    try session.setEx(key, value, ttl_seconds);
+}
 
-    try session.client.send(void, .{ "SETEX", key, ttl_text, value });
+/// 以單一 Redis session 完成 DDNS dedupe：
+/// 1. `EXISTS MyPublicIP:{ip}`
+/// 2. 沒命中時寫回 `MyPublicIP:{ip}`
+/// 3. 再更新固定 key `MyPublicIP`
+pub fn ddnsDedupeCheckAndRemember(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    config: config_mod.Redis,
+    params: DdnsDedupeParams,
+) !DdnsDedupeResult {
+    _ = allocator;
+
+    var session = try Session.connect(io, config);
+    defer session.deinit();
+
+    return ddnsDedupeCheckAndRememberWithSession(&session, params);
+}
+
+/// 把 DDNS dedupe 的 Redis 指令序列抽成可測的 session-level helper。
+fn ddnsDedupeCheckAndRememberWithSession(session: anytype, params: DdnsDedupeParams) !DdnsDedupeResult {
+    if (try session.containsKey(params.cache_key)) {
+        return .{ .cache_hit = true };
+    }
+
+    try session.setEx(params.cache_key, params.cache_value, params.ttl_seconds);
+    try session.setEx(params.current_ip_key, params.cache_value, params.ttl_seconds);
+    return .{ .cache_hit = false };
 }
 
 /// 做一次真正的 `PING`，並回傳 Redis 回的字串。
@@ -254,6 +304,75 @@ test "split host and port for bracket ipv6" {
     const parsed = try splitHostPort("[::1]:6380");
     try std.testing.expectEqualStrings("::1", parsed.host);
     try std.testing.expectEqual(@as(u16, 6380), parsed.port);
+}
+
+test "ddns dedupe helper returns cache hit without writes" {
+    const FakeSession = struct {
+        contains_key_result: bool = true,
+        setex_calls: usize = 0,
+
+        fn containsKey(self: *@This(), key: []const u8) !bool {
+            try std.testing.expectEqualStrings("MyPublicIP:1.2.3.4", key);
+            return self.contains_key_result;
+        }
+
+        fn setEx(self: *@This(), key: []const u8, value: []const u8, ttl_seconds: u64) !void {
+            _ = key;
+            _ = value;
+            _ = ttl_seconds;
+            self.setex_calls += 1;
+        }
+    };
+
+    var session = FakeSession{};
+    const result = try ddnsDedupeCheckAndRememberWithSession(&session, .{
+        .cache_key = "MyPublicIP:1.2.3.4",
+        .cache_value = "1.2.3.4",
+        .current_ip_key = "MyPublicIP",
+        .ttl_seconds = 60,
+    });
+
+    try std.testing.expect(result.cache_hit);
+    try std.testing.expectEqual(@as(usize, 0), session.setex_calls);
+}
+
+test "ddns dedupe helper writes both redis keys on miss" {
+    const FakeSession = struct {
+        contains_key_result: bool = false,
+        setex_calls: usize = 0,
+        seen_keys: [2][]const u8 = .{ "", "" },
+        seen_values: [2][]const u8 = .{ "", "" },
+        seen_ttls: [2]u64 = .{ 0, 0 },
+
+        fn containsKey(self: *@This(), key: []const u8) !bool {
+            try std.testing.expectEqualStrings("MyPublicIP:1.2.3.4", key);
+            return self.contains_key_result;
+        }
+
+        fn setEx(self: *@This(), key: []const u8, value: []const u8, ttl_seconds: u64) !void {
+            self.seen_keys[self.setex_calls] = key;
+            self.seen_values[self.setex_calls] = value;
+            self.seen_ttls[self.setex_calls] = ttl_seconds;
+            self.setex_calls += 1;
+        }
+    };
+
+    var session = FakeSession{};
+    const result = try ddnsDedupeCheckAndRememberWithSession(&session, .{
+        .cache_key = "MyPublicIP:1.2.3.4",
+        .cache_value = "1.2.3.4",
+        .current_ip_key = "MyPublicIP",
+        .ttl_seconds = 86400,
+    });
+
+    try std.testing.expect(!result.cache_hit);
+    try std.testing.expectEqual(@as(usize, 2), session.setex_calls);
+    try std.testing.expectEqualStrings("MyPublicIP:1.2.3.4", session.seen_keys[0]);
+    try std.testing.expectEqualStrings("MyPublicIP", session.seen_keys[1]);
+    try std.testing.expectEqualStrings("1.2.3.4", session.seen_values[0]);
+    try std.testing.expectEqualStrings("1.2.3.4", session.seen_values[1]);
+    try std.testing.expectEqual(@as(u64, 86400), session.seen_ttls[0]);
+    try std.testing.expectEqual(@as(u64, 86400), session.seen_ttls[1]);
 }
 
 test "live redis ping returns pong" {
