@@ -40,18 +40,27 @@
 
 ## 專案結構
 
-- `src/main.zig`: CLI 入口
-- `src/config.zig`: 設定載入、`.env` 解析、環境變數覆寫
-- `src/ddns.zig`: DDNS 更新主流程與供應商更新邏輯
-- `src/redis.zig`: Redis 客戶端包裝
-- `src/scheduler.zig`: 固定間隔排程器
-- `src/logging.zig`: 檔案日誌與輪替
-- `src/tests.zig`: 測試入口
-- `build.zig`: 建置定義
-- `build.ps1`: Windows 釋出版建置腳本
-- `build.bat`: Windows 批次檔包裝腳本
-- `control.sh`: 偏向 Docker 流程的輔助腳本
-- `Dockerfile`: 容器映像建置檔
+這個專案目前整理成比較接近 Zig 社群常見的應用程式結構：
+
+- `src/main.zig`：盡量保持最薄的可執行檔入口。它本身不處理太多邏輯，只負責把程式啟動控制權交給 CLI 層。
+- `src/cli.zig`：應用程式啟動層。這裡負責解析命令列參數、初始化 logger、安裝 signal handler、載入設定，最後啟動常駐排程器。
+- `src/root.zig`：共用模組入口。它會重新匯出主要內部模組，並同時扮演 `zig build test` 的測試匯總入口。
+- `src/config.zig`：設定載入邏輯。會先讀 `app.json`，再讀 `.env`，最後套用系統環境變數，後者覆蓋前者。
+- `src/ddns.zig`：DDNS 主流程。包含取得公開 IP、防重複更新檢查，以及更新各家已啟用的 DDNS provider。
+- `src/redis.zig`：Redis 整合層，主要提供 DDNS 防重複更新所需的 Redis 包裝。
+- `src/scheduler.zig`：固定間隔的背景排程器，會持續觸發每一輪更新工作。
+- `src/logging.zig`：結構化日誌層，負責 console 與檔案日誌行為。
+- `build.zig`：Zig 的建置腳本，負責把 executable、`run` step 與 `test` step 串起來。
+- `build.ps1` / `build.bat`：偏向 Windows 使用情境的建置輔助腳本。
+- `control.sh`：比較偏容器或部署流程的輔助腳本。
+- `Dockerfile`：容器映像建置定義。
+
+如果你是從其他語言生態來看，可以先這樣理解：
+
+- `main.zig` 類似程序入口
+- `cli.zig` 類似應用啟動層
+- `root.zig` 類似共用 package root
+- `build.zig` 同時負責建置腳本與任務入口定義
 
 ## 執行需求
 

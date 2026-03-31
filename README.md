@@ -40,18 +40,27 @@ On each update cycle, `dynip`:
 
 ## Project Layout
 
-- `src/main.zig`: CLI entry point
-- `src/config.zig`: config loading, `.env` parsing, environment overrides
-- `src/ddns.zig`: DDNS update flow and provider update logic
-- `src/redis.zig`: Redis client wrapper
-- `src/scheduler.zig`: fixed-interval scheduler
-- `src/logging.zig`: file logging and rotation
-- `src/tests.zig`: test entry point
-- `build.zig`: build definition
-- `build.ps1`: Windows release build script
-- `build.bat`: Windows batch wrapper
-- `control.sh`: Docker-oriented helper script
-- `Dockerfile`: container image build definition
+This project now follows a more typical Zig application layout:
+
+- `src/main.zig`: the thinnest possible executable entry point. It only forwards startup control to the CLI layer.
+- `src/cli.zig`: the application bootstrap layer. It parses CLI arguments, initializes logging, installs signal handlers, loads config, and starts the long-running scheduler.
+- `src/root.zig`: the shared module root. It re-exports the main internal modules and also acts as the unit test aggregation entry point for `zig build test`.
+- `src/config.zig`: configuration loading logic. It reads `app.json`, then `.env`, then process environment variables, with later sources overriding earlier ones.
+- `src/ddns.zig`: the main DDNS workflow. It fetches the current public IP, performs duplicate-prevention checks, and updates enabled providers.
+- `src/redis.zig`: the Redis integration layer used by DDNS duplicate prevention.
+- `src/scheduler.zig`: the fixed-interval background loop that repeatedly triggers refresh work.
+- `src/logging.zig`: the structured logging layer that handles console and file logging behavior.
+- `build.zig`: the Zig build definition. It wires together the executable, the `run` step, and the test step.
+- `build.ps1` / `build.bat`: Windows-oriented helper scripts for local build flows.
+- `control.sh`: a helper script used mainly for container or deployment-oriented workflows.
+- `Dockerfile`: the container image build definition.
+
+If you are coming from other ecosystems, the rough mental model is:
+
+- `main.zig` is the process entry point
+- `cli.zig` is the application startup layer
+- `root.zig` is the shared package root
+- `build.zig` is both the build script and task entry definition
 
 ## Requirements
 

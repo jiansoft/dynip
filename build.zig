@@ -47,25 +47,32 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // 這裡先建立「主模組」。
-    // 你可以把模組想成：這個可執行檔最上層的原始碼入口與編譯選項集合。
+    // 建立可執行檔要使用的根模組。
+    //
+    // 在 Zig 的 build system 裡，
+    // `createModule(...)` 可以理解成：
+    // 「先把某份原始碼入口、編譯選項與匯入依賴包成一個模組設定」。
+    //
+    // 之後這個模組可以拿去：
+    // - 建 executable
+    // - 建 library
+    // - 建 test 產物
+    //
+    // 這裡的 executable 入口刻意保持很薄，只指向 `src/main.zig`。
     const exe_module = b.createModule(.{
-        // `root_source_file` 指定這個模組從哪支 Zig 檔開始。
-        // 也就是說，整個程式的入口是 `src/main.zig`。
+        // 這個模組從哪支 Zig 檔開始編譯。
         .root_source_file = b.path("src/main.zig"),
-        // 把剛剛決定好的目標平台套進來。
+        // 編譯目標平台。
         .target = target,
-        // 把剛剛決定好的最佳化等級套進來。
+        // 最佳化等級。
         .optimize = optimize,
-        // 讓可執行檔的根模組依照上面的 strip 設定決定
-        // 要不要保留除錯資訊。
+        // 是否移除除錯符號。
         .strip = strip,
-        // 這個專案有用到 `@cImport` 與 libc 時間函式，
-        // 所以這裡要明確要求連結 libc。
+        // 這個專案有用到 `@cImport`，所以要明確連結 libc。
         .link_libc = true,
     });
-    // 把第三方的 `okredis` 模組掛到主模組裡。
-    // 之後在原始碼裡就能直接寫 `@import("okredis")`。
+    // 把第三方 `okredis` 模組掛到這個根模組上。
+    // 之後主程式裡就能直接寫 `@import("okredis")`。
     exe_module.addImport("okredis", okredis_dep.module("okredis"));
 
     // 這裡才是把剛剛的模組變成真正的可執行檔。
@@ -80,6 +87,24 @@ pub fn build(b: *std.Build) void {
     // 當你執行 `zig build` 時，除了編出來，還要把產物安裝到 Zig 預設輸出位置。
     // 一般來說會在 `zig-out/` 下面看到結果。
     b.installArtifact(exe);
+
+    // 額外建立一個只負責「把可執行檔裝到 zig-out/bin」的 install step。
+    //
+    // 這對一般 `zig build` 來說不一定必要，
+    // 但對某些 IDE / debugger 整合很有幫助，
+    // 因為它們會需要：
+    // - 一個明確的 build step 名稱
+    // - 一個固定、可預測的 executable 路徑
+    const install_debug_exe = b.addInstallArtifact(exe, .{
+        .dest_sub_path = exe.out_filename,
+    });
+
+    // 提供給 IDE 使用的 debug build step。
+    //
+    // 這個 step 不會真的執行程式，
+    // 它只保證 `zig-out/bin/dynip` 這支檔案已經建好。
+    const debug_step = b.step("debug", "Build dynip executable for IDE debugging");
+    debug_step.dependOn(&install_debug_exe.step);
 
     // `addRunArtifact` 會建立一個「執行這支程式」的 build step。
     // 之後 `zig build run` 就是靠這個物件運作。
@@ -111,22 +136,25 @@ pub fn build(b: *std.Build) void {
     // 也就是先建出程式，再執行它。
     run_step.dependOn(&run_cmd.step);
 
-    // 測試也需要一個自己的根模組。
-    // 因為這個專案的測試散在多個檔案內，所以用 `src/tests.zig`
-    // 當作「測試總入口」，在裡面把所有有 test 的模組都 import 進來。
+    // 測試這裡改成直接掛在 `src/root.zig`。
+    //
+    // 好處是：
+    // - 不用再維護額外的 `src/tests.zig`
+    // - `root.zig` 既能當共用模組入口，也能當測試匯總入口
+    // - 專案 layout 會更接近常見的 Zig 風格
     const test_module = b.createModule(.{
-        // 測試入口改成 `src/tests.zig`。
-        .root_source_file = b.path("src/tests.zig"),
+        // 測試從 `src/root.zig` 開始。
+        .root_source_file = b.path("src/root.zig"),
         // 測試也要知道目標平台。
         .target = target,
-        // 測試也要知道最佳化等級。
+        // 測試也沿用同一組最佳化等級。
         .optimize = optimize,
-        // 測試模組也沿用同一個 strip 規則。
+        // 測試產物也套用同樣的 strip 規則。
         .strip = strip,
-        // 測試裡一樣會碰到 libc 相關程式碼，所以也連結 libc。
+        // 測試裡一樣會碰到 `@cImport`，所以也連結 libc。
         .link_libc = true,
     });
-    // 測試模組也需要能匯入 `okredis`。
+    // 測試模組同樣需要能匯入 `okredis`。
     test_module.addImport("okredis", okredis_dep.module("okredis"));
 
     // `addTest` 代表建立「編譯測試」這件事。
@@ -138,6 +166,25 @@ pub fn build(b: *std.Build) void {
 
     // 有了測試產物之後，再建立「執行測試」的命令。
     const run_unit_tests = b.addRunArtifact(unit_tests);
+
+    // 為了讓 IDE 也能 debug `zig build test` 類型的工作，
+    // 另外把測試產物安裝成一支固定名稱的可執行檔。
+    //
+    // 這樣像 ZigBrains 這類需要「build step + output executable path」
+    // 的 IDE，就能明確知道要附加到哪個測試 binary。
+    const debug_test_filename = b.fmt(
+        "dynip-tests{s}",
+        .{std.fs.path.extension(unit_tests.out_filename)},
+    );
+    const install_debug_tests = b.addInstallArtifact(unit_tests, .{
+        .dest_sub_path = debug_test_filename,
+    });
+
+    // 提供給 IDE 使用的測試 debug build step。
+    //
+    // 這個 step 只會建出測試執行檔，不會直接跑測試。
+    const debug_test_step = b.step("debug-test", "Build unit test executable for IDE debugging");
+    debug_test_step.dependOn(&install_debug_tests.step);
 
     // 建立名字叫 `test` 的 build step。
     // 所以你才能在命令列輸入 `zig build test`。
