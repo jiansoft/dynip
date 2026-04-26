@@ -148,8 +148,22 @@ const Rotate = struct {
 
         // 再次確認檔案存在。理論上 ensureReady 成功後一定有檔案，但 optional 還是要安全處理。
         if (self.file) |file| {
-            // `writeStreamingAll` 會持續寫到整段 bytes 完成，避免只寫入一部分。
-            try file.writeStreamingAll(io, line);
+            // 取得目前檔案長度，這就是「檔尾」的位置。
+            //
+            // 為什麼每次寫入前都重新取長度：
+            // - 服務重啟後，檔案本來就已經有舊內容。
+            // - 每次寫入前把「邏輯寫入位置」設到最新檔尾，就能保證 log 是 append，不會寫到檔案最上面。
+            const size = try file.length(io);
+            // 使用 positional writer，而不是 streaming writer。
+            // positional writer 會把 offset 明確交給底層寫入 API，不依賴作業系統目前的檔案游標。
+            var write_buffer: [1024]u8 = undefined;
+            var writer = file.writer(io, &write_buffer);
+            // 把這次 writer 的邏輯寫入位置移到檔尾。
+            try writer.seekTo(size);
+            // 透過同一個 writer 寫入，這樣 seek 位置和真正寫入位置會一致。
+            try writer.interface.writeAll(line);
+            // flush 確保 buffer 裡的資料真的送到底層檔案。
+            try writer.flush();
         }
     }
 
@@ -185,25 +199,17 @@ const Rotate = struct {
         // 組出完整路徑，例如 `log/2026-04-26_dynip_info.log`。
         const path = try self.buildCurrentPath(now);
 
-        // `createFile` 搭配 `.truncate = false`：
+        // `createFile` 搭配 `.read = true` 與 `.truncate = false`：
+        // - read=true 讓 Windows handle 可以讀 metadata / 長度；沒有它，後續 file.length 可能失敗。
         // - 檔案不存在就建立。
         // - 檔案存在就保留原本內容。
-        var file = try std.Io.Dir.cwd().createFile(io, path, .{
+        const file = try std.Io.Dir.cwd().createFile(io, path, .{
+            .read = true,
             .truncate = false,
         });
 
-        // 取得目前檔案大小，等等要把寫入位置移到檔尾。
-        // 如果 length 失敗就當作 0，讓 logger 不因為讀長度失敗而整個中斷。
-        const size = file.length(io) catch 0;
-        // Zig 0.16 的 seek API 在 File.Writer 上，所以先建立一個 streaming writer。
-        var seek_buffer: [64]u8 = undefined;
-        var writer = file.writerStreaming(io, &seek_buffer);
-        // 把檔案位置移到檔尾，避免覆蓋舊 log。
-        try writer.seekTo(size);
-        // flush 確保 writer 內部狀態完成同步。
-        try writer.flush();
-
         // 開檔成功後才放回狀態裡。
+        // 真正寫入時會再次 seek 到檔尾，確保重啟服務後一定是 append。
         self.file = file;
     }
 
@@ -546,5 +552,49 @@ test "log timestamp and filename do not prefix positive year with plus" {
     try std.testing.expectEqualStrings(
         "2026-04-26 23:05:02 info hello\n",
         line,
+    );
+}
+
+test "reopened log file appends to bottom instead of overwriting beginning" {
+    // 這個測試模擬服務重啟：
+    // 第一個 Rotate 寫一行，關檔；第二個 Rotate 開同一個檔案再寫一行。
+    // 如果 append 行為錯了，第二行會覆蓋第一行開頭。
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const now = LocalDateTime{
+        .unix_seconds = 0,
+        .year = 2099,
+        .month = 1,
+        .day = 2,
+        .hour = 3,
+        .minute = 4,
+        .second = 5,
+    };
+    const path = "log/2099-01-02_dynip_info.log";
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var first = Rotate.init("info");
+    try first.writeLine(io, now, .info, null, "first-long-line");
+    first.deinit(io);
+
+    var second = Rotate.init("info");
+    try second.writeLine(io, now, .info, null, "second");
+    second.deinit(io);
+
+    const text = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        path,
+        std.testing.allocator,
+        .limited(4096),
+    );
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expectEqualStrings(
+        "2099-01-02 03:04:05 info first-long-line\n" ++
+            "2099-01-02 03:04:05 info second\n",
+        text,
     );
 }
