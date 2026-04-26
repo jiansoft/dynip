@@ -48,22 +48,11 @@ pub const default_log_name = "dynip";
 const default_max_age_days: i64 = 7;
 
 /// 確保 log 目錄存在。
-///
-/// 這裡故意不用 `createDirPath("log")`，而是採用：
-/// 1. 先嘗試打開既有的 `log/`
-/// 2. 如果不存在，再建立它
-///
-/// 這樣在 Docker bind mount 已經把 `/app/log` 掛進來時，
-/// 比較不容易踩到某些檔案系統或掛載情境下的 `error.Unexpected`。
 fn ensureLogDir(io: std.Io) !void {
-    var dir = std.Io.Dir.cwd().openDir(io, default_log_dir, .{}) catch |err| switch (err) {
-        error.FileNotFound => blk: {
-            try std.Io.Dir.cwd().createDir(io, default_log_dir, .default_dir);
-            break :blk try std.Io.Dir.cwd().openDir(io, default_log_dir, .{});
-        },
+    std.Io.Dir.cwd().createDir(io, default_log_dir, .default_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
         else => return err,
     };
-    dir.close(io);
 }
 
 /// 用來表示「本地時間」的一份結構。

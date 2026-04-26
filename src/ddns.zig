@@ -159,6 +159,7 @@ var next_public_ip_index: std.atomic.Value(usize) = .init(0);
 pub fn refresh(
     allocator: std.mem.Allocator,
     io: std.Io,
+    client: *std.http.Client,
     config: config_mod.AppConfig,
 ) !RefreshStatus {
     // 先看現在是否落在「刻意跳過更新」的維護時間。
@@ -175,16 +176,8 @@ pub fn refresh(
     // `scratch` 是這一輪更新檢查專用的 allocator。
     const scratch = arena.allocator();
 
-    // 建一個 HTTP 客戶端，後面抓對外 IP 與更新 DDNS 都會用到它。
-    var client: std.http.Client = .{
-        .allocator = scratch,
-        .io = io,
-    };
-    // 用完後關掉客戶端。
-    defer client.deinit();
-
     // 先抓目前對外 IP。
-    const ip_now = try getPublicIp(scratch, &client);
+    const ip_now = try getPublicIp(scratch, client);
     // 如果同一個行程上次已經成功處理過相同 IP，
     // 這一輪就直接跳過，不再碰 Redis。
     if (isSameAsLastProcessedIp(ip_now)) {
@@ -200,27 +193,22 @@ pub fn refresh(
     else
         config.ddns.dedupe_ttl_seconds;
 
+    // 更新 DDNS provider 之前，先檢查這個 IP 是否已經在 dedupe cache。
+    // 這樣服務重啟後仍會尊重 Redis / local cache，不會先打 provider 才發現命中。
+    const cache_key = try buildPublicIpCacheKey(scratch, ip_now);
+    if (try isDedupeHit(scratch, io, config.ddns.redis, cache_key)) {
+        return .skipped_cached_ip;
+    }
+
     // 真的去更新所有有完成設定的 DDNS 供應商。
-    const summary = try updateDdnsServices(scratch, &client, config, ip_now);
+    const summary = try updateDdnsServices(scratch, client, config, ip_now);
     // 一個供應商都沒啟用，視為設定錯誤。
     if (summary.attempted == 0) return error.NoEnabledDdnsService;
     // 有嘗試，但全部失敗，就把整輪更新檢查視為失敗。
     if (summary.succeeded == 0) return error.AllDdnsUpdatesFailed;
 
     // 至少有一個供應商更新成功後，才把這個 IP 寫進 dedupe cache。
-    const cache_key = try buildPublicIpCacheKey(scratch, ip_now);
-    if (!config.ddns.redis.enabled) {
-        try rememberDedupe(scratch, io, config.ddns.redis, cache_key, ip_now, ttl_seconds);
-    } else {
-        _ = try checkAndRememberDedupeAfterSuccess(
-            scratch,
-            io,
-            config.ddns.redis,
-            cache_key,
-            ip_now,
-            ttl_seconds,
-        );
-    }
+    try rememberDedupe(scratch, io, config.ddns.redis, cache_key, ip_now, ttl_seconds);
     // 這次至少已經成功處理完一輪，就把目前 IP 記在行程內狀態，
     // 之後同 IP 的輪次可以直接跳過，不必再碰 Redis。
     rememberLastProcessedIp(ip_now);
@@ -1207,6 +1195,22 @@ test "local dedupe cache respects ttl" {
     try localDedupeSetAt("MyPublicIP:1.2.3.4", 60, 100);
     try std.testing.expect(localDedupeContainsAt("MyPublicIP:1.2.3.4", 120));
     try std.testing.expect(!localDedupeContainsAt("MyPublicIP:1.2.3.4", 160));
+}
+
+test "local dedupe hit is checked before provider updates" {
+    resetLocalDedupeState();
+    defer resetLocalDedupeState();
+
+    const key = "MyPublicIP:1.2.3.4";
+    try localDedupeSet(key, 60);
+
+    const io: std.Io = undefined;
+    try std.testing.expect(try isDedupeHit(
+        std.testing.allocator,
+        io,
+        .{ .enabled = false },
+        key,
+    ));
 }
 
 test "local dedupe cache shrinks after pruning many expired entries" {

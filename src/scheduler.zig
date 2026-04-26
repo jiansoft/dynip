@@ -62,6 +62,14 @@ pub fn runForever(
         },
     );
 
+    // 建立一個 HTTP 客戶端，整個服務生命週期重複使用它。
+    // 這可以避免每一輪 refresh 都重新初始化 TLS 狀態（rescanning CA certificates）。
+    var client: std.http.Client = .{
+        .allocator = allocator,
+        .io = io,
+    };
+    defer client.deinit();
+
     // `while (true)` 代表無限迴圈。
     // 對常駐服務來說，這就是「一直跑下去」的核心。
     while (true) {
@@ -76,7 +84,7 @@ pub fn runForever(
 
         // 嘗試做一次 DDNS 更新。
         // 這裡故意把成功結果丟掉，因為排程器只在乎「有沒有錯」。
-        _ = ddns.refresh(allocator, io, config) catch |err| {
+        _ = ddns.refresh(allocator, io, &client, config) catch |err| {
             // 如果更新失敗，先記錄錯誤。
             std.log.err("scheduled ddns refresh failed: {}", .{err});
 

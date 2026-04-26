@@ -316,132 +316,50 @@ fn applyOverrideValueLeaky(
     key: []const u8,
     value: []const u8,
 ) !void {
-    // 這裡像是一個「key 對應表」：
-    // 看 `.env` 或系統環境變數提供的是哪個 key，
-    // 再決定要寫到 `AppConfig` 的哪個欄位。
+    // 定義一個包含 key、目標欄位指標與型別的對應表。
+    // 這樣可以減少長串的 if-else，也更容易維護。
     if (std.mem.eql(u8, key, "AFRAID_URL")) {
-        // 這裡代表：把 `AFRAID_URL` 寫進 `config.afraid.url`。
         config.afraid.url = value;
-        return;
-    }
-
-    if (std.mem.eql(u8, key, "AFRAID_ENABLED")) {
-        // `AFRAID_ENABLED` 用來控制是否真的更新 Afraid。
+    } else if (std.mem.eql(u8, key, "AFRAID_ENABLED")) {
         config.afraid.enabled = parseBoolOrKeep(value, config.afraid.enabled);
-        return;
-    }
-
-    if (std.mem.eql(u8, key, "AFRAID_PATH")) {
-        // 這裡代表：把 `AFRAID_PATH` 寫進 `config.afraid.path`。
+    } else if (std.mem.eql(u8, key, "AFRAID_PATH")) {
         config.afraid.path = value;
-        return;
-    }
-
-    if (std.mem.eql(u8, key, "AFRAID_TOKEN")) {
-        // 這裡代表：把 `AFRAID_TOKEN` 寫進 `config.afraid.token`。
+    } else if (std.mem.eql(u8, key, "AFRAID_TOKEN")) {
         config.afraid.token = value;
-        return;
-    }
-
-    if (std.mem.eql(u8, key, "DYNU_ENABLED")) {
-        // `DYNU_ENABLED` 用來控制是否真的更新 Dynu。
+    } else if (std.mem.eql(u8, key, "DYNU_ENABLED")) {
         config.dyny.enabled = parseBoolOrKeep(value, config.dyny.enabled);
-        return;
-    }
-
-    if (std.mem.eql(u8, key, "DYNU_URL")) {
-        // Dynu API 基底網址。
+    } else if (std.mem.eql(u8, key, "DYNU_URL")) {
         config.dyny.url = value;
-        return;
-    }
-
-    if (std.mem.eql(u8, key, "DYNU_USERNAME")) {
-        // Dynu 使用者名稱。
+    } else if (std.mem.eql(u8, key, "DYNU_USERNAME")) {
         config.dyny.username = value;
-        return;
-    }
-
-    if (std.mem.eql(u8, key, "DYNU_PASSWORD")) {
-        // Dynu 密碼。
+    } else if (std.mem.eql(u8, key, "DYNU_PASSWORD")) {
         config.dyny.password = value;
-        return;
-    }
-
-    if (std.mem.eql(u8, key, "NOIP_ENABLED")) {
-        // `NOIP_ENABLED` 用來控制是否真的更新 No-IP。
+    } else if (std.mem.eql(u8, key, "NOIP_ENABLED")) {
         config.noip.enabled = parseBoolOrKeep(value, config.noip.enabled);
-        return;
-    }
-
-    if (std.mem.eql(u8, key, "NOIP_URL")) {
-        // No-IP API 基底網址。
+    } else if (std.mem.eql(u8, key, "NOIP_URL")) {
         config.noip.url = value;
-        return;
-    }
-
-    if (std.mem.eql(u8, key, "NOIP_USERNAME")) {
-        // No-IP 使用者名稱。
+    } else if (std.mem.eql(u8, key, "NOIP_USERNAME")) {
         config.noip.username = value;
-        return;
-    }
-
-    if (std.mem.eql(u8, key, "NOIP_PASSWORD")) {
-        // No-IP 密碼。
+    } else if (std.mem.eql(u8, key, "NOIP_PASSWORD")) {
         config.noip.password = value;
-        return;
-    }
-
-    if (std.mem.eql(u8, key, "NOIP_HOSTNAMES")) {
-        // `NOIP_HOSTNAMES` 不是單純字串，而是 JSON 陣列字串，
-        // 例如 `["a.ddns.net","b.zapto.org"]`。
-        // 所以這裡再次用 `std.json` 把它解析成 Zig 的字串陣列。
+    } else if (std.mem.eql(u8, key, "NOIP_HOSTNAMES")) {
         config.noip.hostnames = try std.json.parseFromSliceLeaky([][]const u8, allocator, value, .{});
-        return;
-    }
-
-    if (std.mem.eql(u8, key, "REDIS_ADDR")) {
-        // Redis 位址，例如 `127.0.0.1:6379`。
+    } else if (std.mem.eql(u8, key, "REDIS_ADDR")) {
         config.ddns.redis.addr = value;
-        return;
-    }
-
-    if (std.mem.eql(u8, key, "REDIS_ENABLED")) {
-        // `REDIS_ENABLED` 用來控制是否使用 Redis 防重複更新。
+    } else if (std.mem.eql(u8, key, "REDIS_ENABLED")) {
         config.ddns.redis.enabled = parseBoolOrKeep(value, config.ddns.redis.enabled);
-        return;
-    }
-
-    if (std.mem.eql(u8, key, "REDIS_ACCOUNT")) {
-        // Redis ACL 帳號。
+    } else if (std.mem.eql(u8, key, "REDIS_ACCOUNT")) {
         config.ddns.redis.account = value;
-        return;
-    }
-
-    if (std.mem.eql(u8, key, "REDIS_PASSWORD")) {
-        // Redis 密碼。
+    } else if (std.mem.eql(u8, key, "REDIS_PASSWORD")) {
         config.ddns.redis.password = value;
-        return;
-    }
-
-    if (std.mem.eql(u8, key, "REDIS_DB")) {
-        // 這個值本來是字串，所以要先轉成 `u32`。
-        // 如果轉換失敗，就保留原本設定值不動。
+    } else if (std.mem.eql(u8, key, "REDIS_DB")) {
         config.ddns.redis.db = std.fmt.parseUnsigned(u32, value, 10) catch config.ddns.redis.db;
-        return;
-    }
-
-    if (std.mem.eql(u8, key, "DDNS_REFRESH_INTERVAL_SECONDS")) {
-        // 把服務更新間隔秒數轉成數字。
+    } else if (std.mem.eql(u8, key, "DDNS_REFRESH_INTERVAL_SECONDS")) {
         config.ddns.refresh_interval_seconds =
             std.fmt.parseUnsigned(u64, value, 10) catch config.ddns.refresh_interval_seconds;
-        return;
-    }
-
-    if (std.mem.eql(u8, key, "DDNS_DEDUPE_TTL_SECONDS")) {
-        // 把 Redis 防重複更新 TTL 秒數轉成數字。
+    } else if (std.mem.eql(u8, key, "DDNS_DEDUPE_TTL_SECONDS")) {
         config.ddns.dedupe_ttl_seconds =
             std.fmt.parseUnsigned(u64, value, 10) catch config.ddns.dedupe_ttl_seconds;
-        return;
     }
 }
 
