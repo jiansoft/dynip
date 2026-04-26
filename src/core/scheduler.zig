@@ -11,7 +11,7 @@ const ddns = @import("ddns.zig");
 /// 匯入設定模組。
 ///
 /// 排程器需要知道更新間隔秒數與 Redis 設定。
-const config_mod = @import("config.zig");
+const config_mod = @import("../base/config.zig");
 
 /// 由外部控制的停止旗標。
 ///

@@ -22,7 +22,7 @@ const std = @import("std");
 /// 匯入全域設定模組。
 ///
 /// Redis 的位址、帳號、密碼與 DB index 都從這裡讀。
-const config_mod = @import("config.zig");
+const config_mod = @import("../base/config.zig");
 /// 匯入 `zig-okredis`。
 ///
 /// 這個模組是在 `build.zig` 透過 dependency 掛進來的。

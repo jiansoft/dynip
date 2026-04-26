@@ -17,13 +17,13 @@ const std = @import("std");
 /// 匯入本專案的設定模組。
 ///
 /// 這樣 DDNS 流程就能讀到 `app.json` / `.env` 載入後的設定值。
-const config_mod = @import("config.zig");
+const config_mod = @import("../base/config.zig");
 /// 匯入本專案的 Redis 客戶端。
 ///
 /// DDNS 防重複更新現在要真的查 Redis，所以更新流程會呼叫這個模組。
-const redis = @import("redis.zig");
+const redis = @import("../io/redis.zig");
 /// 匯入共用 HTTP 文字抓取與日誌輔助。
-const http_text = @import("http_text.zig");
+const http = @import("../io/http.zig");
 
 /// 匯入 C 的 `time.h`。
 ///
@@ -89,7 +89,7 @@ const ProcessPublicIpState = struct {
 };
 
 /// 寫 HTTP body 預覽時，最多保留的字元數。
-const http_log_body_preview_len = http_text.body_preview_len;
+const http_log_body_preview_len = http.body_preview_len;
 /// Public IP lookup 只需要很短的 DNS / TCP connect timeout。
 const public_ip_connect_timeout: std.Io.Timeout = .{ .duration = .{
     .raw = .fromSeconds(3),
@@ -563,14 +563,14 @@ fn updateAfraid(
     // 先把 Afraid 更新網址組出來。
     const url = try buildAfraidUrl(allocator, config);
     // 打 HTTP GET。
-    const response = try http_text.fetchText(allocator, client, url, &.{}, .{
+    const response = try http.fetchText(allocator, client, url, &.{}, .{
         .connect_timeout = ddns_connect_timeout,
     });
     // 用完 body 後要記得釋放。
     defer allocator.free(response.body);
 
     // 先確認 HTTP 狀態碼是 2xx。
-    try http_text.ensureSuccessStatus(response.status, response.body);
+    try http.ensureSuccessStatus(response.status, response.body);
     // Afraid 會把「真的更新」和「IP 沒變」都放在 body 裡，
     // 所以不能只看 HTTP 200，還要檢查 body 是否屬於可接受結果。
     if (!containsExpectedAfraidResponse(response.body)) {
@@ -580,7 +580,7 @@ fn updateAfraid(
     // 不論這次是 Updated 還是 Address has not changed，都明確寫一筆日誌，
     // 這樣就不會看起來像 Afraid 這條路徑完全沒執行。
     var preview_buffer: [http_log_body_preview_len]u8 = undefined;
-    std.log.info("afraid response: {s}", .{http_text.bodyPreviewForLog(&preview_buffer, response.body)});
+    std.log.info("afraid response: {s}", .{http.bodyPreviewForLog(&preview_buffer, response.body)});
 }
 
 /// 呼叫 Dynu 的 DDNS API。
@@ -593,14 +593,14 @@ fn updateDynu(
     // Dynu 需要把目前 IP 也組進更新網址。
     const url = try buildDynuUrl(allocator, config, ip);
     // 真正把請求送出去。
-    const response = try http_text.fetchText(allocator, client, url, &.{}, .{
+    const response = try http.fetchText(allocator, client, url, &.{}, .{
         .connect_timeout = ddns_connect_timeout,
     });
     // 用完 body 之後歸還記憶體。
     defer allocator.free(response.body);
 
     // 先確保不是 404 / 500 這種 HTTP 層級錯誤。
-    try http_text.ensureSuccessStatus(response.status, response.body);
+    try http.ensureSuccessStatus(response.status, response.body);
     // Dynu 常見成功回應是 `good` 或 `nochg`。
     // 如果不是這兩種，就把它視為非預期內容。
     if (!containsGoodOrNochg(response.body)) {
@@ -608,7 +608,7 @@ fn updateDynu(
     }
     // 建一塊暫時 buffer，讓回應內容可以整理後寫進 log。
     var preview_buffer: [http_log_body_preview_len]u8 = undefined;
-    std.log.info("dynu response: {s}", .{http_text.bodyPreviewForLog(&preview_buffer, response.body)});
+    std.log.info("dynu response: {s}", .{http.bodyPreviewForLog(&preview_buffer, response.body)});
 }
 
 /// 呼叫 No-IP 的 DDNS API。
@@ -630,14 +630,14 @@ fn updateNoIp(
         // 先為這一個 hostname 組出更新網址。
         const url = try buildNoIpUrl(allocator, config, hostname, ip);
         // 再帶著 Basic Auth header 送出請求。
-        const response = try http_text.fetchText(allocator, client, url, &headers, .{
+        const response = try http.fetchText(allocator, client, url, &headers, .{
             .connect_timeout = ddns_connect_timeout,
         });
         // 每個 hostname 的回應內容用完都要釋放。
         defer allocator.free(response.body);
 
         // 先確認 HTTP 本身有沒有成功。
-        try http_text.ensureSuccessStatus(response.status, response.body);
+        try http.ensureSuccessStatus(response.status, response.body);
         // No-IP 成功回應也會是 `good` 或 `nochg`。
         if (!containsGoodOrNochg(response.body)) {
             return error.UnexpectedNoIpResponse;
@@ -646,7 +646,7 @@ fn updateNoIp(
         var preview_buffer: [http_log_body_preview_len]u8 = undefined;
         std.log.info("no-ip response ({s}): {s}", .{
             hostname,
-            http_text.bodyPreviewForLog(&preview_buffer, response.body),
+            http.bodyPreviewForLog(&preview_buffer, response.body),
         });
     }
 }
@@ -754,14 +754,14 @@ fn fetchTextIp(
     url: []const u8,
 ) ![]const u8 {
     // 這類來源站直接回傳純文字 IP，所以只要 GET 之後做基本檢查即可。
-    const response = try http_text.fetchText(allocator, client, url, &.{}, .{
+    const response = try http.fetchText(allocator, client, url, &.{}, .{
         .connect_timeout = public_ip_connect_timeout,
     });
     // `response.body` 是動態配置出來的字串，用完一定要釋放。
     defer allocator.free(response.body);
 
     // HTTP 不是 2xx 的話，這裡就會直接回錯。
-    try http_text.ensureSuccessStatus(response.status, response.body);
+    try http.ensureSuccessStatus(response.status, response.body);
     // 把 body 裡可能的空白、換行整理掉，順便驗證這真的是 IP。
     const normalized = try normalizePublicIp(response.body);
     // `normalized` 只是指向 `response.body` 裡的一段 slice。
@@ -777,13 +777,13 @@ fn fetchMyIpJson(
 ) ![]const u8 {
     // 這個來源站回的是 JSON，不是純文字 IP。
     // 真正網址不寫死在這裡，而是由呼叫端從集中管理區塊傳進來。
-    const response = try http_text.fetchText(allocator, client, url, &.{}, .{
+    const response = try http.fetchText(allocator, client, url, &.{}, .{
         .connect_timeout = public_ip_connect_timeout,
     });
     defer allocator.free(response.body);
 
     // 先處理 HTTP 層面的成功 / 失敗。
-    try http_text.ensureSuccessStatus(response.status, response.body);
+    try http.ensureSuccessStatus(response.status, response.body);
 
     // 這個匿名 struct 只描述我們這次真正要用到的欄位。
     const Parsed = struct {
@@ -812,13 +812,13 @@ fn fetchBigDataCloudJson(
 ) ![]const u8 {
     // 這個來源站也回 JSON。
     // 真正網址同樣由呼叫端從集中管理區塊傳進來。
-    const response = try http_text.fetchText(allocator, client, url, &.{}, .{
+    const response = try http.fetchText(allocator, client, url, &.{}, .{
         .connect_timeout = public_ip_connect_timeout,
     });
     defer allocator.free(response.body);
 
     // 先確認 HTTP 請求本身沒失敗。
-    try http_text.ensureSuccessStatus(response.status, response.body);
+    try http.ensureSuccessStatus(response.status, response.body);
 
     // BigDataCloud 的欄位名稱是 `ipString`。
     const Parsed = struct {
