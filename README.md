@@ -287,14 +287,14 @@ The starting source rotates between update cycles instead of always beginning wi
 From `cmd.exe`:
 
 ```bat
-cd /d D:\Project\Eddie\stock_zig
+cd /d C:\dynip
 build.bat
 ```
 
 From PowerShell:
 
 ```powershell
-Set-Location D:\Project\Eddie\stock_zig
+Set-Location C:\dynip
 powershell.exe -ExecutionPolicy Bypass -File .\build.ps1
 ```
 

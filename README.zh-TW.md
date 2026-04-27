@@ -287,14 +287,14 @@ dynip service --config app.json
 在 `cmd.exe`：
 
 ```bat
-cd /d D:\Project\Eddie\stock_zig
+cd /d C:\dynip
 build.bat
 ```
 
 在 PowerShell：
 
 ```powershell
-Set-Location D:\Project\Eddie\stock_zig
+Set-Location C:\dynip
 powershell.exe -ExecutionPolicy Bypass -File .\build.ps1
 ```
 
