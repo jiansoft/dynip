@@ -64,7 +64,7 @@ If you are coming from other ecosystems, the rough mental model is:
 
 ## Requirements
 
-- Zig `0.16.0-dev.2979+e93834410` or a compatible nearby dev version
+- Zig `0.17.0-dev` or later
 - Network access to public IP sources
 - Network access to the DDNS providers you enable
 - Redis only if you want Redis-backed duplicate prevention

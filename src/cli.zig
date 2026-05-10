@@ -30,10 +30,7 @@ const scheduler = dynip.scheduler;
 /// 這裡主要會用到：
 /// - `signal`：註冊 SIGINT / SIGTERM handler
 /// - `exit`：以指定狀態碼結束程式
-const c = @cImport({
-    @cInclude("signal.h");
-    @cInclude("stdlib.h");
-});
+const c = @import("c");
 
 /// `std_options` 是 Zig 提供的特殊常數名稱。
 ///

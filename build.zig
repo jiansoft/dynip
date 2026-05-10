@@ -47,6 +47,17 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // 因為 Zig 0.17 之後移除或限制了 `@cImport` 內建函式，
+    // 現在改由 build system 預先透過 `addTranslateC` 把 C header 轉成 Zig 模組。
+    const c_translate = b.addTranslateC(.{
+        // 集中管理所有 C headers 的檔案。
+        .root_source_file = b.path("src/c.h"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const c_mod = c_translate.createModule();
+
     // 建立可執行檔要使用的根模組。
     //
     // 在 Zig 的 build system 裡，
@@ -68,12 +79,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         // 是否移除除錯符號。
         .strip = strip,
-        // 這個專案有用到 `@cImport`，所以要明確連結 libc。
+        // 這個專案有用到 C API，所以要明確連結 libc。
         .link_libc = true,
     });
     // 把第三方 `okredis` 模組掛到這個根模組上。
     // 之後主程式裡就能直接寫 `@import("okredis")`。
     exe_module.addImport("okredis", okredis_dep.module("okredis"));
+    // 掛載剛剛產生的 C 模組。之後程式裡寫 `@import("c")` 就拿得到 C 的 symbol。
+    exe_module.addImport("c", c_mod);
 
     // 這裡才是把剛剛的模組變成真正的可執行檔。
     const exe = b.addExecutable(.{
@@ -151,11 +164,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         // 測試產物也套用同樣的 strip 規則。
         .strip = strip,
-        // 測試裡一樣會碰到 `@cImport`，所以也連結 libc。
+        // 測試裡一樣會碰到 C API，所以也連結 libc。
         .link_libc = true,
     });
     // 測試模組同樣需要能匯入 `okredis`。
     test_module.addImport("okredis", okredis_dep.module("okredis"));
+    // 測試模組同樣需要 C 模組。
+    test_module.addImport("c", c_mod);
 
     // `addTest` 代表建立「編譯測試」這件事。
     // 注意：這時還只是建立測試產物，還沒真的執行。

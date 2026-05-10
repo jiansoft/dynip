@@ -25,22 +25,10 @@ const redis = @import("../io/redis.zig");
 /// 匯入共用 HTTP 文字抓取與日誌輔助。
 const http = @import("../io/http.zig");
 
-/// 匯入 C 的 `time.h`。
+/// 匯入 C API (由 build.zig 的 addTranslateC 提供)。
 ///
 /// 這裡主要是為了呼叫 `time`、`localtime_r` 之類的時間 API。
-const c = @cImport({
-    @cInclude("time.h");
-});
-
-/// 只有在 Windows 平台時才匯入 Win32 API。
-///
-/// 非 Windows 平台則放一個空 struct，讓後面的程式仍然能編譯。
-const win = if (builtin.os.tag == .windows)
-    @cImport({
-        @cInclude("windows.h");
-    })
-else
-    struct {};
+const c = @import("c");
 
 /// 單次更新檢查的結果。
 pub const RefreshStatus = enum {
@@ -1015,9 +1003,23 @@ fn buildBasicAuthorization(
 fn shouldSkipMaintenanceWindow() bool {
     // Windows 沒有 `localtime_r`，所以改走 Win32 API `GetLocalTime`。
     if (builtin.os.tag == .windows) {
-        var local_time: win.SYSTEMTIME = undefined;
+        const SYSTEMTIME = extern struct {
+            wYear: u16,
+            wMonth: u16,
+            wDayOfWeek: u16,
+            wDay: u16,
+            wHour: u16,
+            wMinute: u16,
+            wSecond: u16,
+            wMilliseconds: u16,
+        };
+        const kernel32 = struct {
+            extern "kernel32" fn GetLocalTime(lpSystemTime: *SYSTEMTIME) callconv(.winapi) void;
+        };
+
+        var local_time: SYSTEMTIME = undefined;
         // 把目前本地時間寫進 `local_time`。
-        win.GetLocalTime(&local_time);
+        kernel32.GetLocalTime(&local_time);
         // 再把時、分丟給共用輔助函式判斷。
         return shouldSkipMaintenanceWindowAt(local_time.wHour, local_time.wMinute);
     } else {

@@ -27,15 +27,13 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 /// 匯入 C 標準函式庫的 `time.h`。
+/// 匯入 C API (由 build.zig 的 addTranslateC 提供)。
 ///
 /// 用意：
 /// - `c.time(null)` 可以取得 Unix timestamp 秒數。
 /// - POSIX 平台會再用 `localtime_r` 把 timestamp 轉成本地年月日時分秒。
 /// - Windows 分支雖然用 Win32 的 `GetLocalTime` 取得本地時間，但仍用 `c.time` 取得清舊檔需要的 Unix 秒數。
-const c = @cImport({
-    // `@cInclude` 會讓 Zig 幫我們引入 C header 裡宣告的型別與函式。
-    @cInclude("time.h");
-});
+const c = @import("c");
 
 /// 日誌資料夾名稱。
 ///
