@@ -4,6 +4,7 @@ const testing = std.testing;
 const fmt = std.fmt;
 const builtin = @import("builtin");
 
+const compat = @import("../compat.zig");
 const FixBuf = @import("../types/fixbuf.zig").FixBuf;
 
 // // TODO: decide what tho do with this weird trait.
@@ -25,8 +26,8 @@ pub const MapParser = struct {
                 // .@"struct", .@"union" => isFVType(), TODO
                 else => false,
             },
-            .@"struct" => |stc| {
-                for (stc.field_types) |FieldT|
+            .@"struct" => {
+                for (comptime compat.fieldTypes(T)) |FieldT|
                     if (FieldT == *anyopaque)
                         return false;
                 return true;
@@ -162,10 +163,10 @@ pub const MapParser = struct {
 
         switch (@typeInfo(T)) {
             else => unreachable,
-            .@"struct" => |stc| {
+            .@"struct" => {
                 var foundNil = false;
                 var foundErr = false;
-                if (stc.field_names.len != size) {
+                if (compat.fieldNames(T).len != size) {
                     // The user requested a struct but the list reply from Redis
                     // contains a different number of field-value pairs.
                     var i: usize = 0;
@@ -191,9 +192,9 @@ pub const MapParser = struct {
                 // TODO: implement a radix tree or something that makes this
                 //       not stupidly inefficient.
                 comptime var max_len = 0;
-                comptime var fieldNames: [stc.field_names.len][]const u8 = undefined;
+                comptime var fieldNames: [compat.fieldNames(T).len][]const u8 = undefined;
                 comptime {
-                    for (stc.field_names, 0..) |field_name, i| {
+                    for (compat.fieldNames(T), 0..) |field_name, i| {
                         if (field_name.len > max_len) max_len = field_name.len;
                         fieldNames[i] = field_name;
                     }
@@ -201,14 +202,14 @@ pub const MapParser = struct {
 
                 const Buf = FixBuf(max_len);
                 var result: T = undefined;
-                // Iterating over `stc.field_names.len` vs `size` is the same,
+                // Iterating over `compat.fieldNames(T).len` vs `size` is the same,
                 // as the two numbers must coincide to be able to reach this
                 // part of the code, but the number of struct fields has the
                 // advantage of being a comptime-known number, allowing the
                 // compiler to unroll the while loop, if advantageous to do so.
                 var i: usize = 0;
                 // upper: (renable label when fixed in Zig)
-                while (i < stc.field_names.len) : (i += 1) {
+                while (i < compat.fieldNames(T).len) : (i += 1) {
                     if (foundNil or foundErr) {
                         // field
                         rootParser.parse(void, r) catch |err| switch (err) {
@@ -238,7 +239,7 @@ pub const MapParser = struct {
                             else => return err,
                         };
 
-                        inline for (stc.field_names, stc.field_types) |field_name, FieldT| {
+                        inline for (comptime compat.fieldNames(T), comptime compat.fieldTypes(T)) |field_name, FieldT| {
                             if (std.mem.eql(u8, field_name, hash_field.toSlice())) {
                                 @field(result, field_name) = (if (@hasField(
                                     @TypeOf(allocator),

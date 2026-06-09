@@ -6,6 +6,7 @@ const InStream = std.io.InStream;
 const Allocator = std.mem.Allocator;
 const builtin = @import("builtin");
 
+const compat = @import("./compat.zig");
 const BigNumParser = @import("./parser/t_bignum.zig").BigNumParser;
 const BoolParser = @import("./parser/t_bool.zig").BoolParser;
 const DoubleParser = @import("./parser/t_double.zig").DoubleParser;
@@ -282,11 +283,11 @@ pub const RESP3Parser = struct {
                 @compileError("sendAlloc cannot return Unions or Enums that don't implement " ++
                     "custom parsing logic. You are passing the wrong value!");
             },
-            .@"struct" => |stc| {
+            .@"struct" => {
                 if (comptime traits.isParserType(T)) {
                     T.Redis.Parser.destroy(val, rootParser, allocator);
                 } else {
-                    inline for (stc.field_names, stc.field_types) |field_name, FieldT| {
+                    inline for (comptime compat.fieldNames(T), comptime compat.fieldTypes(T)) |field_name, FieldT| {
                         switch (@typeInfo(FieldT)) {
                             else => {},
                             .@"enum",

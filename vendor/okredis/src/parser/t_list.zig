@@ -2,6 +2,7 @@ const std = @import("std");
 const Reader = std.Io.Reader;
 const fmt = std.fmt;
 const builtin = @import("builtin");
+const compat = @import("../compat.zig");
 
 /// Parses RedisList values.
 /// Uses RESP3Parser to delegate parsing of the list contents recursively.
@@ -10,8 +11,8 @@ pub const ListParser = struct {
     pub fn isSupported(comptime T: type) bool {
         return switch (@typeInfo(T)) {
             .array => true,
-            .@"struct" => |stc| {
-                for (stc.field_types) |FieldT|
+            .@"struct" => {
+                for (comptime compat.fieldTypes(T)) |FieldT|
                     if (FieldT == *anyopaque)
                         return false;
                 return true;
@@ -132,10 +133,10 @@ pub const ListParser = struct {
                 try decodeArray(arr.child, result[0..], rootParser, allocator, r);
                 return result;
             },
-            .@"struct" => |stc| {
+            .@"struct" => {
                 var foundNil = false;
                 var foundErr = false;
-                if (stc.field_names.len != size) {
+                if (compat.fieldNames(T).len != size) {
                     // The user requested a struct but the list reply from Redis
                     // contains a different amount of items.
                     var i: usize = 0;
@@ -155,7 +156,7 @@ pub const ListParser = struct {
                 }
 
                 var result: T = undefined;
-                inline for (stc.field_names, stc.field_types) |field_name, FieldT| {
+                inline for (comptime compat.fieldNames(T), comptime compat.fieldTypes(T)) |field_name, FieldT| {
                     if (foundNil or foundErr) {
                         rootParser.parse(void, r) catch |err| switch (err) {
                             error.GotErrorReply => {

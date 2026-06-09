@@ -1,6 +1,7 @@
 const std = @import("std");
 const Writer = std.Io.Writer;
 
+const compat = @import("./compat.zig");
 const traits = @import("./traits.zig");
 
 pub const CommandSerializer = struct {
@@ -53,7 +54,7 @@ pub const CommandSerializer = struct {
 
                 // Count the number of arguments
                 var argNum: usize = 0;
-                inline for (comptime std.meta.fieldNames(CmdT)) |field_name| {
+                inline for (comptime compat.fieldNames(CmdT)) |field_name| {
                     const arg = @field(command, field_name);
                     const ArgT = @TypeOf(arg);
                     if (comptime traits.isArguments(ArgT)) {
@@ -79,7 +80,7 @@ pub const CommandSerializer = struct {
                 try w.print("*{}\r\n", .{argNum});
 
                 // Serialize each argument
-                inline for (comptime std.meta.fieldNames(CmdT)) |field_name| {
+                inline for (comptime compat.fieldNames(CmdT)) |field_name| {
                     const arg = @field(command, field_name);
                     const ArgT = @TypeOf(arg);
                     if (comptime traits.isArguments(ArgT)) {

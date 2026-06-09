@@ -69,7 +69,7 @@ pub const BlobStringParser = struct {
                 const elemSize = std.math.divExact(usize, size, @sizeOf(ptr.child)) catch return error.LengthMismatch;
                 const res = try allocator.alignedAlloc(
                     ptr.child,
-                    .fromByteUnits(ptr.attrs.@"align" orelse @alignOf(ptr.child)),
+                    .fromByteUnits(pointerAlignment(ptr)),
                     elemSize,
                 );
                 errdefer allocator.free(res);
@@ -96,6 +96,13 @@ pub const BlobStringParser = struct {
         }
     }
 };
+
+fn pointerAlignment(comptime ptr: anytype) usize {
+    return if (comptime @hasField(@TypeOf(ptr), "attrs"))
+        ptr.attrs.@"align" orelse @alignOf(ptr.child)
+    else
+        ptr.alignment orelse @alignOf(ptr.child);
+}
 
 test "string" {
     {

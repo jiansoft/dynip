@@ -51,6 +51,23 @@ pub const std_options: std.Options = .{
 /// 真正的收尾與停止邏輯，仍然由主流程與 scheduler 觀察後處理。
 var shutdown_requested: std.atomic.Value(bool) = .init(false);
 
+/// 空 CLI 參數時要套用的預設子命令。
+///
+/// `zig build run` 在 Zig 0.17-dev 的新 build API 裡，通常會把程式本體
+/// 啟動成「沒有任何 app 參數」的狀態。也就是說，`runCommand(...)` 收到的
+/// `args` 會是空 slice。
+///
+/// 這個專案希望新手直接輸入 `zig build run` 就能啟動 DDNS service，
+/// 所以把空參數視為等同於：
+///
+/// ```text
+/// dynip service
+/// ```
+///
+/// 這裡用全域常數，而不是在 helper 裡建立區域陣列，是因為 helper 會回傳
+/// slice。slice 只是「指向一段記憶體的視窗」，不能指向已經離開作用域的區域陣列。
+const default_service_args = [_][]const u8{"service"};
+
 /// 將 CLI 用法寫到標準錯誤。
 ///
 /// 當使用者帶錯參數，或明確要求 `--help` / `-h` 時，
@@ -90,6 +107,27 @@ fn isHelpFlag(arg: []const u8) bool {
     return std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h");
 }
 
+/// 將 CLI 子命令參數標準化成 parser 後續可以直接處理的形式。
+///
+/// `args` 的型別是 `[]const []const u8`，可以從右往左讀：
+/// - `[]const u8`：一段不可修改的 byte 字串，例如 `"service"`
+/// - `[]const []const u8`：多個不可修改字串組成的 slice，也就是參數列表
+///
+/// 規則很單純：
+/// - 如果使用者有帶參數，就原樣回傳，避免改掉 `--help` 或 `--config`
+/// - 如果使用者沒帶參數，就補成 `service`
+fn commandArgsOrDefault(args: []const []const u8) []const []const u8 {
+    // `args.len == 0` 代表沒有任何子命令或選項。
+    if (args.len == 0) {
+        // `default_service_args[0..]` 把固定長度陣列轉成 slice。
+        // 後面的 parser 只需要 slice，不需要知道底層是陣列還是別的來源。
+        return default_service_args[0..];
+    }
+
+    // 有帶參數時完全不改動，讓明確輸入的 CLI 行為優先。
+    return args;
+}
+
 /// 解析 CLI 子命令，並在合法時啟動服務。
 ///
 /// 目前只支援一個子命令：
@@ -98,6 +136,7 @@ fn isHelpFlag(arg: []const u8) bool {
 /// 允許的形式如下：
 /// - `dynip service`
 /// - `dynip service --config app.json`
+/// - `dynip`
 /// - `dynip --help`
 fn runCommand(
     arena_allocator: std.mem.Allocator,
@@ -106,33 +145,31 @@ fn runCommand(
     args: []const []const u8,
     stop_token: ?scheduler.StopToken,
 ) !void {
-    // 完全沒帶子命令，視為 CLI 使用方式錯誤。
-    if (args.len == 0) {
-        try printUsage(io);
-        return error.InvalidArguments;
-    }
+    // 先把「空參數」這個特殊情況收斂掉。
+    // 後面的判斷就可以一律假設至少有一個 command_args[0] 可讀。
+    const command_args = commandArgsOrDefault(args);
 
     // 只有一個參數且是 help flag，代表使用者只想看說明。
-    if (args.len == 1 and isHelpFlag(args[0])) {
+    if (command_args.len == 1 and isHelpFlag(command_args[0])) {
         try printUsage(io);
         return;
     }
 
     // 目前只接受 `service` 這一種子命令。
-    if (!std.mem.eql(u8, args[0], "service")) {
+    if (!std.mem.eql(u8, command_args[0], "service")) {
         try printUsage(io);
         return error.InvalidArguments;
     }
 
     // `dynip service --help` 也是合法寫法。
-    if (args.len == 2 and isHelpFlag(args[1])) {
+    if (command_args.len == 2 and isHelpFlag(command_args[1])) {
         try printUsage(io);
         return;
     }
 
     // 把 `service` 子命令本身拿掉，
     // 後面才是屬於 `service` 的選項。
-    const option_args = args[1..];
+    const option_args = command_args[1..];
     // 解析 `--config <path>`。
     const config_path: []const u8 = switch (option_args.len) {
         // 沒帶額外選項時，就走預設 `app.json`。

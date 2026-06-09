@@ -11,7 +11,16 @@
 ///
 /// HTTP 客戶端、JSON、ArrayList、字串處理與 log 都由這裡提供。
 const std = @import("std");
-const default_accept_encoding: [@typeInfo(std.http.ContentEncoding).@"enum".field_names.len]bool = initDefaultAcceptEncoding();
+const content_encoding_count = enumFieldCount(std.http.ContentEncoding);
+const default_accept_encoding: [content_encoding_count]bool = initDefaultAcceptEncoding();
+
+fn enumFieldCount(comptime T: type) usize {
+    const enum_info = @typeInfo(T).@"enum";
+    return if (comptime @hasField(@TypeOf(enum_info), "field_names"))
+        enum_info.field_names.len
+    else
+        enum_info.fields.len;
+}
 
 /// 建立 HTTP 專用的日誌分類。
 ///
@@ -79,7 +88,7 @@ pub const HeaderPolicy = struct {
     /// 只有當 `standard.accept_encoding` 不是 `.omit` 時才會生效。
     /// 預設至少會接受 `identity`，
     /// 這樣就算我們沒有主動送出 `Accept-Encoding`，也能正常讀取未壓縮回應。
-    accept_encoding: [@typeInfo(std.http.ContentEncoding).@"enum".field_names.len]bool = default_accept_encoding,
+    accept_encoding: [content_encoding_count]bool = default_accept_encoding,
 };
 
 /// 單次 HTTP 文字 request 的完整選項。
@@ -564,8 +573,8 @@ fn maskSlice(text: []u8) void {
     }
 }
 
-fn initDefaultAcceptEncoding() [@typeInfo(std.http.ContentEncoding).@"enum".field_names.len]bool {
-    var result: [@typeInfo(std.http.ContentEncoding).@"enum".field_names.len]bool = @splat(false);
+fn initDefaultAcceptEncoding() [content_encoding_count]bool {
+    var result: [content_encoding_count]bool = @splat(false);
     result[@intFromEnum(std.http.ContentEncoding.identity)] = true;
     return result;
 }

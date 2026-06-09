@@ -3,6 +3,7 @@
 const std = @import("std");
 const Writer = std.Io.Writer;
 
+const compat = @import("../../compat.zig");
 const common = @import("../_common_utils.zig");
 const FV = common.FV;
 
@@ -69,11 +70,11 @@ fn _forStruct(comptime T: type) type {
         // We are marking ouserlves also as an argument to manage struct serialization.
         pub const RedisArguments = struct {
             pub fn count(_: Self) usize {
-                return comptime std.meta.fieldNames(T).len;
+                return comptime compat.fieldNames(T).len;
             }
 
             pub fn serialize(_: Self, comptime rootSerializer: type, msg: anytype) !void {
-                inline for (comptime std.meta.fieldNames(T)) |field_name| {
+                inline for (comptime compat.fieldNames(T)) |field_name| {
                     try rootSerializer.serializeArgument(msg, []const u8, field_name);
                 }
             }

@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../../compat.zig");
 
 pub const StreamFns = enum {
     XADD,
@@ -27,7 +28,7 @@ pub fn isValidStreamID(cmd: StreamFns, id: []const u8) bool {
 }
 
 fn isAny(arg: []const u8, strings: anytype) bool {
-    inline for (comptime std.meta.fieldNames(@TypeOf(strings))) |field_name| {
+    inline for (comptime compat.fieldNames(@TypeOf(strings))) |field_name| {
         const str = @field(strings, field_name);
         if (std.mem.eql(u8, arg, str)) return true;
     }
