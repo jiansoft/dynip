@@ -64,6 +64,25 @@ fn ensureLogDir(io: std.Io) !void {
     };
 }
 
+/// 取得當前檔案大小。
+///
+/// 在 Linux 系統下，Zig 標準庫的 `file.length(io)` 底層使用 `statx`。
+/// 在某些容器環境（如 distroless 且以非 root 執行）或舊版 Kernel 下，
+/// `statx` 呼叫可能會被沙箱（seccomp）阻擋而回傳錯誤，導致寫入中斷。
+/// 因此在此額外封裝，Linux 上改採更穩定的 `lseek` 系統呼叫來取得大小。
+fn getFileLength(io: std.Io, file: std.Io.File) !u64 {
+    if (comptime builtin.os.tag == .linux) {
+        // SEEK_END 的 whence 是 2
+        const rc = std.os.linux.lseek(file.handle, 0, 2);
+        switch (std.os.linux.errno(rc)) {
+            .SUCCESS => return rc,
+            else => return error.Unexpected,
+        }
+    } else {
+        return try file.length(io);
+    }
+}
+
 /// 程式內部使用的本地時間格式。
 ///
 /// 為什麼不用直接到處傳 C 的 `tm` 或 Windows `SYSTEMTIME`：
@@ -151,7 +170,7 @@ const Rotate = struct {
             // 為什麼每次寫入前都重新取長度：
             // - 服務重啟後，檔案本來就已經有舊內容。
             // - 每次寫入前把「邏輯寫入位置」設到最新檔尾，就能保證 log 是 append，不會寫到檔案最上面。
-            const size = try file.length(io);
+            const size = try getFileLength(io, file);
             // 使用 positional writer，而不是 streaming writer。
             // positional writer 會把 offset 明確交給底層寫入 API，不依賴作業系統目前的檔案游標。
             var write_buffer: [1024]u8 = undefined;

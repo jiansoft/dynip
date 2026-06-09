@@ -286,8 +286,8 @@ pub const RESP3Parser = struct {
                 if (comptime traits.isParserType(T)) {
                     T.Redis.Parser.destroy(val, rootParser, allocator);
                 } else {
-                    inline for (stc.fields) |f| {
-                        switch (@typeInfo(f.type)) {
+                    inline for (stc.field_names, stc.field_types) |field_name, FieldT| {
+                        switch (@typeInfo(FieldT)) {
                             else => {},
                             .@"enum",
                             .@"union",
@@ -295,7 +295,7 @@ pub const RESP3Parser = struct {
                             .pointer,
                             .optional,
                             => {
-                                freeReply(@field(val, f.name), allocator);
+                                freeReply(@field(val, field_name), allocator);
                             },
                         }
                     }

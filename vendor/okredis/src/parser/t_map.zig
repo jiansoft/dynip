@@ -26,8 +26,8 @@ pub const MapParser = struct {
                 else => false,
             },
             .@"struct" => |stc| {
-                for (stc.fields) |f|
-                    if (f.type == *anyopaque)
+                for (stc.field_types) |FieldT|
+                    if (FieldT == *anyopaque)
                         return false;
                 return true;
             },
@@ -165,7 +165,7 @@ pub const MapParser = struct {
             .@"struct" => |stc| {
                 var foundNil = false;
                 var foundErr = false;
-                if (stc.fields.len != size) {
+                if (stc.field_names.len != size) {
                     // The user requested a struct but the list reply from Redis
                     // contains a different number of field-value pairs.
                     var i: usize = 0;
@@ -191,24 +191,24 @@ pub const MapParser = struct {
                 // TODO: implement a radix tree or something that makes this
                 //       not stupidly inefficient.
                 comptime var max_len = 0;
-                comptime var fieldNames: [stc.fields.len][]const u8 = undefined;
+                comptime var fieldNames: [stc.field_names.len][]const u8 = undefined;
                 comptime {
-                    for (stc.fields, 0..) |f, i| {
-                        if (f.name.len > max_len) max_len = f.name.len;
-                        fieldNames[i] = f.name;
+                    for (stc.field_names, 0..) |field_name, i| {
+                        if (field_name.len > max_len) max_len = field_name.len;
+                        fieldNames[i] = field_name;
                     }
                 }
 
                 const Buf = FixBuf(max_len);
                 var result: T = undefined;
-                // Iterating over `stc.fields.len` vs `size` is the same,
+                // Iterating over `stc.field_names.len` vs `size` is the same,
                 // as the two numbers must coincide to be able to reach this
                 // part of the code, but the number of struct fields has the
                 // advantage of being a comptime-known number, allowing the
                 // compiler to unroll the while loop, if advantageous to do so.
                 var i: usize = 0;
                 // upper: (renable label when fixed in Zig)
-                while (i < stc.fields.len) : (i += 1) {
+                while (i < stc.field_names.len) : (i += 1) {
                     if (foundNil or foundErr) {
                         // field
                         rootParser.parse(void, r) catch |err| switch (err) {
@@ -238,15 +238,15 @@ pub const MapParser = struct {
                             else => return err,
                         };
 
-                        inline for (stc.fields) |f| {
-                            if (std.mem.eql(u8, f.name, hash_field.toSlice())) {
-                                @field(result, f.name) = (if (@hasField(
+                        inline for (stc.field_names, stc.field_types) |field_name, FieldT| {
+                            if (std.mem.eql(u8, field_name, hash_field.toSlice())) {
+                                @field(result, field_name) = (if (@hasField(
                                     @TypeOf(allocator),
                                     "ptr",
                                 ))
-                                    rootParser.parseAlloc(f.type, allocator.ptr, r)
+                                    rootParser.parseAlloc(FieldT, allocator.ptr, r)
                                 else
-                                    rootParser.parse(f.type, r)) catch |err| switch (err) {
+                                    rootParser.parse(FieldT, r)) catch |err| switch (err) {
                                     error.GotNilReply => blk: {
                                         foundNil = true;
                                         break :blk undefined;

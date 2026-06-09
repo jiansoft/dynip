@@ -53,7 +53,10 @@ pub fn build(b: *std.Build) void {
         // 集中管理所有 C headers 的檔案。
         .root_source_file = b.path("src/c.h"),
         .target = target,
-        .optimize = optimize,
+        // 這裡只把 libc headers 轉成 Zig declarations，不是編譯熱路徑程式碼。
+        // Zig 0.17-dev 目前會把 `ReleaseFast` 傳成 `translate-c -Ofast`，
+        // 但這個 translate-c frontend 不接受該參數，所以固定用 Debug。
+        .optimize = .Debug,
         .link_libc = true,
     });
     const c_mod = c_translate.createModule();
@@ -123,23 +126,15 @@ pub fn build(b: *std.Build) void {
     // 之後 `zig build run` 就是靠這個物件運作。
     const run_cmd = b.addRunArtifact(exe);
 
-    // `b.args` 代表使用者在 `zig build run --` 後面帶進來的參數。
+    // `addPassthruArgs` 代表使用者在 `zig build run --` 後面帶進來的參數。
     // 例如：
     //
     // zig build run -- service --config app.json
     //
-    // 這時 `service --config app.json` 就會出現在 `b.args` 裡。
-    if (b.args) |args| {
-        // 如果真的有帶參數，就把這些參數原封不動轉給程式本身。
-        run_cmd.addArgs(args);
-    } else {
-        // 如果完全沒帶參數，這個專案想要的預設行為是直接啟動服務。
-        // 所以自動幫使用者補上一個 `"service"`。
-        //
-        // 這樣你在 IDE 直接按 Run，或在終端直接打 `zig build run`，
-        // 就會直接進入常駐服務，而不需要每次自己手打子命令。
-        run_cmd.addArg("service");
-    }
+    // 這時 `service --config app.json` 會原封不動轉給程式本身。
+    // Zig 0.17 已移除舊版 build API 的 `b.args` 欄位，
+    // 改由 Run step 自己宣告要接收 passthrough arguments。
+    run_cmd.addPassthruArgs();
 
     // 建立一個名字叫 `run` 的 build step。
     // 使用者在命令列輸入 `zig build run` 時，找的就是這個名字。

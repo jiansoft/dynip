@@ -195,8 +195,8 @@ fn pipelineImpl(
         if (@hasField(@TypeOf(opts), "one")) {
             try CommandSerializer.serializeCommand(client.w, cmds);
         } else {
-            inline for (std.meta.fields(@TypeOf(cmds))) |field| {
-                const cmd = @field(cmds, field.name);
+            inline for (comptime std.meta.fieldNames(@TypeOf(cmds))) |field_name| {
+                const cmd = @field(cmds, field_name);
                 try CommandSerializer.serializeCommand(client.w, cmd);
             }
         }
@@ -250,7 +250,7 @@ fn pipelineImpl(
         var result: Ts = undefined;
 
         if (Ts == void) {
-            const cmd_num = std.meta.fields(@TypeOf(cmds)).len;
+            const cmd_num = std.meta.fieldNames(@TypeOf(cmds)).len;
             comptime var i: usize = 0;
             inline while (i < cmd_num) : (i += 1) {
                 try RESP3.parse(void, client.r);
@@ -259,16 +259,16 @@ fn pipelineImpl(
         } else {
             switch (@typeInfo(Ts)) {
                 .@"struct" => {
-                    inline for (std.meta.fields(Ts)) |field| {
+                    inline for (comptime std.meta.fieldNames(Ts), comptime std.meta.fieldTypes(Ts)) |field_name, FieldT| {
                         if (@hasField(@TypeOf(opts), "ptr")) {
-                            @field(result, field.name) = try RESP3.parseAlloc(
-                                field.type,
+                            @field(result, field_name) = try RESP3.parseAlloc(
+                                FieldT,
                                 opts.ptr,
                                 client.r,
                             );
                         } else {
-                            @field(result, field.name) = try RESP3.parse(
-                                field.type,
+                            @field(result, field_name) = try RESP3.parse(
+                                FieldT,
                                 client.r,
                             );
                         }
