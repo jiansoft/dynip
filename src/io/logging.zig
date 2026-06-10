@@ -25,6 +25,8 @@ const std = @import("std");
 ///
 /// 這裡用 `builtin.os.tag` 判斷目前是不是 Windows，因為 Windows 和 POSIX 取得本地時間的 API 不一樣。
 const builtin = @import("builtin");
+/// 匯入設定模組，讓 logger 能接收 Seq 相關設定。
+const config_mod = @import("../base/config.zig");
 
 /// 匯入 C 標準函式庫的 `time.h`。
 /// 匯入 C API (由 build.zig 的 addTranslateC 提供)。
@@ -49,6 +51,12 @@ pub const default_log_name = "dynip";
 ///
 /// 超過 7 天的檔案會在換日或第一次開檔時嘗試刪除。
 const default_max_age_days: i64 = 7;
+
+/// Seq CLEF ingestion endpoint。
+const seq_clef_path = "/ingest/clef";
+
+/// Seq CLEF content type。
+const seq_clef_content_type = "application/vnd.serilog.clef";
 
 /// 確保 `log/` 目錄存在。
 ///
@@ -289,6 +297,10 @@ const Logger = struct {
     error_rotate: Rotate = Rotate.init("error"),
     /// debug 等級的檔案輪替器。
     debug_rotate: Rotate = Rotate.init("debug"),
+    /// Seq 遠端日誌 sink。`null` 代表未啟用或設定不完整。
+    seq_sink: ?SeqSink = null,
+    /// 避免 Seq 故障時每筆 log 都在 console 洗版。
+    seq_failure_reported: bool = false,
 
     /// 關閉 logger 裡所有已開啟檔案。
     fn deinit(self: *Logger) void {
@@ -302,6 +314,11 @@ const Logger = struct {
         self.warn_rotate.deinit(self.io);
         self.error_rotate.deinit(self.io);
         self.debug_rotate.deinit(self.io);
+        // Seq sink 內部持有 HTTP client，也需要釋放連線池資源。
+        if (self.seq_sink) |*sink| {
+            sink.deinit();
+            self.seq_sink = null;
+        }
     }
 
     /// 根據 log level 選出對應的輪替器。
@@ -333,7 +350,149 @@ const Logger = struct {
         const rotate = self.rotateForLevel(level);
         // 寫入失敗時不讓主程式崩潰，因為 logger 失敗通常不該中斷 DDNS 服務。
         rotate.writeLine(self.io, now, level, scope_name, message) catch {};
+
+        // 如果 Seq 已啟用，把同一筆 log 轉成 CLEF 送出。
+        // 失敗時只提示一次，避免遠端日誌服務影響本地服務或造成 console 洗版。
+        if (self.seq_sink) |*sink| {
+            sink.write(level, scope_name, message, now) catch |err| {
+                if (!self.seq_failure_reported) {
+                    self.seq_failure_reported = true;
+                    var warning_buffer: [256]u8 = undefined;
+                    const warning = std.fmt.bufPrint(
+                        &warning_buffer,
+                        "seq log ingestion failed: {s}",
+                        .{@errorName(err)},
+                    ) catch "seq log ingestion failed";
+                    writeRenderedToConsole(.warn, null, warning);
+                }
+            };
+        }
     }
+};
+
+/// Seq 遠端日誌 sink。
+///
+/// 這裡刻意不使用 `src/io/http.zig` 的 helper，因為那個 helper 會寫 HTTP log。
+/// 如果 logger 內部送 Seq 時又產生 HTTP log，就會形成遞迴。
+const SeqSink = struct {
+    allocator: std.mem.Allocator,
+    client: std.http.Client,
+    endpoint: []const u8,
+    api_key: []const u8,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        seq_config: config_mod.SeqLogging,
+    ) !?SeqSink {
+        if (!seq_config.enabled) return null;
+        if (seq_config.server_url.len == 0 or seq_config.api_key.len == 0) return null;
+
+        const base_url = trimTrailingSlashes(seq_config.server_url);
+        const endpoint = try std.fmt.allocPrint(
+            allocator,
+            "{s}{s}",
+            .{ base_url, seq_clef_path },
+        );
+        errdefer allocator.free(endpoint);
+
+        const api_key = try allocator.dupe(u8, seq_config.api_key);
+        errdefer allocator.free(api_key);
+
+        return .{
+            .allocator = allocator,
+            .client = .{
+                .allocator = allocator,
+                .io = io,
+            },
+            .endpoint = endpoint,
+            .api_key = api_key,
+        };
+    }
+
+    fn deinit(self: *SeqSink) void {
+        self.client.deinit();
+        self.allocator.free(self.endpoint);
+        self.allocator.free(self.api_key);
+    }
+
+    fn write(
+        self: *SeqSink,
+        level: std.log.Level,
+        scope_name: ?[]const u8,
+        message: []const u8,
+        now: LocalDateTime,
+    ) !void {
+        var timestamp_buffer: [32]u8 = undefined;
+        const timestamp = try formatSeqTimestamp(&timestamp_buffer, now);
+
+        const event = SeqEvent{
+            .@"@t" = timestamp,
+            .@"@mt" = message,
+            .@"@l" = seqLevelText(level),
+            .SourceContext = scope_name,
+            .Service = default_log_name,
+        };
+
+        var body = std.ArrayList(u8).empty;
+        defer body.deinit(self.allocator);
+
+        var writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &body);
+        errdefer writer.deinit();
+        try std.json.Stringify.value(event, .{}, &writer.writer);
+        try writer.writer.writeByte('\n');
+        body = writer.toArrayList();
+
+        try self.post(body.items);
+    }
+
+    fn post(self: *SeqSink, body: []const u8) !void {
+        const uri = try std.Uri.parse(self.endpoint);
+        const headers = [_]std.http.Header{
+            .{ .name = "X-Seq-ApiKey", .value = self.api_key },
+        };
+
+        var request = try self.client.request(.POST, uri, .{
+            .keep_alive = true,
+            .headers = .{
+                .content_type = .{ .override = seq_clef_content_type },
+                .accept_encoding = .omit,
+            },
+            .extra_headers = &headers,
+        });
+        defer request.deinit();
+        request.accept_encoding = @splat(false);
+        request.accept_encoding[@intFromEnum(std.http.ContentEncoding.identity)] = true;
+
+        const mutable_body = try self.allocator.dupe(u8, body);
+        defer self.allocator.free(mutable_body);
+        try request.sendBodyComplete(mutable_body);
+
+        var redirect_buffer: [1024]u8 = undefined;
+        var response = try request.receiveHead(&redirect_buffer);
+        const reader = response.reader(&.{});
+        _ = reader.discardRemaining() catch {};
+
+        if (response.head.status.class() != .success) {
+            return error.SeqIngestionFailed;
+        }
+    }
+};
+
+/// 移除 URL 尾端多餘的 `/`。
+fn trimTrailingSlashes(value: []const u8) []const u8 {
+    var end = value.len;
+    while (end > 0 and value[end - 1] == '/') : (end -= 1) {}
+    return value[0..end];
+}
+
+/// Seq 使用的 CLEF event 格式。
+const SeqEvent = struct {
+    @"@t": []const u8,
+    @"@mt": []const u8,
+    @"@l": []const u8,
+    SourceContext: ?[]const u8,
+    Service: []const u8,
 };
 
 /// 全域 logger 實體。
@@ -351,6 +510,28 @@ pub fn init(io: std.Io) !void {
     try ensureLogDir(io);
     // 建立 logger，並保存目前這份 io。
     global_logger = .{ .io = io };
+}
+
+/// 依設定啟用 Seq 遠端日誌。
+///
+/// 這個函式會在設定檔與 `.env` 都載入完成後呼叫，所以可以安全使用
+/// `LOG_SEQ_SERVER_URL` / `LOG_SEQ_API_KEY` 覆寫後的值。
+pub fn configureSeq(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    seq_config: config_mod.SeqLogging,
+) !void {
+    if (global_logger) |*logger| {
+        logger.mutex.lockUncancelable(logger.io);
+        defer logger.mutex.unlock(logger.io);
+
+        if (logger.seq_sink) |*sink| {
+            sink.deinit();
+            logger.seq_sink = null;
+        }
+
+        logger.seq_sink = try SeqSink.init(allocator, io, seq_config);
+    }
 }
 
 /// 關閉全域 logger。
@@ -478,6 +659,25 @@ fn levelText(level: std.log.Level) []const u8 {
         .info => "info",
         .debug => "debug",
     };
+}
+
+/// 把 Zig log level 轉成 Seq / Serilog 常見 level 名稱。
+fn seqLevelText(level: std.log.Level) []const u8 {
+    return switch (level) {
+        .err => "Error",
+        .warn => "Warning",
+        .info => "Information",
+        .debug => "Debug",
+    };
+}
+
+/// 產生 Seq CLEF `@t` 欄位需要的 ISO-like timestamp。
+fn formatSeqTimestamp(buffer: []u8, now: LocalDateTime) ![]const u8 {
+    return std.fmt.bufPrint(
+        buffer,
+        "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}",
+        .{ now.year, now.month, now.day, now.hour, now.minute, now.second },
+    );
 }
 
 /// 取得目前本地時間。

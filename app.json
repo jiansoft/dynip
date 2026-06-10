@@ -28,5 +28,12 @@
       "password": "",
       "db": 0
     }
+  },
+  "logging": {
+    "seq": {
+      "enabled": false,
+      "server_url": "",
+      "api_key": ""
+    }
   }
 }

@@ -29,6 +29,8 @@ pub const AppConfig = struct {
     noip: NoIp = .{},
     /// DDNS 服務本身的執行設定。
     ddns: Ddns = .{},
+    /// 日誌輸出設定。
+    logging: Logging = .{},
 };
 
 /// 寫進日誌前用來取代 token / password 的固定遮罩字串。
@@ -103,6 +105,22 @@ pub const Ddns = struct {
     redis: Redis = .{},
 };
 
+/// 日誌相關設定。
+pub const Logging = struct {
+    /// Seq HTTP ingestion 設定。
+    seq: SeqLogging = .{},
+};
+
+/// Seq 日誌收集設定。
+pub const SeqLogging = struct {
+    /// 是否把本專案日誌送到 Seq。
+    enabled: bool = false,
+    /// Seq server URL，例如 `http://192.168.111.224:5341`。
+    server_url: []const u8 = "",
+    /// Seq ingestion API key。實際值建議放在 `.env`。
+    api_key: []const u8 = "",
+};
+
 /// 從 `app.json` 讀取設定，並套用環境變數覆寫。
 ///
 /// 傳回的字串與陣列資料都配置在呼叫端提供的 `allocator` 上，
@@ -157,6 +175,8 @@ pub fn redactedForLog(app_config: AppConfig) AppConfig {
     redactIfPresent(&redacted.noip.password);
     // 如果 Redis 密碼不是空字串，就把它換成固定遮罩字串。
     redactIfPresent(&redacted.ddns.redis.password);
+    // 如果 Seq API key 不是空字串，就把它換成固定遮罩字串。
+    redactIfPresent(&redacted.logging.seq.api_key);
     // 回傳這份「可安全寫進日誌」的設定副本。
     return redacted;
 }
@@ -307,6 +327,9 @@ const env_override_keys = [_][:0]const u8{
     "REDIS_DB",
     "DDNS_DEDUPE_TTL_SECONDS",
     "DDNS_REFRESH_INTERVAL_SECONDS",
+    "LOG_SEQ_ENABLED",
+    "LOG_SEQ_SERVER_URL",
+    "LOG_SEQ_API_KEY",
 };
 
 /// 依 key 把覆寫值寫進設定結構。
@@ -360,6 +383,12 @@ fn applyOverrideValueLeaky(
     } else if (std.mem.eql(u8, key, "DDNS_DEDUPE_TTL_SECONDS")) {
         config.ddns.dedupe_ttl_seconds =
             std.fmt.parseUnsigned(u64, value, 10) catch config.ddns.dedupe_ttl_seconds;
+    } else if (std.mem.eql(u8, key, "LOG_SEQ_ENABLED")) {
+        config.logging.seq.enabled = parseBoolOrKeep(value, config.logging.seq.enabled);
+    } else if (std.mem.eql(u8, key, "LOG_SEQ_SERVER_URL")) {
+        config.logging.seq.server_url = value;
+    } else if (std.mem.eql(u8, key, "LOG_SEQ_API_KEY")) {
+        config.logging.seq.api_key = value;
     }
 }
 
@@ -508,6 +537,9 @@ test "dotenv text overrides config values" {
         \\REDIS_DB=5
         \\DDNS_DEDUPE_TTL_SECONDS=86400
         \\DDNS_REFRESH_INTERVAL_SECONDS=90
+        \\LOG_SEQ_ENABLED=true
+        \\LOG_SEQ_SERVER_URL=http://seq.example.com:5341
+        \\LOG_SEQ_API_KEY=example-seq-key
     ;
 
     try applyDotEnvTextOverridesLeaky(allocator, &config, dotenv_text);
@@ -529,6 +561,9 @@ test "dotenv text overrides config values" {
     try std.testing.expectEqual(@as(u32, 5), config.ddns.redis.db);
     try std.testing.expectEqual(@as(u64, 86400), config.ddns.dedupe_ttl_seconds);
     try std.testing.expectEqual(@as(u64, 90), config.ddns.refresh_interval_seconds);
+    try std.testing.expect(config.logging.seq.enabled);
+    try std.testing.expectEqualStrings("http://seq.example.com:5341", config.logging.seq.server_url);
+    try std.testing.expectEqualStrings("example-seq-key", config.logging.seq.api_key);
 }
 
 test "parse bool override accepts common true false words" {

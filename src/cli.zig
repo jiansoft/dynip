@@ -195,6 +195,9 @@ fn runCommand(
     // 2. `.env`
     // 3. process environment variables
     const app_config = try config.loadLeaky(arena_allocator, io, config_path);
+    // 設定載入完成後，才知道 Seq server URL / API key 是否有被 `.env` 覆寫。
+    // 所以遠端 Seq logger 要在這裡啟用，而不是一開始初始化檔案 logger 時啟用。
+    try logging.configureSeq(allocator, io, app_config.logging.seq);
     // 啟動前先把敏感資訊遮罩後的設定寫進日誌。
     try logLoadedConfig(allocator, app_config);
     // 補一筆簡短訊息，說明這次啟動用哪個設定檔路徑。
