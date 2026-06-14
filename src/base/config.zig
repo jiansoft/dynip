@@ -107,6 +107,10 @@ pub const Ddns = struct {
 
 /// 日誌相關設定。
 pub const Logging = struct {
+    /// console 最低輸出等級。
+    console_level: []const u8 = "info",
+    /// 檔案日誌最低輸出等級。
+    file_level: []const u8 = "info",
     /// Seq HTTP ingestion 設定。
     seq: SeqLogging = .{},
 };
@@ -115,6 +119,8 @@ pub const Logging = struct {
 pub const SeqLogging = struct {
     /// 是否把本專案日誌送到 Seq。
     enabled: bool = false,
+    /// Seq 最低送出等級。
+    level: []const u8 = "warn",
     /// Seq server URL，例如 `http://192.168.111.224:5341`。
     server_url: []const u8 = "",
     /// Seq ingestion API key。實際值建議放在 `.env`。
@@ -327,7 +333,10 @@ const env_override_keys = [_][:0]const u8{
     "REDIS_DB",
     "DDNS_DEDUPE_TTL_SECONDS",
     "DDNS_REFRESH_INTERVAL_SECONDS",
+    "LOG_CONSOLE_LEVEL",
+    "LOG_FILE_LEVEL",
     "LOG_SEQ_ENABLED",
+    "LOG_SEQ_LEVEL",
     "LOG_SEQ_SERVER_URL",
     "LOG_SEQ_API_KEY",
 };
@@ -383,8 +392,14 @@ fn applyOverrideValueLeaky(
     } else if (std.mem.eql(u8, key, "DDNS_DEDUPE_TTL_SECONDS")) {
         config.ddns.dedupe_ttl_seconds =
             std.fmt.parseUnsigned(u64, value, 10) catch config.ddns.dedupe_ttl_seconds;
+    } else if (std.mem.eql(u8, key, "LOG_CONSOLE_LEVEL")) {
+        config.logging.console_level = value;
+    } else if (std.mem.eql(u8, key, "LOG_FILE_LEVEL")) {
+        config.logging.file_level = value;
     } else if (std.mem.eql(u8, key, "LOG_SEQ_ENABLED")) {
         config.logging.seq.enabled = parseBoolOrKeep(value, config.logging.seq.enabled);
+    } else if (std.mem.eql(u8, key, "LOG_SEQ_LEVEL")) {
+        config.logging.seq.level = value;
     } else if (std.mem.eql(u8, key, "LOG_SEQ_SERVER_URL")) {
         config.logging.seq.server_url = value;
     } else if (std.mem.eql(u8, key, "LOG_SEQ_API_KEY")) {
@@ -537,7 +552,10 @@ test "dotenv text overrides config values" {
         \\REDIS_DB=5
         \\DDNS_DEDUPE_TTL_SECONDS=86400
         \\DDNS_REFRESH_INTERVAL_SECONDS=90
+        \\LOG_CONSOLE_LEVEL=debug
+        \\LOG_FILE_LEVEL=info
         \\LOG_SEQ_ENABLED=true
+        \\LOG_SEQ_LEVEL=warn
         \\LOG_SEQ_SERVER_URL=http://seq.example.com:5341
         \\LOG_SEQ_API_KEY=example-seq-key
     ;
@@ -561,7 +579,10 @@ test "dotenv text overrides config values" {
     try std.testing.expectEqual(@as(u32, 5), config.ddns.redis.db);
     try std.testing.expectEqual(@as(u64, 86400), config.ddns.dedupe_ttl_seconds);
     try std.testing.expectEqual(@as(u64, 90), config.ddns.refresh_interval_seconds);
+    try std.testing.expectEqualStrings("debug", config.logging.console_level);
+    try std.testing.expectEqualStrings("info", config.logging.file_level);
     try std.testing.expect(config.logging.seq.enabled);
+    try std.testing.expectEqualStrings("warn", config.logging.seq.level);
     try std.testing.expectEqualStrings("http://seq.example.com:5341", config.logging.seq.server_url);
     try std.testing.expectEqualStrings("example-seq-key", config.logging.seq.api_key);
 }

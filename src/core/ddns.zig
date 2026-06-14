@@ -294,12 +294,45 @@ fn refreshWithRedisProviderState(
     ttl_seconds: u64,
     now_seconds: i64,
 ) !RefreshStatus {
+    // Redis 模式的核心目標不是「這個 IP 有沒有處理過」，
+    // 而是「每一家 DDNS provider 是否都已經收斂到目前 IP」。
+    //
+    // 為了做到這件事，Redis 裡會保存兩種狀態：
+    // 1. `DDNS:DesiredIP`
+    //    代表目前這輪所有 provider 應該更新到哪個 public IP。
+    // 2. `DDNS:Provider:{provider}` hash
+    //    代表單一家 provider 目前成功更新到哪個 IP、是否失敗、
+    //    已重試幾次、下次何時可以重試、最後錯誤是什麼。
+
+    // 這一輪 refresh 只建立一條 Redis 連線。
+    //
+    // 注意：`redis.Session` 必須在呼叫端的穩定位址上初始化。
+    // `okredis.Client` 內部會保存 reader / writer interface 的指標，
+    // 如果用「函式回傳 Session struct」的方式讓 struct 被搬移，
+    // 那些指標可能會指向舊 stack，後續第二次 Redis 指令就可能 crash。
+    //
+    // 所以這裡先宣告 `redis_session`，再用 `init(...)` 原地初始化。
     var redis_session: redis.Session = undefined;
     try redis_session.init(io, config.ddns.redis);
     defer redis_session.deinit();
 
+    // 先把目前 public IP 寫成 desired IP。
+    //
+    // 這個 key 主要用於維運觀察：
+    // `redis-cli GET DDNS:DesiredIP`
+    //
+    // Provider 真正是否需要更新，仍然由後面的 provider hash 判斷。
     try rememberDesiredIpWithSession(&redis_session, ip, ttl_seconds);
 
+    // 逐一 reconcile Afraid / Dynu / No-IP。
+    //
+    // `reconcile` 的意思是：
+    // - 如果 provider 已經是目前 IP，跳過。
+    // - 如果 provider 失敗過但 backoff 還沒到，暫緩。
+    // - 如果 provider 落後或 retry 到期，才真的打 DDNS API。
+    //
+    // 這樣三家裡面只有一家失敗時，下一輪只會處理失敗那家，
+    // 不會重複更新已經成功的 provider。
     const summary = try updateDdnsServicesReconciled(
         allocator,
         &redis_session,
@@ -309,33 +342,67 @@ fn refreshWithRedisProviderState(
         ttl_seconds,
         now_seconds,
     );
+    // 一家 provider 都沒有完整設定，代表服務沒有可執行的更新目標。
     if (summary.configured == 0) return error.NoEnabledDdnsService;
 
+    // 只要本輪有 provider 成功，就同步寫舊版觀察 key。
+    //
+    // 這些 key 不是新版狀態機的主要判斷依據，但保留它們有兩個好處：
+    // - 舊部署或既有監控如果還在看 `MyPublicIP`，不會立刻失效。
+    // - 人工排查時仍可用簡單 GET 查看最近成功 IP。
     const cache_key = try buildPublicIpCacheKey(allocator, ip);
     if (summary.succeeded != 0) {
         try rememberDedupeWithSession(&redis_session, cache_key, ip, ttl_seconds, summary.successes);
     }
 
+    // 有實際嘗試更新，但全部都失敗，這輪要回報失敗。
+    //
+    // 如果 `attempted == 0`，可能只是全部 provider 都已經是最新，
+    // 或者都還在 retry backoff，不應該被視為「更新 API 全部失敗」。
     if (summary.attempted != 0 and summary.succeeded == 0) {
         return error.AllDdnsUpdatesFailed;
     }
 
+    // 只有在所有 configured provider 都已經達到 desired IP 時，
+    // 才把目前 IP 記到 process-local cache。
+    //
+    // 這可以讓下一輪同 IP 直接跳過，連 Redis 都不用碰。
+    // 但如果有 provider 失敗或 backoff 中，就不能寫這個 cache，
+    // 否則下一輪會被本機快取擋掉，失敗 provider 就沒有機會補更新。
     if (summary.already_current + summary.succeeded == summary.configured) {
         rememberLastProcessedIp(ip);
     }
 
-    std.log.info(
-        "ddns reconcile completed: ip={s}, configured={d}, attempted={d}, succeeded={d}, already_current={d}, retry_deferred={d}, failed={d}",
-        .{
-            ip,
-            summary.configured,
-            summary.attempted,
-            summary.succeeded,
-            summary.already_current,
-            summary.retry_deferred,
-            summary.failed,
-        },
-    );
+    // 沒有任何變化時，summary 只放 debug，避免常駐服務每分鐘洗版。
+    // 只要有嘗試更新、失敗或 retry deferred，就提升到 info，
+    // 讓營運時能看到有意義的狀態變化。
+    if (summary.attempted == 0 and summary.failed == 0 and summary.retry_deferred == 0) {
+        std.log.debug(
+            "ddns reconcile completed: ip={s}, configured={d}, attempted={d}, succeeded={d}, already_current={d}, retry_deferred={d}, failed={d}",
+            .{
+                ip,
+                summary.configured,
+                summary.attempted,
+                summary.succeeded,
+                summary.already_current,
+                summary.retry_deferred,
+                summary.failed,
+            },
+        );
+    } else {
+        std.log.info(
+            "ddns reconcile completed: ip={s}, configured={d}, attempted={d}, succeeded={d}, already_current={d}, retry_deferred={d}, failed={d}",
+            .{
+                ip,
+                summary.configured,
+                summary.attempted,
+                summary.succeeded,
+                summary.already_current,
+                summary.retry_deferred,
+                summary.failed,
+            },
+        );
+    }
 
     return if (summary.attempted == 0) .skipped_cached_ip else .updated;
 }
@@ -791,10 +858,27 @@ fn updateDdnsServicesReconciled(
     ttl_seconds: u64,
     now_seconds: i64,
 ) !ServiceSummary {
+    // 這個 summary 是本輪 reconcile 的總帳。
+    //
+    // `configured`：設定完整、應納入管理的 provider 數量。
+    // `attempted`：本輪真的打了 DDNS API 的 provider 數量。
+    // `succeeded`：本輪打 API 且成功的 provider 數量。
+    // `already_current`：原本就已經是 desired IP，所以跳過的 provider 數量。
+    // `retry_deferred`：前次失敗後仍在 backoff 等待中的 provider 數量。
+    // `failed`：本輪實際嘗試但失敗的 provider 數量。
     var summary = ServiceSummary{};
 
+    // `ttl_seconds` 目前在上層寫 desired IP 與 legacy key 時使用。
+    // 這裡保留參數形狀，是為了讓呼叫端語意清楚：
+    // 「這整輪 reconcile 是帶著同一組 TTL 執行」。
     _ = ttl_seconds;
 
+    // 三家 provider 逐一 reconcile。
+    //
+    // 這裡刻意不並行：
+    // - 目前共用同一條 Redis session。
+    // - DDNS 更新頻率低，沒有必要為了三個 provider 增加並行複雜度。
+    // - 順序執行的 log 與狀態比較容易排查。
     try reconcileProvider(&summary, allocator, redis_session, client, config, .afraid, ip, now_seconds);
     try reconcileProvider(&summary, allocator, redis_session, client, config, .dynu, ip, now_seconds);
     try reconcileProvider(&summary, allocator, redis_session, client, config, .noip, ip, now_seconds);
@@ -812,9 +896,16 @@ fn reconcileProvider(
     desired_ip: []const u8,
     now_seconds: i64,
 ) !void {
+    // provider 沒啟用或認證資料不完整時，不納入 configured。
+    // 這樣使用者只啟用 No-IP 時，Afraid / Dynu 不會被算成未完成。
     if (!isProviderConfigured(config, provider)) return;
     summary.configured += 1;
 
+    // 讀取 Redis 裡這家 provider 的既有狀態。
+    //
+    // 如果 Redis 讀取失敗，這裡不直接中斷整輪 refresh。
+    // 原因是 DDNS 的主要任務是「盡量把 provider 更新到目前 IP」；
+    // 狀態讀不到時，最保守的補償策略是當作沒有狀態，直接嘗試更新。
     const state = loadProviderState(allocator, redis_session, provider) catch |err| blk: {
         std.log.warn(
             "failed to load ddns provider state, will attempt update: provider={s}, error={}",
@@ -823,10 +914,16 @@ fn reconcileProvider(
         break :blk ProviderState{};
     };
 
+    // 根據目前 Redis 狀態決定這家 provider 要不要打 API。
+    //
+    // 三種結果：
+    // - already_current：已成功更新到 desired IP，跳過。
+    // - retry_deferred：上次失敗，且 next_retry_at 還沒到，暫緩。
+    // - attempt：需要嘗試更新。
     switch (providerAttemptDecision(state, desired_ip, now_seconds)) {
         .already_current => {
             summary.already_current += 1;
-            std.log.info("skip ddns provider because it is already current: provider={s}, ip={s}", .{
+            std.log.debug("skip ddns provider because it is already current: provider={s}, ip={s}", .{
                 providerName(provider),
                 desired_ip,
             });
@@ -834,7 +931,7 @@ fn reconcileProvider(
         },
         .retry_deferred => {
             summary.retry_deferred += 1;
-            std.log.info(
+            std.log.debug(
                 "defer ddns provider retry: provider={s}, desired_ip={s}, next_retry_at={d}, now={d}",
                 .{ providerName(provider), desired_ip, state.next_retry_at, now_seconds },
             );
@@ -843,8 +940,12 @@ fn reconcileProvider(
         .attempt => {},
     }
 
+    // 走到這裡代表這家 provider 需要實際打 DDNS 更新 API。
     summary.attempted += 1;
     updateProvider(allocator, client, config, provider, desired_ip) catch |err| {
+        // 更新失敗時，不讓錯誤直接中斷其他 provider。
+        // 先把失敗狀態寫回 Redis，讓下一輪可以根據 retry_count
+        // 和 next_retry_at 做 backoff 重試。
         summary.failed += 1;
         const next_retry_at = now_seconds + retryDelaySeconds(state.retry_count + 1);
         saveProviderFailure(
@@ -869,6 +970,11 @@ fn reconcileProvider(
         return;
     };
 
+    // 更新成功後，寫回 provider hash：
+    // - current_ip = desired_ip
+    // - status = success
+    // - retry_count / next_retry_at 歸零
+    // - last_error 清空
     summary.succeeded += 1;
     summary.successes.mark(provider);
     try saveProviderSuccess(allocator, redis_session, provider, desired_ip, now_seconds);
@@ -1110,7 +1216,7 @@ fn updateAfraid(
     // 不論這次是 Updated 還是 Address has not changed，都明確寫一筆日誌，
     // 這樣就不會看起來像 Afraid 這條路徑完全沒執行。
     var preview_buffer: [http_log_body_preview_len]u8 = undefined;
-    std.log.info("afraid response: {s}", .{http.bodyPreviewForLog(&preview_buffer, response.body)});
+    std.log.debug("afraid response: {s}", .{http.bodyPreviewForLog(&preview_buffer, response.body)});
 }
 
 /// 呼叫 Dynu 的 DDNS API。
@@ -1138,7 +1244,7 @@ fn updateDynu(
     }
     // 建一塊暫時 buffer，讓回應內容可以整理後寫進 log。
     var preview_buffer: [http_log_body_preview_len]u8 = undefined;
-    std.log.info("dynu response: {s}", .{http.bodyPreviewForLog(&preview_buffer, response.body)});
+    std.log.debug("dynu response: {s}", .{http.bodyPreviewForLog(&preview_buffer, response.body)});
 }
 
 /// 呼叫 No-IP 的 DDNS API。
@@ -1174,7 +1280,7 @@ fn updateNoIp(
         }
         // 準備 log 用的暫時 buffer。
         var preview_buffer: [http_log_body_preview_len]u8 = undefined;
-        std.log.info("no-ip response ({s}): {s}", .{
+        std.log.debug("no-ip response ({s}): {s}", .{
             hostname,
             http.bodyPreviewForLog(&preview_buffer, response.body),
         });

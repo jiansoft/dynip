@@ -30,8 +30,11 @@
     }
   },
   "logging": {
+    "console_level": "info",
+    "file_level": "info",
     "seq": {
       "enabled": false,
+      "level": "warn",
       "server_url": "",
       "api_key": ""
     }

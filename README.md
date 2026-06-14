@@ -142,6 +142,16 @@ Later sources override earlier ones.
       "password": "",
       "db": 0
     }
+  },
+  "logging": {
+    "console_level": "info",
+    "file_level": "info",
+    "seq": {
+      "enabled": false,
+      "level": "warn",
+      "server_url": "",
+      "api_key": ""
+    }
   }
 }
 ```
@@ -226,6 +236,12 @@ When `ddns.redis.enabled = false`:
 - `REDIS_DB`
 - `DDNS_DEDUPE_TTL_SECONDS`
 - `DDNS_REFRESH_INTERVAL_SECONDS`
+- `LOG_CONSOLE_LEVEL`
+- `LOG_FILE_LEVEL`
+- `LOG_SEQ_ENABLED`
+- `LOG_SEQ_LEVEL`
+- `LOG_SEQ_SERVER_URL`
+- `LOG_SEQ_API_KEY`
 
 ### Example `.env`
 
@@ -253,6 +269,11 @@ REDIS_PASSWORD=<set-if-needed>
 REDIS_ENABLED=false
 DDNS_REFRESH_INTERVAL_SECONDS=60
 DDNS_DEDUPE_TTL_SECONDS=86400
+
+LOG_CONSOLE_LEVEL=info
+LOG_FILE_LEVEL=info
+LOG_SEQ_ENABLED=false
+LOG_SEQ_LEVEL=warn
 ```
 
 ## Usage

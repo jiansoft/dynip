@@ -308,7 +308,7 @@ pub fn bodyPreviewForLog(buffer: []u8, body: []const u8) []const u8 {
 fn logHttpRequest(method: std.http.Method, log_url: []const u8, body: ?[]const u8) void {
     // 如果這次 request 有 body，就把 body 長度也一起寫進 log。
     if (body) |request_body| {
-        http_log.info(
+        http_log.debug(
             "request {s} {s} body_bytes={d}",
             .{ @tagName(method), log_url, request_body.len },
         );
@@ -317,7 +317,7 @@ fn logHttpRequest(method: std.http.Method, log_url: []const u8, body: ?[]const u
     }
 
     // 沒有 body 的情況只記 method 與 URL 即可。
-    http_log.info("request {s} {s}", .{ @tagName(method), log_url });
+    http_log.debug("request {s} {s}", .{ @tagName(method), log_url });
 }
 
 /// 產生適合寫進 log 的網址版本，並遮罩敏感值。
@@ -356,7 +356,7 @@ fn logHttpResponse(
 
     // 2xx 視為成功。
     if (status.class() == .success) {
-        http_log.info(
+        http_log.debug(
             "response {s} {s} status={d} bytes={d}",
             .{ @tagName(method), log_url, @intFromEnum(status), body.len },
         );

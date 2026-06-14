@@ -131,7 +131,7 @@ pub const Session = struct {
             auth,
         );
 
-        redis_log.info("connect redis via okredis addr={s} db={d}", .{ config.addr, config.db });
+        redis_log.debug("connect redis via okredis addr={s} db={d}", .{ config.addr, config.db });
 
         // 如果指定的不是預設 DB 0，就再補一個 `SELECT`。
         if (config.db != 0) {

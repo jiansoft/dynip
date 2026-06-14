@@ -58,6 +58,14 @@ const seq_clef_path = "/ingest/clef";
 /// Seq CLEF content type。
 const seq_clef_content_type = "application/vnd.serilog.clef";
 
+/// runtime 可設定的最低日誌等級。
+const RuntimeLogLevel = enum {
+    debug,
+    info,
+    warn,
+    err,
+};
+
 /// 確保 `log/` 目錄存在。
 ///
 /// 這個函式只負責建立資料夾，不負責開 log 檔。
@@ -297,6 +305,12 @@ const Logger = struct {
     error_rotate: Rotate = Rotate.init("error"),
     /// debug 等級的檔案輪替器。
     debug_rotate: Rotate = Rotate.init("debug"),
+    /// console 最低輸出等級。
+    console_level: RuntimeLogLevel = .info,
+    /// 檔案日誌最低輸出等級。
+    file_level: RuntimeLogLevel = .info,
+    /// Seq 最低送出等級。
+    seq_level: RuntimeLogLevel = .warn,
     /// Seq 遠端日誌 sink。`null` 代表未啟用或設定不完整。
     seq_sink: ?SeqSink = null,
     /// 避免 Seq 故障時每筆 log 都在 console 洗版。
@@ -346,14 +360,17 @@ const Logger = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
-        // 找到這個 level 對應的檔案輪替器。
-        const rotate = self.rotateForLevel(level);
-        // 寫入失敗時不讓主程式崩潰，因為 logger 失敗通常不該中斷 DDNS 服務。
-        rotate.writeLine(self.io, now, level, scope_name, message) catch {};
+        if (shouldWriteLevel(level, self.file_level)) {
+            // 找到這個 level 對應的檔案輪替器。
+            const rotate = self.rotateForLevel(level);
+            // 寫入失敗時不讓主程式崩潰，因為 logger 失敗通常不該中斷 DDNS 服務。
+            rotate.writeLine(self.io, now, level, scope_name, message) catch {};
+        }
 
         // 如果 Seq 已啟用，把同一筆 log 轉成 CLEF 送出。
         // 失敗時只提示一次，避免遠端日誌服務影響本地服務或造成 console 洗版。
-        if (self.seq_sink) |*sink| {
+        if (self.seq_sink != null and shouldWriteLevel(level, self.seq_level)) {
+            const sink = &self.seq_sink.?;
             sink.write(level, scope_name, message, now) catch |err| {
                 if (!self.seq_failure_reported) {
                     self.seq_failure_reported = true;
@@ -512,14 +529,14 @@ pub fn init(io: std.Io) !void {
     global_logger = .{ .io = io };
 }
 
-/// 依設定啟用 Seq 遠端日誌。
+/// 依設定套用 runtime 日誌等級與 Seq 遠端日誌。
 ///
 /// 這個函式會在設定檔與 `.env` 都載入完成後呼叫，所以可以安全使用
-/// `LOG_SEQ_SERVER_URL` / `LOG_SEQ_API_KEY` 覆寫後的值。
-pub fn configureSeq(
+/// `LOG_*` 覆寫後的值。
+pub fn configure(
     allocator: std.mem.Allocator,
     io: std.Io,
-    seq_config: config_mod.SeqLogging,
+    logging_config: config_mod.Logging,
 ) !void {
     if (global_logger) |*logger| {
         logger.mutex.lockUncancelable(logger.io);
@@ -530,7 +547,10 @@ pub fn configureSeq(
             logger.seq_sink = null;
         }
 
-        logger.seq_sink = try SeqSink.init(allocator, io, seq_config);
+        logger.console_level = parseRuntimeLogLevel(logging_config.console_level);
+        logger.file_level = parseRuntimeLogLevel(logging_config.file_level);
+        logger.seq_level = parseRuntimeLogLevel(logging_config.seq.level);
+        logger.seq_sink = try SeqSink.init(allocator, io, logging_config.seq);
     }
 }
 
@@ -571,9 +591,11 @@ pub fn logFn(
         logger.writeRendered(level, scope_name, rendered);
     }
 
-    // 不管檔案 logger 是否已初始化，都同步輸出到 console。
-    // 這樣初始化失敗或早期錯誤仍然看得到。
-    writeRenderedToConsole(level, scope_name, rendered);
+    // 不管檔案 logger 是否已初始化，console 仍由 runtime level 控制。
+    const console_level = if (global_logger) |*logger| logger.console_level else RuntimeLogLevel.info;
+    if (shouldWriteLevel(level, console_level)) {
+        writeRenderedToConsole(level, scope_name, rendered);
+    }
 }
 
 /// 直接寫一筆 info 等級檔案日誌。
@@ -669,6 +691,39 @@ fn seqLevelText(level: std.log.Level) []const u8 {
         .info => "Information",
         .debug => "Debug",
     };
+}
+
+fn parseRuntimeLogLevel(value: []const u8) RuntimeLogLevel {
+    if (std.ascii.eqlIgnoreCase(value, "debug")) return .debug;
+    if (std.ascii.eqlIgnoreCase(value, "info")) return .info;
+    if (std.ascii.eqlIgnoreCase(value, "information")) return .info;
+    if (std.ascii.eqlIgnoreCase(value, "warn")) return .warn;
+    if (std.ascii.eqlIgnoreCase(value, "warning")) return .warn;
+    if (std.ascii.eqlIgnoreCase(value, "err")) return .err;
+    if (std.ascii.eqlIgnoreCase(value, "error")) return .err;
+    return .info;
+}
+
+fn runtimeLogLevelRank(level: RuntimeLogLevel) u8 {
+    return switch (level) {
+        .debug => 0,
+        .info => 1,
+        .warn => 2,
+        .err => 3,
+    };
+}
+
+fn stdLogLevelRank(level: std.log.Level) u8 {
+    return switch (level) {
+        .debug => 0,
+        .info => 1,
+        .warn => 2,
+        .err => 3,
+    };
+}
+
+fn shouldWriteLevel(level: std.log.Level, minimum: RuntimeLogLevel) bool {
+    return stdLogLevelRank(level) >= runtimeLogLevelRank(minimum);
 }
 
 /// 產生 Seq CLEF `@t` 欄位需要的 ISO-like timestamp。
