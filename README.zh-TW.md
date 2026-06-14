@@ -24,19 +24,48 @@
 - 在多個公開 IP 查詢來源之間輪替
 - 依日誌等級輸出檔案
 - 記錄 HTTP 請求 / 回應日誌
-- 以 Redis 或本機記憶體避免重複更新
+- 使用 Redis 記錄各 DDNS 供應商的獨立狀態
+- 自動重試失敗的供應商，不重複更新已經是最新 IP 的供應商
 
-## 運作方式
+## 快速開始
+
+1. 建立 `app.json` 或 `.env`，並至少啟用一個 DDNS 供應商。
+2. 如果需要持久化 provider 狀態與重試紀錄，請啟用 Redis。
+3. 啟動服務：
+
+```bash
+zig build run
+```
+
+明確指定設定檔路徑：
+
+```bash
+zig build run -- service --config app.json
+```
+
+## DDNS 更新模型
 
 每一輪更新流程如下：
 
 1. 檢查目前是否落在本地時間 `02:00` 到 `02:04` 的維護跳過時段。
 2. 從內建的公開 IP 查詢來源取得目前公開 IP。
-3. 依照 `MyPublicIP:{ip}` 格式建立用來避免重複更新的 key。
-4. 當 `ddns.redis.enabled = true` 時查 Redis，否則改查本機記憶體 TTL 快取。
-5. 如果 key 已存在，就略過這次更新。
-6. 更新所有已啟用且認證資料完整的 DDNS 供應商。
-7. 只要至少一個供應商更新成功，就把 key 寫入避免重複更新的快取。
+3. 把這個公開 IP 視為所有已啟用 DDNS 供應商的目標 IP，也就是 `desired_ip`。
+4. 當 Redis 啟用時，逐一比對 Redis 裡的供應商狀態。
+5. 只更新 `current_ip` 尚未等於 `desired_ip`，且重試等待時間已到期的供應商。
+6. 記錄供應商成功或失敗狀態，包含重試次數、下次重試時間與最後錯誤。
+7. 當 Redis 關閉時，退回本機記憶體 TTL 防重複更新流程。
+
+範例：
+
+```text
+目前公開 IP: 1.2.3.4
+
+Afraid current_ip = 1.2.3.4  -> 略過
+Dynu   current_ip = 1.2.3.4  -> 略過
+No-IP  current_ip = 5.6.7.8  -> 更新或重試
+```
+
+也就是說，某一家供應商失敗時，不會造成其他已成功的供應商被重複更新。
 
 ## 專案結構
 
@@ -45,11 +74,12 @@
 - `src/main.zig`：盡量保持最薄的可執行檔入口。它本身不處理太多邏輯，只負責把程式啟動控制權交給 CLI 層。
 - `src/cli.zig`：應用程式啟動層。這裡負責解析命令列參數、初始化 logger、安裝 signal handler、載入設定，最後啟動常駐排程器。
 - `src/root.zig`：共用模組入口。它會重新匯出主要內部模組，並同時扮演 `zig build test` 的測試匯總入口。
-- `src/config.zig`：設定載入邏輯。會先讀 `app.json`，再讀 `.env`，最後套用系統環境變數，後者覆蓋前者。
-- `src/ddns.zig`：DDNS 主流程。包含取得公開 IP、防重複更新檢查，以及更新各家已啟用的 DDNS provider。
-- `src/redis.zig`：Redis 整合層，主要提供 DDNS 防重複更新所需的 Redis 包裝。
-- `src/scheduler.zig`：固定間隔的背景排程器，會持續觸發每一輪更新工作。
-- `src/logging.zig`：結構化日誌層，負責 console 與檔案日誌行為。
+- `src/base/config.zig`：設定載入邏輯。會先讀 `app.json`，再讀 `.env`，最後套用系統環境變數，後者覆蓋前者。
+- `src/core/ddns.zig`：DDNS 主流程。包含取得公開 IP、比對 provider 狀態，以及更新各家已啟用的 DDNS 供應商。
+- `src/io/redis.zig`：Redis 整合層，負責 DDNS provider 狀態與相容觀察 key。
+- `src/core/scheduler.zig`：固定間隔的背景排程器，會持續觸發每一輪更新工作。
+- `src/io/logging.zig`：結構化日誌層，負責 console 與檔案日誌行為。
+- `src/io/http.zig`：共用 HTTP 請求與回應日誌輔助。
 - `build.zig`：Zig 的建置腳本，負責把 executable、`run` step 與 `test` step 串起來。
 - `build.ps1` / `build.bat`：偏向 Windows 使用情境的建置輔助腳本。
 - `control.sh`：比較偏容器或部署流程的輔助腳本。
@@ -57,7 +87,7 @@
 
 如果你是從其他語言生態來看，可以先這樣理解：
 
-- `main.zig` 類似程序入口
+- `main.zig` 類似程式入口
 - `cli.zig` 類似應用啟動層
 - `root.zig` 類似共用 package root
 - `build.zig` 同時負責建置腳本與任務入口定義
@@ -130,20 +160,38 @@
 - `dyny`: `username`, `password`
 - `noip`: `username`, `password`, `hostnames`
 
-### Redis 防重複更新
+### Redis 狀態與重試行為
 
 當 `ddns.redis.enabled = true` 時：
 
-- 避免重複更新的狀態存放在 Redis
-- key 格式為 `MyPublicIP:{ip}`
-- 目前最新公開 IP 也會同步寫到 `MyPublicIP`
-- 更新成功後會用 `SETEX` 寫入 key
+- 目前希望所有 provider 收斂到的 public IP 會寫到 `DDNS:DesiredIP`
+- 每家 provider 都有自己的 Redis hash：`DDNS:Provider:afraid`、`DDNS:Provider:dynu` 或 `DDNS:Provider:noip`
+- provider hash 會記錄 `current_ip`、`desired_ip`、`status`、`retry_count`、`next_retry_at`、`last_error` 與 `updated_at`
+- 失敗 provider 會依 exponential backoff 重試；已成功 provider 會跳過，直到 desired IP 再次變更
+- 成功更新後仍會寫入相容用觀察 key：`MyPublicIP`、`MyPublicIP:{ip}` 與 `MyPublicIP:{provider}`
+
+provider hash 範例：
+
+```text
+DDNS:Provider:noip
+  current_ip    = 5.6.7.8
+  desired_ip    = 1.2.3.4
+  status        = failed
+  retry_count   = 2
+  next_retry_at = 1781435400
+  last_error    = UnexpectedNoIpResponse
+  updated_at    = 1781435100
+```
+
+重試等待時間從 `30` 秒開始，最長退避到 `15` 分鐘。如果公開 IP 又改變，供應商會立刻針對新的 `desired_ip` 嘗試更新，不會被舊 IP 的重試等待時間擋住。
 
 當 `ddns.redis.enabled = false` 時：
 
 - 避免重複更新的狀態只存放在程式本身的記憶體中
 - TTL 邏輯與 Redis 模式相同
 - 程式重新啟動後，這些狀態就會消失
+
+`ddns.dedupe_ttl_seconds` 仍會控制相容觀察 key 與 desired IP key 的 TTL。provider hash 不設定 TTL，方便保留最後狀態供排查使用。
 
 ### 支援的環境變數
 
@@ -248,6 +296,50 @@ zig build run -- --help
 ```bash
 dynip service --config app.json
 ```
+
+## 維運與排查
+
+### 檢查 Redis 狀態
+
+查看目前目標 IP：
+
+```bash
+redis-cli GET DDNS:DesiredIP
+```
+
+查看單一供應商狀態：
+
+```bash
+redis-cli HGETALL DDNS:Provider:noip
+```
+
+查看相容觀察 key：
+
+```bash
+redis-cli GET MyPublicIP
+redis-cli GET MyPublicIP:noip
+```
+
+### 常見情境
+
+如果某一家供應商失敗，但其他供應商成功，通常會看到：
+
+```text
+status=failed
+current_ip 不等於 desired_ip
+next_retry_at 是未來時間
+```
+
+服務會略過已經是最新 IP 的供應商，並在 `next_retry_at` 到期後只重試失敗的供應商。
+
+如果某一家供應商一直沒有更新：
+
+- 確認該供應商已啟用，且必要認證資料都有填
+- 查看 `last_error`
+- 比對 `current_ip` 與 `desired_ip`
+- 確認 `next_retry_at` 是否仍在未來
+
+如果一輪更新中出現大量 Redis 連線 log，代表行為不正常。Redis 啟用時，每一輪更新應該共用同一條 Redis session。
 
 ## 日誌
 

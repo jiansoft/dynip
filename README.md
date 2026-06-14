@@ -24,19 +24,48 @@ It supports layered configuration loading, structured logging, HTTP request trac
 - Rotate across multiple public IP sources
 - Write log files by level
 - Record HTTP request/response logs
-- Prevent duplicate updates with Redis or local memory
+- Track provider-level DDNS state in Redis
+- Retry failed providers without re-updating providers that are already current
 
-## How It Works
+## Quick Start
+
+1. Create `app.json` or `.env` with at least one enabled provider.
+2. Enable Redis if you want durable provider state and retry tracking.
+3. Run the service:
+
+```bash
+zig build run
+```
+
+Run with an explicit config path:
+
+```bash
+zig build run -- service --config app.json
+```
+
+## DDNS Update Model
 
 On each update cycle, `dynip`:
 
 1. Checks whether the current time is inside the maintenance window `02:00` to `02:04` local time.
 2. Fetches the current public IP from one of the built-in public IP sources.
-3. Builds a key in the form `MyPublicIP:{ip}` to prevent duplicate updates.
-4. Checks that key in Redis when `ddns.redis.enabled = true`, otherwise checks an in-memory TTL cache.
-5. Skips the update if the key already exists.
-6. Updates all enabled DDNS providers with complete credentials.
-7. Stores the key after at least one provider update succeeds.
+3. Treats that public IP as the desired IP for every enabled DDNS provider.
+4. When Redis is enabled, reconciles each provider independently against its stored provider state.
+5. Updates only providers whose recorded `current_ip` is not the desired IP and whose retry backoff has expired.
+6. Records provider success or failure, including retry count, next retry time, and last error.
+7. When Redis is disabled, falls back to the in-memory TTL duplicate-prevention path.
+
+Example:
+
+```text
+Public IP: 1.2.3.4
+
+Afraid current_ip = 1.2.3.4  -> skipped
+Dynu   current_ip = 1.2.3.4  -> skipped
+No-IP  current_ip = 5.6.7.8  -> updated or retried
+```
+
+This means one failed provider does not force all providers to be updated again.
 
 ## Project Layout
 
@@ -45,11 +74,12 @@ This project now follows a more typical Zig application layout:
 - `src/main.zig`: the thinnest possible executable entry point. It only forwards startup control to the CLI layer.
 - `src/cli.zig`: the application bootstrap layer. It parses CLI arguments, initializes logging, installs signal handlers, loads config, and starts the long-running scheduler.
 - `src/root.zig`: the shared module root. It re-exports the main internal modules and also acts as the unit test aggregation entry point for `zig build test`.
-- `src/config.zig`: configuration loading logic. It reads `app.json`, then `.env`, then process environment variables, with later sources overriding earlier ones.
-- `src/ddns.zig`: the main DDNS workflow. It fetches the current public IP, performs duplicate-prevention checks, and updates enabled providers.
-- `src/redis.zig`: the Redis integration layer used by DDNS duplicate prevention.
-- `src/scheduler.zig`: the fixed-interval background loop that repeatedly triggers refresh work.
-- `src/logging.zig`: the structured logging layer that handles console and file logging behavior.
+- `src/base/config.zig`: configuration loading logic. It reads `app.json`, then `.env`, then process environment variables, with later sources overriding earlier ones.
+- `src/core/ddns.zig`: the main DDNS workflow. It fetches the current public IP, reconciles provider state, and updates enabled providers.
+- `src/io/redis.zig`: the Redis integration layer used by DDNS provider state and legacy observer keys.
+- `src/core/scheduler.zig`: the fixed-interval background loop that repeatedly triggers refresh work.
+- `src/io/logging.zig`: the structured logging layer that handles console and file logging behavior.
+- `src/io/http.zig`: shared HTTP fetch and response logging helpers.
 - `build.zig`: the Zig build definition. It wires together the executable, the `run` step, and the test step.
 - `build.ps1` / `build.bat`: Windows-oriented helper scripts for local build flows.
 - `control.sh`: a helper script used mainly for container or deployment-oriented workflows.
@@ -130,20 +160,38 @@ Provider-specific fields:
 - `dyny`: `username`, `password`
 - `noip`: `username`, `password`, `hostnames`
 
-### Redis Duplicate Prevention
+### Redis State And Retry Behavior
 
 When `ddns.redis.enabled = true`:
 
-- duplicate-prevention state is stored in Redis
-- key format is `MyPublicIP:{ip}`
-- the latest public IP is also stored in `MyPublicIP`
-- successful updates write the key with `SETEX`
+- the desired public IP is stored in `DDNS:DesiredIP`
+- each provider has a Redis hash: `DDNS:Provider:afraid`, `DDNS:Provider:dynu`, or `DDNS:Provider:noip`
+- provider hashes track `current_ip`, `desired_ip`, `status`, `retry_count`, `next_retry_at`, `last_error`, and `updated_at`
+- failed providers are retried with exponential backoff, while successful providers are skipped until the desired IP changes
+- legacy observer keys are still written after successful updates: `MyPublicIP`, `MyPublicIP:{ip}`, and `MyPublicIP:{provider}`
+
+Provider hash example:
+
+```text
+DDNS:Provider:noip
+  current_ip    = 5.6.7.8
+  desired_ip    = 1.2.3.4
+  status        = failed
+  retry_count   = 2
+  next_retry_at = 1781435400
+  last_error    = UnexpectedNoIpResponse
+  updated_at    = 1781435100
+```
+
+Retry delay starts at `30` seconds and backs off up to `15` minutes. If the public IP changes again, the provider is attempted immediately for the new desired IP instead of waiting for the old retry window.
 
 When `ddns.redis.enabled = false`:
 
 - duplicate-prevention state is stored in local process memory
 - the same TTL logic still applies
 - all duplicate-prevention state is lost after process restart
+
+`ddns.dedupe_ttl_seconds` still controls the TTL for legacy observer keys and the desired IP key. Provider hashes are kept without a TTL so the last provider state remains available for troubleshooting.
 
 ### Supported Environment Variables
 
@@ -248,6 +296,50 @@ Run the compiled binary directly:
 ```bash
 dynip service --config app.json
 ```
+
+## Operations
+
+### Inspect Redis State
+
+Check the current desired IP:
+
+```bash
+redis-cli GET DDNS:DesiredIP
+```
+
+Check one provider:
+
+```bash
+redis-cli HGETALL DDNS:Provider:noip
+```
+
+Check the legacy observer keys:
+
+```bash
+redis-cli GET MyPublicIP
+redis-cli GET MyPublicIP:noip
+```
+
+### Common Cases
+
+If one provider failed and others succeeded:
+
+```text
+status=failed
+current_ip is not equal to desired_ip
+next_retry_at is in the future
+```
+
+The service will skip providers that are already current and retry only the failed provider after `next_retry_at`.
+
+If a provider never updates:
+
+- confirm the provider is enabled and has all required credentials
+- inspect `last_error`
+- compare `current_ip` and `desired_ip`
+- check whether `next_retry_at` is still in the future
+
+If the service logs many Redis connections in one refresh cycle, that is unexpected. The Redis-enabled update path is designed to reuse one Redis session per refresh cycle.
 
 ## Logging
 
