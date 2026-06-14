@@ -5,6 +5,9 @@
 //!
 //! 專案外部其實還是只看到三個主要 API：
 //! - `containsKey(...)`
+//! - `get(...)`
+//! - `hGet(...)`
+//! - `hSetFields(...)`
 //! - `setEx(...)`
 //! - `ddnsDedupeCheckAndRemember(...)`
 //! - `ping(...)`
@@ -71,7 +74,7 @@ pub const DdnsDedupeResult = struct {
 /// - 做 `PING`
 ///
 /// 都建立一條連線，用完就關掉。
-const Session = struct {
+pub const Session = struct {
     /// Zig 的 IO 物件。
     io: std.Io,
     /// 底層 TCP stream。
@@ -87,23 +90,23 @@ const Session = struct {
     /// `zig-okredis` 提供的高階 Redis 客戶端。
     client: Client,
 
-    /// 建立一條新的 Redis session。
-    fn connect(io: std.Io, config: config_mod.Redis) !Session {
+    /// 在呼叫端提供的穩定記憶體位置上初始化 Redis session。
+    ///
+    /// `okredis.Client` 會保存指向 reader / writer interface 的指標，所以這個
+    /// struct 初始化後不能再被搬移；因此這裡不回傳 by-value `Session`。
+    pub fn init(self: *Session, io: std.Io, config: config_mod.Redis) !void {
         // 先把像 `192.168.1.10:6379` 這樣的字串拆成 host 與 port。
         const endpoint = try splitHostPort(config.addr);
         // 然後真的打開 TCP 連線。
         const stream = try connectStream(io, endpoint.host, endpoint.port);
         errdefer stream.close(io);
 
-        // 先宣告一個未初始化的 session。
-        // 等等會把欄位一個一個填進去。
-        var session: Session = undefined;
-        session.io = io;
-        session.stream = stream;
+        self.io = io;
+        self.stream = stream;
 
         // reader / writer 都必須綁定到自己的 buffer。
-        session.reader = session.stream.reader(io, &session.reader_buffer);
-        session.writer = session.stream.writer(io, &session.writer_buffer);
+        self.reader = self.stream.reader(io, &self.reader_buffer);
+        self.writer = self.stream.writer(io, &self.writer_buffer);
 
         // 如果有密碼，就組出 AUTH 資訊。
         // 如果沒有密碼，就讓 okredis 看到 `null`，表示不做 AUTH。
@@ -121,10 +124,10 @@ const Session = struct {
         // 1. 視情況先做 AUTH
         // 2. 接著送 `HELLO 3`
         // 3. 確認 Redis 支援 RESP3
-        session.client = try Client.init(
+        self.client = try Client.init(
             io,
-            &session.reader.interface,
-            &session.writer.interface,
+            &self.reader.interface,
+            &self.writer.interface,
             auth,
         );
 
@@ -134,29 +137,86 @@ const Session = struct {
         if (config.db != 0) {
             var db_buffer: [32]u8 = undefined;
             const db_text = try std.fmt.bufPrint(&db_buffer, "{d}", .{config.db});
-            try session.client.send(void, .{ "SELECT", db_text });
+            try self.client.send(void, .{ "SELECT", db_text });
         }
-
-        return session;
     }
 
     /// 關閉這條 TCP 連線。
-    fn deinit(self: *Session) void {
+    pub fn deinit(self: *Session) void {
         self.stream.close(self.io);
     }
 
     /// 同一條 Redis 連線上執行 `EXISTS key`。
-    fn containsKey(self: *Session, key: []const u8) !bool {
+    pub fn containsKey(self: *Session, key: []const u8) !bool {
         const count = try self.client.send(i64, .{ "EXISTS", key });
         return count > 0;
     }
 
+    /// 同一條 Redis 連線上執行 `GET key`。
+    pub fn get(self: *Session, allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
+        return self.client.sendAlloc(?[]u8, allocator, .{ "GET", key });
+    }
+
+    /// 同一條 Redis 連線上執行 `HGET key field`。
+    pub fn hGet(self: *Session, allocator: std.mem.Allocator, key: []const u8, field: []const u8) !?[]u8 {
+        return self.client.sendAlloc(?[]u8, allocator, .{ "HGET", key, field });
+    }
+
+    /// 同一條 Redis 連線上執行多欄位 `HSET key field value ...`。
+    pub fn hSetFields(self: *Session, fields: []const HashField) !void {
+        const key = fields[0].key;
+        _ = switch (fields.len) {
+            6 => try self.client.send(i64, .{
+                "HSET",
+                key,
+                fields[0].field,
+                fields[0].value,
+                fields[1].field,
+                fields[1].value,
+                fields[2].field,
+                fields[2].value,
+                fields[3].field,
+                fields[3].value,
+                fields[4].field,
+                fields[4].value,
+                fields[5].field,
+                fields[5].value,
+            }),
+            7 => try self.client.send(i64, .{
+                "HSET",
+                key,
+                fields[0].field,
+                fields[0].value,
+                fields[1].field,
+                fields[1].value,
+                fields[2].field,
+                fields[2].value,
+                fields[3].field,
+                fields[3].value,
+                fields[4].field,
+                fields[4].value,
+                fields[5].field,
+                fields[5].value,
+                fields[6].field,
+                fields[6].value,
+            }),
+            else => return error.UnsupportedRedisHashFieldCount,
+        };
+    }
+
     /// 同一條 Redis 連線上執行 `SETEX key ttl value`。
-    fn setEx(self: *Session, key: []const u8, value: []const u8, ttl_seconds: u64) !void {
+    pub fn setEx(self: *Session, key: []const u8, value: []const u8, ttl_seconds: u64) !void {
         var ttl_buffer: [32]u8 = undefined;
         const ttl_text = try std.fmt.bufPrint(&ttl_buffer, "{d}", .{ttl_seconds});
         try self.client.send(void, .{ "SETEX", key, ttl_text, value });
     }
+};
+
+/// Redis Hash 欄位寫入項目。
+pub const HashField = struct {
+    key: []const u8,
+    field: []const u8,
+    value: []const u8,
 };
 
 /// 對外提供的 `EXISTS` 包裝。
@@ -173,13 +233,67 @@ pub fn containsKey(
     // 但保留同樣的參數形狀，能讓外部 API 不必改。
     _ = allocator;
 
-    var session = try Session.connect(io, config);
+    var session: Session = undefined;
+    try session.init(io, config);
     defer session.deinit();
 
     // `EXISTS key` 會回整數：
     // - 1 代表存在
     // - 0 代表不存在
     return session.containsKey(key);
+}
+
+/// 對外提供的 `GET` 包裝。
+///
+/// key 不存在時回傳 `null`；有值時回傳配置在 `allocator` 上的字串。
+pub fn get(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    config: config_mod.Redis,
+    key: []const u8,
+) !?[]u8 {
+    var session: Session = undefined;
+    try session.init(io, config);
+    defer session.deinit();
+
+    return session.get(allocator, key);
+}
+
+/// 對外提供的 `HGET` 包裝。
+pub fn hGet(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    config: config_mod.Redis,
+    key: []const u8,
+    field: []const u8,
+) !?[]u8 {
+    var session: Session = undefined;
+    try session.init(io, config);
+    defer session.deinit();
+
+    return session.hGet(allocator, key, field);
+}
+
+/// 對外提供的多欄位 `HSET` 包裝。
+pub fn hSetFields(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    config: config_mod.Redis,
+    fields: []const HashField,
+) !void {
+    _ = allocator;
+    if (fields.len == 0) return;
+
+    const key = fields[0].key;
+    for (fields) |field| {
+        if (!std.mem.eql(u8, key, field.key)) return error.RedisHashFieldsMustShareKey;
+    }
+
+    var session: Session = undefined;
+    try session.init(io, config);
+    defer session.deinit();
+
+    try session.hSetFields(fields);
 }
 
 /// 對外提供的 `SETEX` 包裝。
@@ -198,7 +312,8 @@ pub fn setEx(
 ) !void {
     _ = allocator;
 
-    var session = try Session.connect(io, config);
+    var session: Session = undefined;
+    try session.init(io, config);
     defer session.deinit();
 
     try session.setEx(key, value, ttl_seconds);
@@ -216,7 +331,8 @@ pub fn ddnsDedupeCheckAndRemember(
 ) !DdnsDedupeResult {
     _ = allocator;
 
-    var session = try Session.connect(io, config);
+    var session: Session = undefined;
+    try session.init(io, config);
     defer session.deinit();
 
     return ddnsDedupeCheckAndRememberWithSession(&session, params);
@@ -242,7 +358,8 @@ pub fn ping(
     io: std.Io,
     config: config_mod.Redis,
 ) ![]u8 {
-    var session = try Session.connect(io, config);
+    var session: Session = undefined;
+    try session.init(io, config);
     defer session.deinit();
 
     return session.client.sendAlloc([]u8, allocator, .{"PING"});
