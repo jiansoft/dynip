@@ -64,11 +64,21 @@ const DdnsProvider = enum {
 };
 
 /// 供應商成功狀態，用來決定哪些 provider 要寫回 Redis。
+///
+/// 每一輪 DDNS 更新結束後，呼叫端會根據這份結果
+/// 決定要對哪些 provider 寫入 Redis 的 IP 記錄。
 const ProviderSuccesses = struct {
+    /// Afraid.org 這輪是否成功更新。
     afraid: bool = false,
+    /// Dynu 這輪是否成功更新。
     dynu: bool = false,
+    /// No-IP 這輪是否成功更新。
     noip: bool = false,
 
+    /// 把指定的 provider 標記為「本輪成功」。
+    ///
+    /// 通常在 DDNS API 回傳成功後立即呼叫，
+    /// 讓後續寫 Redis 時知道哪些 provider 要記錄。
     fn mark(self: *ProviderSuccesses, provider: DdnsProvider) void {
         switch (provider) {
             .afraid => self.afraid = true,
@@ -77,6 +87,10 @@ const ProviderSuccesses = struct {
         }
     }
 
+    /// 回傳指定 provider 這輪是否已標記成功。
+    ///
+    /// 用於寫 Redis 前篩選：只對成功的 provider 寫入 IP 記錄，
+    /// 避免把失敗 provider 的舊 IP 覆蓋掉成功的那筆。
     fn includes(self: ProviderSuccesses, provider: DdnsProvider) bool {
         return switch (provider) {
             .afraid => self.afraid,
@@ -87,18 +101,40 @@ const ProviderSuccesses = struct {
 };
 
 /// 單一 provider 的持久化更新狀態。
+///
+/// 這份狀態會被存在 Redis 的 hash 結構中（key: `DDNS:Provider:{provider}`），
+/// 讓服務重啟後仍能判斷上一輪是否成功、是否還在 retry backoff 中。
 const ProviderState = struct {
+    /// 這家 provider 目前已確認成功更新到的 IP。
+    /// `null` 代表還沒有任何一次成功紀錄。
     current_ip: ?[]const u8 = null,
+    /// 這一輪希望 provider 收斂到的目標 IP。
+    /// 若與 `current_ip` 相同且 `status` 為 `success`，就不需要重新打 API。
     desired_ip: ?[]const u8 = null,
+    /// 最後一次更新的結果字串，值為 `"success"` 或 `"failed"`。
+    /// `null` 代表這家 provider 從來沒有被嘗試過。
     status: ?[]const u8 = null,
+    /// 目前累計的連續失敗次數。
+    /// 用於計算 exponential backoff 的等待時間。
     retry_count: u32 = 0,
+    /// 下次可以重試的 Unix 秒數時間戳記。
+    /// 若目前時間 < 這個值，就暫緩本輪更新（retry deferred）。
     next_retry_at: i64 = 0,
 };
 
 /// provider 在這一輪是否應該打 DDNS API。
+///
+/// 由 `providerAttemptDecision()` 根據 Redis 裡的 `ProviderState` 判斷後回傳，
+/// 呼叫端再依結果決定要跳過、暫緩還是真的送出 DDNS 更新請求。
 const ProviderAttemptDecision = enum {
+    /// 需要實際呼叫 DDNS API 嘗試更新。
+    /// 可能是第一次更新、IP 已變更，或 retry backoff 已到期。
     attempt,
+    /// 這家 provider 的 `current_ip` 已等於 `desired_ip` 且狀態為成功。
+    /// 不需要重複更新，直接跳過以節省 API 呼叫次數。
     already_current,
+    /// 上一輪更新失敗，但 `next_retry_at` 尚未到期。
+    /// 暫緩本輪，等下一輪再重試，避免在短時間內重複轟炸 DDNS API。
     retry_deferred,
 };
 
@@ -562,6 +598,13 @@ fn allEnabledProvidersAlreadyRecorded(
     return checked != 0;
 }
 
+/// 讀取 Redis 裡某家 provider 的目前 IP 記錄，比對是否與傳入的 `ip` 相同。
+///
+/// 用於 dedupe 命中時的二次驗證：整體 `MyPublicIP:{ip}` key 存在，
+/// 不代表每家 provider 都已成功更新到這個 IP。
+/// 這個函式補這個漏洞，確保所有啟用的 provider 都有確實更新的紀錄後才跳過。
+///
+/// Redis 讀取失敗時回傳 `false`（保守策略：寧可多更新一次，也不漏更新）。
 fn providerCurrentIpMatches(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -585,6 +628,11 @@ fn providerCurrentIpMatches(
     return false;
 }
 
+/// 判斷指定的 DDNS provider 是否已完整設定（啟用且認證資料不為空）。
+///
+/// 只有 `enabled = true` 且所有必要欄位（token / username / password / hostnames）
+/// 都有填值時才回傳 `true`。
+/// 若任一必要欄位為空，代表使用者沒有真的要啟用這家 provider，不應納入 reconcile。
 fn isProviderConfigured(app_config: config_mod.AppConfig, provider: DdnsProvider) bool {
     return switch (provider) {
         .afraid => app_config.afraid.enabled and app_config.afraid.token.len != 0,
@@ -659,6 +707,11 @@ fn rememberDedupe(
     );
 }
 
+/// 把本輪成功更新的各 provider 目前 IP，個別寫入 Redis。
+///
+/// key 格式為 `MyPublicIP:{provider}`（例如 `MyPublicIP:afraid`）。
+/// 只有 `successes` 裡標記為成功的 provider 才會被寫入，
+/// 避免覆蓋掉還沒成功的 provider 的舊記錄。
 fn rememberProviderCurrentIps(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -680,6 +733,11 @@ fn rememberProviderCurrentIps(
     }
 }
 
+/// 使用既有的 Redis session，把 dedupe key、目前 IP 及各 provider IP 寫入 Redis。
+///
+/// 與 `rememberDedupe` 的差別在於這個版本重用呼叫端已建立的 session，
+/// 不額外開新的 TCP 連線，適合在 Redis 模式的單輪 reconcile 結尾呼叫，
+/// 以減少連線次數。
 fn rememberDedupeWithSession(
     redis_session: *redis.Session,
     cache_key: []const u8,
@@ -697,6 +755,11 @@ fn rememberDedupeWithSession(
     );
 }
 
+/// 使用既有 Redis session，把成功的各 provider 目前 IP 寫入 Redis。
+///
+/// 功能與 `rememberProviderCurrentIps` 相同，
+/// 但改用已建立的 `redis.Session` 以避免重複開連線。
+/// 通常由 `rememberDedupeWithSession` 在結尾呼叫。
 fn rememberProviderCurrentIpsWithSession(
     redis_session: *redis.Session,
     successes: ProviderSuccesses,
@@ -817,6 +880,10 @@ fn maybeShrinkLocalDedupeLocked() void {
     local_dedupe_entries.shrinkAndFree(std.heap.page_allocator, len);
 }
 
+/// 清除所有本機防重複更新快取項目，並釋放其佔用的記憶體。
+///
+/// 主要供測試使用：每個測試開始前可以呼叫此函式，
+/// 確保測試之間的本機 dedupe 狀態不會互相污染。
 fn resetLocalDedupeState() void {
     lockLocalDedupe();
     defer unlockLocalDedupe();
@@ -886,6 +953,15 @@ fn updateDdnsServicesReconciled(
     return summary;
 }
 
+/// 對單一 DDNS provider 執行 reconcile 邏輯，並更新 `summary` 統計。
+///
+/// reconcile 流程共三個步驟：
+/// 1. 若 provider 未設定完整，直接跳過（不計入 `configured`）。
+/// 2. 從 Redis 讀取目前狀態，判斷是否需要更新（`already_current`、`retry_deferred`、`attempt`）。
+/// 3. 若需要更新：呼叫對應的 DDNS API，成功則寫回成功狀態，失敗則寫回失敗狀態並設定下次重試時間。
+///
+/// 單一 provider 失敗時不會中斷其他 provider 的 reconcile，
+/// 錯誤會被記錄並轉存到 Redis 以供下輪重試。
 fn reconcileProvider(
     summary: *ServiceSummary,
     allocator: std.mem.Allocator,
@@ -980,6 +1056,11 @@ fn reconcileProvider(
     try saveProviderSuccess(allocator, redis_session, provider, desired_ip, now_seconds);
 }
 
+/// 根據 provider 種類，分派到對應的 DDNS 更新函式。
+///
+/// 這是一個薄薄的分派層（dispatch），
+/// 讓呼叫端不需要關心每家 provider 的 API 實作細節，
+/// 只需要傳入 `provider` enum 值，就會自動呼叫正確的更新邏輯。
 fn updateProvider(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
@@ -994,6 +1075,12 @@ fn updateProvider(
     };
 }
 
+/// 根據 Redis 中的 provider 狀態，決定這一輪該如何處理這家 DDNS provider。
+///
+/// 判斷順序：
+/// 1. 若 `current_ip == desired_ip` 且狀態為成功 → `already_current`（跳過）。
+/// 2. 若 `desired_ip` 已記錄且與目前一致，但 `next_retry_at` 尚未到期 → `retry_deferred`（暫緩）。
+/// 3. 其他情況（包含首次更新、IP 變更、retry 到期）→ `attempt`（嘗試更新）。
 fn providerAttemptDecision(state: ProviderState, desired_ip: []const u8, now_seconds: i64) ProviderAttemptDecision {
     if (state.current_ip) |current_ip| {
         if (std.mem.eql(u8, current_ip, desired_ip) and providerStateStatusEquals(state, provider_status_success)) {
@@ -1013,11 +1100,23 @@ fn providerAttemptDecision(state: ProviderState, desired_ip: []const u8, now_sec
     return .attempt;
 }
 
+/// 比對 `ProviderState.status` 是否等於預期字串。
+///
+/// 若 `status` 為 `null`（代表這家 provider 從來沒有被嘗試過），一律回傳 `false`。
+/// 通常用來檢查狀態是否為 `"success"`，以決定是否可以跳過本輪更新。
 fn providerStateStatusEquals(state: ProviderState, expected: []const u8) bool {
     if (state.status) |status| return std.mem.eql(u8, status, expected);
     return false;
 }
 
+/// 從 Redis hash 讀取指定 provider 的完整狀態。
+///
+/// 每個欄位都透過 `HGET` 個別讀取，若欄位不存在則使用預設值：
+/// - 字串欄位預設為 `null`
+/// - 數字欄位預設為 `0`
+///
+/// 若 Redis 連線或讀取失敗，錯誤會由呼叫端（`reconcileProvider`）捕捉，
+/// 並退回到「假設沒有狀態，直接嘗試更新」的保守策略。
 fn loadProviderState(
     allocator: std.mem.Allocator,
     redis_session: *redis.Session,
@@ -1033,6 +1132,10 @@ fn loadProviderState(
     };
 }
 
+/// 從 Redis hash 讀取一個 `u32` 整數欄位。
+///
+/// Redis 儲存的值都是字串，這個輔助函式負責把字串解析成 `u32`。
+/// 若欄位不存在或解析失敗（例如值不是合法數字），回傳 `0` 作為安全預設值。
 fn loadProviderStateU32(
     allocator: std.mem.Allocator,
     redis_session: *redis.Session,
@@ -1046,6 +1149,11 @@ fn loadProviderStateU32(
     return 0;
 }
 
+/// 從 Redis hash 讀取一個 `i64` 整數欄位。
+///
+/// 與 `loadProviderStateU32` 相同，負責把 Redis 字串轉換成帶正負號的 64 位元整數。
+/// 主要用於讀取 `next_retry_at`（Unix 秒數時間戳記）。
+/// 若欄位不存在或解析失敗，回傳 `0`（代表「立刻可以重試」）。
 fn loadProviderStateI64(
     allocator: std.mem.Allocator,
     redis_session: *redis.Session,
@@ -1059,6 +1167,15 @@ fn loadProviderStateI64(
     return 0;
 }
 
+/// 把 DDNS provider 的成功狀態寫入 Redis hash。
+///
+/// 成功後會同時更新以下欄位：
+/// - `current_ip`：設為本輪成功更新到的 IP。
+/// - `desired_ip`：設為本輪目標 IP（與 `current_ip` 相同）。
+/// - `status`：設為 `"success"`。
+/// - `retry_count` 與 `next_retry_at`：歸零（重置 backoff 計數器）。
+/// - `last_error`：清空。
+/// - `updated_at`：記錄本次成功的 Unix 秒數。
 fn saveProviderSuccess(
     allocator: std.mem.Allocator,
     redis_session: *redis.Session,
@@ -1083,6 +1200,17 @@ fn saveProviderSuccess(
     try redis_session.hSetFields(&fields);
 }
 
+/// 把 DDNS provider 的失敗狀態與下次重試時間寫入 Redis hash。
+///
+/// 失敗後會更新以下欄位：
+/// - `desired_ip`：記錄本輪目標 IP（供下輪比對是否 IP 已變更）。
+/// - `status`：設為 `"failed"`。
+/// - `retry_count`：累加後的重試次數（用於 exponential backoff 計算）。
+/// - `next_retry_at`：計算好的下次可重試 Unix 秒數。
+/// - `last_error`：記錄這次失敗的錯誤名稱，方便維運排查。
+/// - `updated_at`：記錄本次失敗的 Unix 秒數。
+///
+/// 注意：`current_ip` 不會被更新，保留最後一次成功的 IP 記錄。
 fn saveProviderFailure(
     allocator: std.mem.Allocator,
     redis_session: *redis.Session,
@@ -1113,6 +1241,18 @@ fn saveProviderFailure(
     try redis_session.hSetFields(&fields);
 }
 
+/// 根據累計的失敗次數，計算本次應該等待多少秒才能重試（exponential backoff）。
+///
+/// 計算規則：
+/// - `retry_count == 0`：回傳初始延遲（`provider_retry_initial_delay_seconds` = 30 秒）。
+/// - `retry_count >= 1`：以初始延遲為基底，每次失敗延遲翻倍（2 的次方）。
+/// - 上限為 `provider_retry_max_delay_seconds`（= 15 分鐘）。
+///
+/// 範例（初始延遲 30 秒）：
+/// - retry 1 → 30s
+/// - retry 2 → 60s
+/// - retry 3 → 120s
+/// - retry 6+ → 900s（15 分鐘上限）
 fn retryDelaySeconds(retry_count: u32) i64 {
     if (retry_count == 0) return provider_retry_initial_delay_seconds;
 
@@ -1684,6 +1824,14 @@ fn shouldSkipMaintenanceWindow() bool {
 
 /// 真正的規則很單純：
 /// 只要時間落在 02:00 到 02:04，就跳過。
+/// 根據傳入的「時」與「分」，判斷是否落在凌晨維護時段（02:00–02:04）。
+///
+/// 這個函式把「取得本地時間」與「判斷規則」拆開，
+/// 讓測試可以直接傳入固定的時間值，不需要真的等到凌晨兩點才能測試。
+///
+/// 維護時段規則：
+/// - `hour == 2` 且 `minute` 在 0–4（含）之間 → 回傳 `true`（跳過更新）。
+/// - 其他時間 → 回傳 `false`（正常更新）。
 fn shouldSkipMaintenanceWindowAt(hour: c_int, minute: c_int) bool {
     return hour == 2 and minute >= 0 and minute < 5;
 }
