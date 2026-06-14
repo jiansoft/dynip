@@ -295,115 +295,185 @@ fn unquoteDotEnvValue(value: []const u8) []const u8 {
 }
 
 /// 套用目前執行環境的環境變數覆寫。
+///
+/// 這一層是讀作業系統真的存在的環境變數，
+/// 例如你在 shell 裡先 `export AFRAID_TOKEN=...` 那種。
+/// 優先權比 `.env` 更高，因為它會最後套用。
+///
+/// `inline for` 在編譯期把 `env_overrides` 裡所有 key 展開成獨立的
+/// `getEnv` 呼叫。每個 key 在 comptime 就已知，可以直接轉成
+/// C sentinel 字串，不需要執行期的任何字串複製或 buffer。
 fn applyProcessEnvOverridesLeaky(allocator: std.mem.Allocator, config: *AppConfig) !void {
-    // 這一層是讀作業系統真的存在的環境變數，
-    // 例如你在 shell 裡先 `export AFRAID_TOKEN=...` 那種。
-    // 優先權比 `.env` 更高，因為它會最後套用。
-
-    // 下面每一行都採用同一個模式：
-    // 1. 先用 `getEnv("某個名稱")` 看環境變數有沒有存在
-    // 2. 如果有，就把那個值交給 `applyOverrideValueLeaky(...)`
-    // 3. 由後者決定要寫進 `AppConfig` 的哪個欄位
-    for (env_override_keys) |key| {
-        if (getEnv(key)) |value| {
-            try applyOverrideValueLeaky(allocator, config, key, value);
+    // `inline for` 在編譯期把所有 override 展開成獨立的 `if (getEnv(...))` 判斷。
+    // 每個 key 都是 comptime 已知的字串常數，不需要執行期額外配置。
+    inline for (env_overrides) |override| {
+        // 把 comptime 已知的 key 字串轉成 C 格式（在尾端補 null byte）。
+        // `@as([*:0]const u8, ...)` 讓 Zig 知道這是 sentinel 終止指標，
+        // 可以直接傳給 `std.c.getenv`。
+        const sentinel_key: [*:0]const u8 = comptime @as([*:0]const u8, @ptrCast((override.key ++ .{0}).ptr));
+        if (getEnv(sentinel_key)) |value| {
+            try applyOverrideValueLeaky(allocator, config, override.key, value);
         }
     }
 }
 
-/// 集中管理支援的環境變數名稱，避免在讀取流程散落重複 if。
-const env_override_keys = [_][:0]const u8{
-    "AFRAID_URL",
-    "AFRAID_ENABLED",
-    "AFRAID_PATH",
-    "AFRAID_TOKEN",
-    "DYNU_ENABLED",
-    "DYNU_URL",
-    "DYNU_USERNAME",
-    "DYNU_PASSWORD",
-    "NOIP_ENABLED",
-    "NOIP_URL",
-    "NOIP_USERNAME",
-    "NOIP_PASSWORD",
-    "NOIP_HOSTNAMES",
-    "REDIS_ADDR",
-    "REDIS_ENABLED",
-    "REDIS_ACCOUNT",
-    "REDIS_PASSWORD",
-    "REDIS_DB",
-    "DDNS_DEDUPE_TTL_SECONDS",
-    "DDNS_REFRESH_INTERVAL_SECONDS",
-    "LOG_CONSOLE_LEVEL",
-    "LOG_FILE_LEVEL",
-    "LOG_SEQ_ENABLED",
-    "LOG_SEQ_LEVEL",
-    "LOG_SEQ_SERVER_URL",
-    "LOG_SEQ_API_KEY",
+/// 環境變數覆寫的「型別標記」。
+///
+/// `applyOverrideValueLeaky` 的 comptime 對應表會用這個 enum
+/// 決定每個 key 要用哪種方式把字串 value 轉成正確型別再寫入設定。
+///
+/// - `.str`    : 直接把 `[]const u8` 寫入字串欄位。
+/// - `.bool`   : 用 `parseBoolOrKeep` 把常見布林字串轉成 `bool`。
+/// - `.u32`    : 用 `std.fmt.parseUnsigned(u32, ...)` 轉成無號 32 位整數。
+/// - `.u64`    : 用 `std.fmt.parseUnsigned(u64, ...)` 轉成無號 64 位整數。
+/// - `.str_arr`: 用 JSON 解析把 `["a","b"]` 轉成 `[][]const u8`。
+const FieldKind = enum { str, bool, u32, u64, str_arr };
+
+/// 每一筆環境變數覆寫規則的描述。
+/// comptime 建表時需要用字串路徑（`field`）來找到 `AppConfig` 裡對應的欄位指標，
+/// 再搭配 `kind` 決定轉型策略。
+const EnvOverride = struct {
+    /// 環境變數名稱（例如 `"AFRAID_TOKEN"`）。
+    key: []const u8,
+    /// 從 `AppConfig` 根到目標欄位的點分路徑（例如 `"afraid.token"`）。
+    ///
+    /// `applyOverrideValueLeaky` 裡的 `inline for` 會在 comptime 用
+    /// `@field(...)` 逐層解析這個路徑，不需要執行期字串處理。
+    field: []const u8,
+    /// 寫入時要用哪種轉型策略。
+    kind: FieldKind,
+};
+
+/// 環境變數 → AppConfig 欄位的完整對應表。
+///
+/// 這是整個覆寫機制的唯一真實來源（single source of truth）。
+/// 新增或移除一個環境變數時，**只需要改這裡**，其他地方完全不動：
+/// - `applyProcessEnvOverridesLeaky` 直接從這張表提取 key 名稱。
+/// - `applyOverrideValueLeaky` 直接從這張表找到目標欄位與轉型策略。
+const env_overrides = [_]EnvOverride{
+    .{ .key = "AFRAID_URL", .field = "afraid.url", .kind = .str },
+    .{ .key = "AFRAID_ENABLED", .field = "afraid.enabled", .kind = .bool },
+    .{ .key = "AFRAID_PATH", .field = "afraid.path", .kind = .str },
+    .{ .key = "AFRAID_TOKEN", .field = "afraid.token", .kind = .str },
+    .{ .key = "DYNU_ENABLED", .field = "dyny.enabled", .kind = .bool },
+    .{ .key = "DYNU_URL", .field = "dyny.url", .kind = .str },
+    .{ .key = "DYNU_USERNAME", .field = "dyny.username", .kind = .str },
+    .{ .key = "DYNU_PASSWORD", .field = "dyny.password", .kind = .str },
+    .{ .key = "NOIP_ENABLED", .field = "noip.enabled", .kind = .bool },
+    .{ .key = "NOIP_URL", .field = "noip.url", .kind = .str },
+    .{ .key = "NOIP_USERNAME", .field = "noip.username", .kind = .str },
+    .{ .key = "NOIP_PASSWORD", .field = "noip.password", .kind = .str },
+    .{ .key = "NOIP_HOSTNAMES", .field = "noip.hostnames", .kind = .str_arr },
+    .{ .key = "REDIS_ADDR", .field = "ddns.redis.addr", .kind = .str },
+    .{ .key = "REDIS_ENABLED", .field = "ddns.redis.enabled", .kind = .bool },
+    .{ .key = "REDIS_ACCOUNT", .field = "ddns.redis.account", .kind = .str },
+    .{ .key = "REDIS_PASSWORD", .field = "ddns.redis.password", .kind = .str },
+    .{ .key = "REDIS_DB", .field = "ddns.redis.db", .kind = .u32 },
+    .{ .key = "DDNS_REFRESH_INTERVAL_SECONDS", .field = "ddns.refresh_interval_seconds", .kind = .u64 },
+    .{ .key = "DDNS_DEDUPE_TTL_SECONDS", .field = "ddns.dedupe_ttl_seconds", .kind = .u64 },
+    .{ .key = "LOG_CONSOLE_LEVEL", .field = "logging.console_level", .kind = .str },
+    .{ .key = "LOG_FILE_LEVEL", .field = "logging.file_level", .kind = .str },
+    .{ .key = "LOG_SEQ_ENABLED", .field = "logging.seq.enabled", .kind = .bool },
+    .{ .key = "LOG_SEQ_LEVEL", .field = "logging.seq.level", .kind = .str },
+    .{ .key = "LOG_SEQ_SERVER_URL", .field = "logging.seq.server_url", .kind = .str },
+    .{ .key = "LOG_SEQ_API_KEY", .field = "logging.seq.api_key", .kind = .str },
 };
 
 /// 依 key 把覆寫值寫進設定結構。
+///
+/// 實作策略：
+/// 1. 以 `inline for` 走 `env_overrides` 陣列（comptime 已知）。
+/// 2. 每次迭代的 `override.key` 與 `override.field` 都是 comptime 常數，
+///    讓 `resolveField(config, override.field)` 能在 comptime 解析點分路徑。
+/// 3. `override.kind` 同樣是 comptime 常數，`switch` 的每個分支都能被編譯器靜態特化，
+///    最終機器碼等同手寫的直接賦值，不產生任何執行期分派。
 fn applyOverrideValueLeaky(
     allocator: std.mem.Allocator,
     config: *AppConfig,
     key: []const u8,
     value: []const u8,
 ) !void {
-    // 定義一個包含 key、目標欄位指標與型別的對應表。
-    // 這樣可以減少長串的 if-else，也更容易維護。
-    if (std.mem.eql(u8, key, "AFRAID_URL")) {
-        config.afraid.url = value;
-    } else if (std.mem.eql(u8, key, "AFRAID_ENABLED")) {
-        config.afraid.enabled = parseBoolOrKeep(value, config.afraid.enabled);
-    } else if (std.mem.eql(u8, key, "AFRAID_PATH")) {
-        config.afraid.path = value;
-    } else if (std.mem.eql(u8, key, "AFRAID_TOKEN")) {
-        config.afraid.token = value;
-    } else if (std.mem.eql(u8, key, "DYNU_ENABLED")) {
-        config.dyny.enabled = parseBoolOrKeep(value, config.dyny.enabled);
-    } else if (std.mem.eql(u8, key, "DYNU_URL")) {
-        config.dyny.url = value;
-    } else if (std.mem.eql(u8, key, "DYNU_USERNAME")) {
-        config.dyny.username = value;
-    } else if (std.mem.eql(u8, key, "DYNU_PASSWORD")) {
-        config.dyny.password = value;
-    } else if (std.mem.eql(u8, key, "NOIP_ENABLED")) {
-        config.noip.enabled = parseBoolOrKeep(value, config.noip.enabled);
-    } else if (std.mem.eql(u8, key, "NOIP_URL")) {
-        config.noip.url = value;
-    } else if (std.mem.eql(u8, key, "NOIP_USERNAME")) {
-        config.noip.username = value;
-    } else if (std.mem.eql(u8, key, "NOIP_PASSWORD")) {
-        config.noip.password = value;
-    } else if (std.mem.eql(u8, key, "NOIP_HOSTNAMES")) {
-        config.noip.hostnames = try std.json.parseFromSliceLeaky([][]const u8, allocator, value, .{});
-    } else if (std.mem.eql(u8, key, "REDIS_ADDR")) {
-        config.ddns.redis.addr = value;
-    } else if (std.mem.eql(u8, key, "REDIS_ENABLED")) {
-        config.ddns.redis.enabled = parseBoolOrKeep(value, config.ddns.redis.enabled);
-    } else if (std.mem.eql(u8, key, "REDIS_ACCOUNT")) {
-        config.ddns.redis.account = value;
-    } else if (std.mem.eql(u8, key, "REDIS_PASSWORD")) {
-        config.ddns.redis.password = value;
-    } else if (std.mem.eql(u8, key, "REDIS_DB")) {
-        config.ddns.redis.db = std.fmt.parseUnsigned(u32, value, 10) catch config.ddns.redis.db;
-    } else if (std.mem.eql(u8, key, "DDNS_REFRESH_INTERVAL_SECONDS")) {
-        config.ddns.refresh_interval_seconds =
-            std.fmt.parseUnsigned(u64, value, 10) catch config.ddns.refresh_interval_seconds;
-    } else if (std.mem.eql(u8, key, "DDNS_DEDUPE_TTL_SECONDS")) {
-        config.ddns.dedupe_ttl_seconds =
-            std.fmt.parseUnsigned(u64, value, 10) catch config.ddns.dedupe_ttl_seconds;
-    } else if (std.mem.eql(u8, key, "LOG_CONSOLE_LEVEL")) {
-        config.logging.console_level = value;
-    } else if (std.mem.eql(u8, key, "LOG_FILE_LEVEL")) {
-        config.logging.file_level = value;
-    } else if (std.mem.eql(u8, key, "LOG_SEQ_ENABLED")) {
-        config.logging.seq.enabled = parseBoolOrKeep(value, config.logging.seq.enabled);
-    } else if (std.mem.eql(u8, key, "LOG_SEQ_LEVEL")) {
-        config.logging.seq.level = value;
-    } else if (std.mem.eql(u8, key, "LOG_SEQ_SERVER_URL")) {
-        config.logging.seq.server_url = value;
-    } else if (std.mem.eql(u8, key, "LOG_SEQ_API_KEY")) {
-        config.logging.seq.api_key = value;
+    // `inline for` 走唯一的 `env_overrides` 表，把每個 entry 展開成獨立分支。
+    // `override.key` 是 comptime 常數；傳入的 `key` 是執行期 slice。
+    inline for (env_overrides) |override| {
+        // 比對執行期傳入的 key 與這個 comptime 分支的 key 是否相同。
+        // 注意：`inline for` 裡的 `continue` 只有在條件為 comptime 時才合法；
+        // 這裡 `key` 是執行期值，所以改用 `if` 把整個賦值區塊包起來。
+        if (std.mem.eql(u8, key, override.key)) {
+            // `resolveField` 在 comptime 用 `@field` 逐層解析點分路徑，
+            // 讓巢狀欄位（例如 `ddns.redis.addr`）也能正確取到可寫的欄位指標。
+            // `override.field` 是 comptime 常數，這個呼叫完全在編譯期完成。
+            const field_ptr = resolveField(config, override.field);
+
+            // `override.kind` 也是 comptime 常數，`switch` 的每個分支都能被編譯器靜態特化，
+            // 不同 kind 的展開版本不會互相混合。
+            switch (override.kind) {
+                // 字串型別：直接把 value slice 寫入欄位。
+                .str => field_ptr.* = value,
+                // 布林型別：辨識 true/false/1/0/yes/no/on/off 等常見寫法。
+                .bool => field_ptr.* = parseBoolOrKeep(value, field_ptr.*),
+                // 無號 32 位整數：解析失敗時保留原值，不中斷整個覆寫流程。
+                .u32 => field_ptr.* = std.fmt.parseUnsigned(u32, value, 10) catch field_ptr.*,
+                // 無號 64 位整數：同上。
+                .u64 => field_ptr.* = std.fmt.parseUnsigned(u64, value, 10) catch field_ptr.*,
+                // JSON 字串陣列：例如 `["a.ddns.net","b.zapto.org"]`。
+                // `Leaky` 表示解析後的字串記憶體交給外層 arena 統一回收。
+                .str_arr => field_ptr.* = try std.json.parseFromSliceLeaky(
+                    [][]const u8,
+                    allocator,
+                    value,
+                    .{},
+                ),
+            }
+            return;
+        }
+    }
+}
+
+/// 用 `@field` 逐層解析點分路徑，回傳最終欄位的可寫指標。
+///
+/// 因為 `path` 在呼叫端一定是 comptime 常數（來自 `env_overrides`），
+/// 整個解析過程都在編譯期完成，執行期沒有任何字串掃描。
+///
+/// 例如 `"ddns.redis.addr"` 會被解析為：
+/// `&config.ddns.redis.addr`（型別由 Zig 在 comptime 推導）。
+fn resolveField(config: *AppConfig, comptime path: []const u8) *resolveFieldType(AppConfig, path) {
+    // 委派給遞迴的 `resolveFieldImpl`，在 comptime 逐層解析點分路徑。
+    return resolveFieldImpl(config, path);
+}
+
+/// `resolveField` 的型別層計算：在 comptime 算出點分路徑最終指向的型別。
+fn resolveFieldType(comptime T: type, comptime path: []const u8) type {
+    // 找到第一個 `.` 的位置。
+    const dot = comptime std.mem.indexOfScalar(u8, path, '.') orelse {
+        // 沒有 `.`，代表這已經是最後一層，直接用 `@field` 取出型別。
+        return @TypeOf(@field(@as(T, undefined), path));
+    };
+    // 有 `.`，先取出第一段欄位名稱，再遞迴往下一層。
+    const head = path[0..dot];
+    const tail = path[dot + 1 ..];
+    const HeadType = @TypeOf(@field(@as(T, undefined), head));
+    return resolveFieldType(HeadType, tail);
+}
+
+/// `resolveField` 的指標層實作：逐層解引用到最終欄位的可寫指標。
+///
+/// Zig 0.17 的 `orelse` block 內若有 `return`，有時會被編譯器誤判為 comptime context。
+/// 這裡改用 comptime `if/else` 取代 `orelse {...}`，避免誤判。
+fn resolveFieldImpl(ptr: anytype, comptime path: []const u8) *resolveFieldType(
+    @typeInfo(@TypeOf(ptr)).pointer.child,
+    path,
+) {
+    // `comptime` 確保條件在編譯期求值，產生的 if/else 是靜態分支，不是執行期分派。
+    const dot = comptime std.mem.indexOfScalar(u8, path, '.');
+    if (comptime dot == null) {
+        // 沒有 `.`，已到達最終欄位，直接回傳可寫指標。
+        return &@field(ptr.*, path);
+    } else {
+        // 有 `.`，先取第一段欄位名稱，再往下遞迴。
+        const head = comptime path[0..dot.?];
+        const tail = comptime path[dot.? + 1 ..];
+        return resolveFieldImpl(&@field(ptr.*, head), tail);
     }
 }
 
