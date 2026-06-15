@@ -173,6 +173,87 @@ const ProcessPublicIpState = struct {
     buffer: [64]u8 = undefined,
 };
 
+/// 對外公開的 provider 狀態快照（值語意，複製自 process-level 記憶體）。
+///
+/// 給 Zig 新手：
+/// - 這個 struct 不使用 heap allocation。
+/// - 字串欄位採「固定大小陣列 + len」的 C-like 寫法。
+/// - 例如 `current_ip` 是 `[64]u8`，真正有效長度放在 `current_ip_len`。
+/// - 呼叫端要讀字串時，不直接讀整個 buffer，而是呼叫 `currentIpSlice()`。
+/// - 因為回傳的是值語意 copy，Dashboard 讀完不需要持有 mutex，也不用 free。
+pub const ProviderSnapshot = struct {
+    /// provider key 的固定 buffer，例如 "afraid" / "dynu" / "noip"。
+    name: [8]u8 = undefined,
+    /// `name` buffer 中實際有效 byte 數。
+    name_len: usize = 0,
+    /// false 代表服務剛啟動，該 provider 尚未寫入任何狀態。
+    initialized: bool = false,
+
+    /// 最後一次成功更新到 provider 的 IP。
+    current_ip: [64]u8 = undefined,
+    current_ip_len: usize = 0,
+    /// 本輪 DDNS 想要收斂到的 public IP。
+    desired_ip: [64]u8 = undefined,
+    desired_ip_len: usize = 0,
+    /// DDNS core 寫入的原始狀態字串，例如 "success" / "failed"。
+    status: [16]u8 = undefined,
+    status_len: usize = 0,
+
+    /// 連續失敗重試次數；成功後會歸零。
+    retry_count: u32 = 0,
+    /// 下次允許重試的 Unix timestamp 秒數；0 代表不需等待。
+    next_retry_at: i64 = 0,
+
+    /// 最近一次錯誤名稱，通常來自 `@errorName(err)`。
+    last_error: [128]u8 = undefined,
+    last_error_len: usize = 0,
+    /// 這份 provider 狀態最後一次被寫入的 Unix timestamp 秒數。
+    updated_at: i64 = 0,
+
+    /// 將固定 buffer + len 轉成正常 slice。
+    pub fn nameSlice(self: *const ProviderSnapshot) []const u8 {
+        return self.name[0..self.name_len];
+    }
+
+    pub fn currentIpSlice(self: *const ProviderSnapshot) []const u8 {
+        return self.current_ip[0..self.current_ip_len];
+    }
+
+    pub fn desiredIpSlice(self: *const ProviderSnapshot) []const u8 {
+        return self.desired_ip[0..self.desired_ip_len];
+    }
+
+    pub fn statusSlice(self: *const ProviderSnapshot) []const u8 {
+        return self.status[0..self.status_len];
+    }
+
+    pub fn lastErrorSlice(self: *const ProviderSnapshot) []const u8 {
+        return self.last_error[0..self.last_error_len];
+    }
+};
+
+/// process-level provider 狀態，供 Dashboard 在同一行程內讀取。
+///
+/// 這是內部可變狀態；所有讀寫都必須經過 `process_provider_mutex`。
+/// 對外不要直接暴露它，而是透過 `ProviderSnapshot` 複製出去。
+const ProcessProviderState = struct {
+    initialized: bool = false,
+
+    current_ip: [64]u8 = undefined,
+    current_ip_len: usize = 0,
+    desired_ip: [64]u8 = undefined,
+    desired_ip_len: usize = 0,
+    status: [16]u8 = undefined,
+    status_len: usize = 0,
+
+    retry_count: u32 = 0,
+    next_retry_at: i64 = 0,
+
+    last_error: [128]u8 = undefined,
+    last_error_len: usize = 0,
+    updated_at: i64 = 0,
+};
+
 /// 寫 HTTP body 預覽時，最多保留的字元數。
 const http_log_body_preview_len = http.body_preview_len;
 /// Public IP lookup 只需要很短的 DNS / TCP connect timeout。
@@ -200,6 +281,17 @@ const local_dedupe_shrink_min_capacity: usize = 32;
 const local_dedupe_shrink_slack_factor: usize = 4;
 /// 同一個服務行程內，記住最近一次成功處理的 public IP。
 var process_public_ip_state: ProcessPublicIpState = .{};
+/// 保護 process-level provider 狀態的互斥鎖。
+var process_provider_mutex: std.atomic.Mutex = .unlocked;
+/// 同一個服務行程內，各 provider 最近一次更新狀態。
+///
+/// 固定 slot 設計：
+/// - 0 = afraid
+/// - 1 = dynu
+/// - 2 = noip
+///
+/// 固定陣列讓 Dashboard API 永遠可回三筆資料，也避免動態配置。
+var process_provider_states: [3]ProcessProviderState = .{ .{}, .{}, .{} };
 
 /// 集中管理這個模組會打到的第三方網址。
 ///
@@ -279,6 +371,7 @@ pub fn refresh(
         config.ddns.dedupe_ttl_seconds;
 
     if (config.ddns.redis.enabled) {
+        const now_seconds = currentUnixSeconds();
         return refreshWithRedisProviderState(
             scratch,
             io,
@@ -286,7 +379,7 @@ pub fn refresh(
             config,
             ip_now,
             ttl_seconds,
-            currentUnixSeconds(),
+            now_seconds,
         );
     }
 
@@ -298,7 +391,7 @@ pub fn refresh(
     }
 
     // 真的去更新所有有完成設定的 DDNS 供應商。
-    const summary = try updateDdnsServices(scratch, client, config, ip_now);
+    const summary = try updateDdnsServices(scratch, client, config, ip_now, currentUnixSeconds());
     // 一個供應商都沒啟用，視為設定錯誤。
     if (summary.attempted == 0) return error.NoEnabledDdnsService;
     // 有嘗試，但全部失敗，就把整輪更新檢查視為失敗。
@@ -483,6 +576,162 @@ fn providerName(provider: DdnsProvider) []const u8 {
         .dynu => "dynu",
         .noip => "no-ip",
     };
+}
+
+/// provider enum 對應到固定 dashboard/API key。
+fn providerKey(provider: DdnsProvider) []const u8 {
+    return switch (provider) {
+        .afraid => "afraid",
+        .dynu => "dynu",
+        .noip => "noip",
+    };
+}
+
+/// provider enum 對應到 process-level 狀態陣列 slot。
+fn providerSlot(provider: DdnsProvider) usize {
+    return switch (provider) {
+        .afraid => 0,
+        .dynu => 1,
+        .noip => 2,
+    };
+}
+
+/// 取得目前行程內所有 provider 的狀態快照。
+///
+/// 回傳值語意資料，呼叫端不需持有鎖，也不需釋放記憶體。
+pub fn getProviderSnapshots() [3]ProviderSnapshot {
+    // 讀取共享狀態前先拿 mutex，避免 Dashboard thread 和 DDNS thread 同時讀寫。
+    lockProcessProviderStates();
+    // defer 會在函式離開時執行，確保中途 return/error 也會 unlock。
+    defer process_provider_mutex.unlock();
+
+    // 把內部可變 state 複製成對外 snapshot。
+    // 複製完成後，呼叫端拿到的是獨立值，不會再受 mutex 保護範圍影響。
+    return .{
+        providerSnapshotFromState(.afraid, process_provider_states[providerSlot(.afraid)]),
+        providerSnapshotFromState(.dynu, process_provider_states[providerSlot(.dynu)]),
+        providerSnapshotFromState(.noip, process_provider_states[providerSlot(.noip)]),
+    };
+}
+
+/// 從鎖內 provider state 建立公開 snapshot。
+fn providerSnapshotFromState(provider: DdnsProvider, state: ProcessProviderState) ProviderSnapshot {
+    // 大部分欄位可以直接值複製；固定 buffer 陣列也是值複製。
+    var snapshot = ProviderSnapshot{
+        .initialized = state.initialized,
+        .current_ip = state.current_ip,
+        .current_ip_len = state.current_ip_len,
+        .desired_ip = state.desired_ip,
+        .desired_ip_len = state.desired_ip_len,
+        .status = state.status,
+        .status_len = state.status_len,
+        .retry_count = state.retry_count,
+        .next_retry_at = state.next_retry_at,
+        .last_error = state.last_error,
+        .last_error_len = state.last_error_len,
+        .updated_at = state.updated_at,
+    };
+    // provider name 不存放在 ProcessProviderState 裡，而是由 enum slot 推導。
+    copyToFixedBuffer(&snapshot.name, &snapshot.name_len, providerKey(provider));
+    return snapshot;
+}
+
+/// 記錄 provider 成功更新狀態到 process-level memory。
+fn memoryWriteProviderSuccess(provider: DdnsProvider, ip: []const u8, now_seconds: i64) void {
+    // 寫入共享狀態必須加鎖。
+    lockProcessProviderStates();
+    defer process_provider_mutex.unlock();
+
+    // `&array[index]` 取得元素指標，因此後續修改會直接寫回全域陣列。
+    const state = &process_provider_states[providerSlot(provider)];
+    state.initialized = true;
+    // 成功時 current_ip 和 desired_ip 都等於本輪 public IP。
+    copyToFixedBuffer(&state.current_ip, &state.current_ip_len, ip);
+    copyToFixedBuffer(&state.desired_ip, &state.desired_ip_len, ip);
+    copyToFixedBuffer(&state.status, &state.status_len, provider_status_success);
+    // 成功後清除 retry/backoff/error。
+    state.retry_count = 0;
+    state.next_retry_at = 0;
+    state.last_error_len = 0;
+    state.updated_at = now_seconds;
+}
+
+/// 記錄 provider 更新失敗狀態到 process-level memory。
+fn memoryWriteProviderFailure(
+    provider: DdnsProvider,
+    desired_ip: []const u8,
+    retry_count: u32,
+    next_retry_at: i64,
+    last_error: []const u8,
+    now_seconds: i64,
+) void {
+    lockProcessProviderStates();
+    defer process_provider_mutex.unlock();
+
+    const state = &process_provider_states[providerSlot(provider)];
+    state.initialized = true;
+    // 失敗時保留 current_ip，因為 current_ip 代表最後一次成功值。
+    // 只更新 desired_ip，讓 Dashboard 可以看出目前想收斂到哪個 IP。
+    copyToFixedBuffer(&state.desired_ip, &state.desired_ip_len, desired_ip);
+    copyToFixedBuffer(&state.status, &state.status_len, provider_status_failed);
+    state.retry_count = retry_count;
+    state.next_retry_at = next_retry_at;
+    copyToFixedBuffer(&state.last_error, &state.last_error_len, last_error);
+    state.updated_at = now_seconds;
+}
+
+/// 取得指定 provider 目前記憶體內的 retry 次數。
+fn processProviderRetryCount(provider: DdnsProvider) u32 {
+    lockProcessProviderStates();
+    defer process_provider_mutex.unlock();
+
+    return process_provider_states[providerSlot(provider)].retry_count;
+}
+
+/// 非 Redis 路徑失敗時，根據 process memory 內既有 retry_count 產生展示狀態。
+fn memoryWriteProviderAttemptFailure(
+    provider: DdnsProvider,
+    desired_ip: []const u8,
+    err: anyerror,
+    now_seconds: i64,
+) void {
+    const retry_count = processProviderRetryCount(provider) + 1;
+    const next_retry_at = now_seconds + retryDelaySeconds(retry_count);
+    memoryWriteProviderFailure(
+        provider,
+        desired_ip,
+        retry_count,
+        next_retry_at,
+        @errorName(err),
+        now_seconds,
+    );
+}
+
+/// 重設 provider process state，供測試使用。
+fn resetProcessProviderStates() void {
+    lockProcessProviderStates();
+    defer process_provider_mutex.unlock();
+
+    process_provider_states = .{ .{}, .{}, .{} };
+}
+
+/// 取得 process-level provider 狀態 mutex。
+fn lockProcessProviderStates() void {
+    // std.atomic.Mutex 的 tryLock 失敗時回 false。
+    // 這裡使用簡單 spin lock，因為保護區很短，只是複製幾個固定 buffer。
+    while (!process_provider_mutex.tryLock()) {
+        std.atomic.spinLoopHint();
+    }
+}
+
+/// 複製 slice 到固定 buffer，超過容量時截斷。
+fn copyToFixedBuffer(buffer: anytype, len: *usize, value: []const u8) void {
+    // @min 確保不會寫超過固定 buffer 容量。
+    const copy_len = @min(value.len, buffer.len);
+    // Zig 的 @memcpy 要求來源和目的長度一致，所以先切成相同長度 slice。
+    if (copy_len != 0) @memcpy(buffer[0..copy_len], value[0..copy_len]);
+    // len 永遠代表目前 buffer 內有效資料長度。
+    len.* = copy_len;
 }
 
 /// 判斷目前 IP 是否和同一個行程上次成功處理的 IP 相同。
@@ -999,6 +1248,7 @@ fn reconcileProvider(
     switch (providerAttemptDecision(state, desired_ip, now_seconds)) {
         .already_current => {
             summary.already_current += 1;
+            memoryWriteProviderSuccess(provider, desired_ip, now_seconds);
             std.log.debug("skip ddns provider because it is already current: provider={s}, ip={s}", .{
                 providerName(provider),
                 desired_ip,
@@ -1197,6 +1447,7 @@ fn saveProviderSuccess(
         .{ .key = key, .field = "updated_at", .value = now_text },
     };
     _ = allocator;
+    memoryWriteProviderSuccess(provider, ip, now_seconds);
     try redis_session.hSetFields(&fields);
 }
 
@@ -1238,6 +1489,7 @@ fn saveProviderFailure(
         .{ .key = key, .field = "updated_at", .value = now_text },
     };
     _ = allocator;
+    memoryWriteProviderFailure(provider, desired_ip, retry_count, next_retry_at, last_error, now_seconds);
     try redis_session.hSetFields(&fields);
 }
 
@@ -1267,6 +1519,7 @@ fn updateDdnsServices(
     client: *std.http.Client,
     config: config_mod.AppConfig,
     ip: []const u8,
+    now_seconds: i64,
 ) !ServiceSummary {
     // 先從 0 開始累計這一輪更新統計。
     var summary = ServiceSummary{};
@@ -1286,8 +1539,11 @@ fn updateDdnsServices(
             // Afraid 真的更新成功時，成功數量加 1。
             summary.succeeded += 1;
             summary.successes.mark(.afraid);
+            memoryWriteProviderSuccess(.afraid, ip, now_seconds);
         } else |err| {
             // 失敗時不讓整輪直接中斷，而是先記錄錯誤。
+            summary.failed += 1;
+            memoryWriteProviderAttemptFailure(.afraid, ip, err, now_seconds);
             std.log.err("afraid update failed: {}", .{err});
         }
     }
@@ -1303,8 +1559,11 @@ fn updateDdnsServices(
             // Dynu 成功就累計成功數。
             summary.succeeded += 1;
             summary.successes.mark(.dynu);
+            memoryWriteProviderSuccess(.dynu, ip, now_seconds);
         } else |err| {
             // 失敗時只記錄，不中斷其他供應商。
+            summary.failed += 1;
+            memoryWriteProviderAttemptFailure(.dynu, ip, err, now_seconds);
             std.log.err("dynu update failed: {}", .{err});
         }
     }
@@ -1320,8 +1579,11 @@ fn updateDdnsServices(
             // 只要整個 No-IP 更新流程成功，就加到成功數。
             summary.succeeded += 1;
             summary.successes.mark(.noip);
+            memoryWriteProviderSuccess(.noip, ip, now_seconds);
         } else |err| {
             // 記錄 No-IP 的失敗原因。
+            summary.failed += 1;
+            memoryWriteProviderAttemptFailure(.noip, ip, err, now_seconds);
             std.log.err("no-ip update failed: {}", .{err});
         }
     }
@@ -2059,6 +2321,61 @@ test "process local public ip state skips unchanged ip" {
     rememberLastProcessedIp("1.2.3.4");
     try std.testing.expect(isSameAsLastProcessedIp("1.2.3.4"));
     try std.testing.expect(!isSameAsLastProcessedIp("5.6.7.8"));
+}
+
+test "provider snapshots expose fixed provider slots before initialization" {
+    resetProcessProviderStates();
+    defer resetProcessProviderStates();
+
+    const snapshots = getProviderSnapshots();
+
+    try std.testing.expectEqualStrings("afraid", snapshots[0].nameSlice());
+    try std.testing.expectEqualStrings("dynu", snapshots[1].nameSlice());
+    try std.testing.expectEqualStrings("noip", snapshots[2].nameSlice());
+    try std.testing.expect(!snapshots[0].initialized);
+    try std.testing.expect(!snapshots[1].initialized);
+    try std.testing.expect(!snapshots[2].initialized);
+}
+
+test "provider success snapshot copies status by value" {
+    resetProcessProviderStates();
+    defer resetProcessProviderStates();
+
+    memoryWriteProviderSuccess(.dynu, "1.2.3.4", 100);
+    var snapshots = getProviderSnapshots();
+
+    try std.testing.expect(snapshots[1].initialized);
+    try std.testing.expectEqualStrings("dynu", snapshots[1].nameSlice());
+    try std.testing.expectEqualStrings("1.2.3.4", snapshots[1].currentIpSlice());
+    try std.testing.expectEqualStrings("1.2.3.4", snapshots[1].desiredIpSlice());
+    try std.testing.expectEqualStrings(provider_status_success, snapshots[1].statusSlice());
+    try std.testing.expectEqual(@as(u32, 0), snapshots[1].retry_count);
+    try std.testing.expectEqual(@as(i64, 0), snapshots[1].next_retry_at);
+    try std.testing.expectEqual(@as(i64, 100), snapshots[1].updated_at);
+
+    memoryWriteProviderSuccess(.dynu, "5.6.7.8", 200);
+    try std.testing.expectEqualStrings("1.2.3.4", snapshots[1].currentIpSlice());
+
+    snapshots = getProviderSnapshots();
+    try std.testing.expectEqualStrings("5.6.7.8", snapshots[1].currentIpSlice());
+}
+
+test "provider failure snapshot preserves last successful current ip" {
+    resetProcessProviderStates();
+    defer resetProcessProviderStates();
+
+    memoryWriteProviderSuccess(.noip, "1.2.3.4", 100);
+    memoryWriteProviderFailure(.noip, "5.6.7.8", 2, 300, "UnexpectedNoIpResponse", 200);
+
+    const snapshots = getProviderSnapshots();
+    try std.testing.expect(snapshots[2].initialized);
+    try std.testing.expectEqualStrings("1.2.3.4", snapshots[2].currentIpSlice());
+    try std.testing.expectEqualStrings("5.6.7.8", snapshots[2].desiredIpSlice());
+    try std.testing.expectEqualStrings(provider_status_failed, snapshots[2].statusSlice());
+    try std.testing.expectEqual(@as(u32, 2), snapshots[2].retry_count);
+    try std.testing.expectEqual(@as(i64, 300), snapshots[2].next_retry_at);
+    try std.testing.expectEqualStrings("UnexpectedNoIpResponse", snapshots[2].lastErrorSlice());
+    try std.testing.expectEqual(@as(i64, 200), snapshots[2].updated_at);
 }
 
 test "redis dedupe params keep legacy redis key and value format" {

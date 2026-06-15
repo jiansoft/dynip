@@ -29,6 +29,8 @@ pub const AppConfig = struct {
     noip: NoIp = .{},
     /// DDNS 服務本身的執行設定。
     ddns: Ddns = .{},
+    /// Dashboard HTTP server 設定。
+    dashboard: Dashboard = .{},
     /// 日誌輸出設定。
     logging: Logging = .{},
 };
@@ -103,6 +105,26 @@ pub const Ddns = struct {
     dedupe_ttl_seconds: u64 = 60 * 60 * 24,
     /// Redis 連線設定。
     redis: Redis = .{},
+};
+
+/// Dashboard HTTP server 設定。
+///
+/// 這個設定控制的是「同一個 dynip process 內」的 HTTP Dashboard。
+/// Docker 部署時，container 內預設也使用同一個 port：9003。
+pub const Dashboard = struct {
+    /// 是否在同一個 dynip process 內啟動 Dashboard HTTP server。
+    ///
+    /// 設成 false 時，`dynip service` 只跑 DDNS scheduler，不開 Web port。
+    enabled: bool = true,
+    /// Dashboard 綁定位址。
+    ///
+    /// - `0.0.0.0`：容器/主機所有網卡都可連，適合 Docker publish port。
+    /// - `127.0.0.1`：只允許本機連線，適合本機測試。
+    host: []const u8 = "0.0.0.0",
+    /// Dashboard 監聽 port。
+    ///
+    /// 依目前線上服務 port 排列，DDNS Dashboard 預設接在 9001-9002 後面。
+    port: u32 = 9003,
 };
 
 /// 日誌相關設定。
@@ -371,6 +393,10 @@ const env_overrides = [_]EnvOverride{
     .{ .key = "REDIS_DB", .field = "ddns.redis.db", .kind = .u32 },
     .{ .key = "DDNS_REFRESH_INTERVAL_SECONDS", .field = "ddns.refresh_interval_seconds", .kind = .u64 },
     .{ .key = "DDNS_DEDUPE_TTL_SECONDS", .field = "ddns.dedupe_ttl_seconds", .kind = .u64 },
+    // Dashboard 可用環境變數覆寫 app.json，Docker 啟動時會用到。
+    .{ .key = "DASHBOARD_ENABLED", .field = "dashboard.enabled", .kind = .bool },
+    .{ .key = "DASHBOARD_HOST", .field = "dashboard.host", .kind = .str },
+    .{ .key = "DASHBOARD_PORT", .field = "dashboard.port", .kind = .u32 },
     .{ .key = "LOG_CONSOLE_LEVEL", .field = "logging.console_level", .kind = .str },
     .{ .key = "LOG_FILE_LEVEL", .field = "logging.file_level", .kind = .str },
     .{ .key = "LOG_SEQ_ENABLED", .field = "logging.seq.enabled", .kind = .bool },
@@ -540,6 +566,11 @@ test "load config ignores unrelated rust settings" {
         \\    "redis": {
         \\      "enabled": false
         \\    }
+        \\  },
+        \\  "dashboard": {
+        \\    "enabled": true,
+        \\    "host": "127.0.0.1",
+        \\    "port": 18080
         \\  }
         \\}
     ;
@@ -560,6 +591,9 @@ test "load config ignores unrelated rust settings" {
     try std.testing.expectEqual(@as(usize, 2), config.noip.hostnames.len);
     try std.testing.expectEqualStrings("demo.ddns.net", config.noip.hostnames[0]);
     try std.testing.expect(!config.ddns.redis.enabled);
+    try std.testing.expect(config.dashboard.enabled);
+    try std.testing.expectEqualStrings("127.0.0.1", config.dashboard.host);
+    try std.testing.expectEqual(@as(u32, 18080), config.dashboard.port);
 }
 
 test "redacted config masks secrets only when present" {
@@ -622,6 +656,9 @@ test "dotenv text overrides config values" {
         \\REDIS_DB=5
         \\DDNS_DEDUPE_TTL_SECONDS=86400
         \\DDNS_REFRESH_INTERVAL_SECONDS=90
+        \\DASHBOARD_ENABLED=true
+        \\DASHBOARD_HOST=127.0.0.1
+        \\DASHBOARD_PORT=18080
         \\LOG_CONSOLE_LEVEL=debug
         \\LOG_FILE_LEVEL=info
         \\LOG_SEQ_ENABLED=true
@@ -649,6 +686,9 @@ test "dotenv text overrides config values" {
     try std.testing.expectEqual(@as(u32, 5), config.ddns.redis.db);
     try std.testing.expectEqual(@as(u64, 86400), config.ddns.dedupe_ttl_seconds);
     try std.testing.expectEqual(@as(u64, 90), config.ddns.refresh_interval_seconds);
+    try std.testing.expect(config.dashboard.enabled);
+    try std.testing.expectEqualStrings("127.0.0.1", config.dashboard.host);
+    try std.testing.expectEqual(@as(u32, 18080), config.dashboard.port);
     try std.testing.expectEqualStrings("debug", config.logging.console_level);
     try std.testing.expectEqualStrings("info", config.logging.file_level);
     try std.testing.expect(config.logging.seq.enabled);

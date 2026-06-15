@@ -3,7 +3,7 @@
 > 文件版本：v1.1（移除 Redis 依賴，改用 APP 記憶體）  
 > 建立日期：2026-06-15  
 > 專案：`dynip` — Zig DDNS Background Service  
-> 框架：[Jetzig](https://jetzig.dev/) (Zig Web Framework)
+> Web 實作：同進程內建 HTTP Dashboard（`std.http.Server`）；`dashboard/` 保留 Jetzig scaffold 供後續相容後切換
 
 ---
 
@@ -50,7 +50,9 @@ ProviderState:
 
 ### 1.3 目標
 
-使用 **Jetzig** 開發一個 Web Dashboard，整合在 `dynip` 專案中（或作為獨立 sub-project）。
+開發一個 Web Dashboard，整合在 `dynip` 單一 process 內。
+
+目前已完成的 runtime 版本使用 `src/dashboard/server.zig` 直接以 Zig 標準庫 HTTP server 提供頁面與 JSON API；`dashboard/` Jetzig scaffold 已建立，但本機 Zig 0.17 與 Jetzig 產生的相依目前存在編譯相容性問題，因此暫不把 Jetzig app 接進主 build。
 
 ### 1.4 設計原則（v1.1 更新）
 
@@ -69,7 +71,8 @@ ProviderState:
 |------|------|
 | 響應速度 | 頁面首次載入 < 500ms |
 | 狀態刷新 | 輪詢間隔 ≤ 30 秒（可配置） |
-| 部署方式 | 同 `dynip` 服務一起啟動，或獨立啟動 |
+| 部署方式 | 單一 `dynip` process 內同時啟動 DDNS service 與 Dashboard HTTP server |
+| Dashboard 監聽 | 由 `app.json` 的 `dashboard.host` / `dashboard.port` 控制，預設 `0.0.0.0:9003` |
 | 認證 | 初版不需要，後期可加基本 HTTP Auth |
 | Redis 依賴 | Dashboard **不**依賴 Redis；資料來自 `ddns.getProviderSnapshots()` |
 
@@ -199,6 +202,7 @@ ProviderState:
 │  │ No-IP        │ true    │ ✅ Yes      │ dynupdate.no-ip.com    │   │
 │  │──────────────│─────────│────────────│───────────────────────│   │
 │  │ Refresh Interval  │ 60s                                      │   │
+│  │ Dashboard Listen  │ 0.0.0.0:9003                             │   │
 │  │ Redis enabled     │ false  (Dashboard does not use Redis)    │   │
 │  │ Data Source       │ Process Memory                          │   │
 │  └──────────────────────────────────────────────────────────────┘   │
@@ -244,10 +248,10 @@ ProviderState:
 └───────────────────────────┬──────────────────────────────────┘
                             │ HTTP
 ┌───────────────────────────▼──────────────────────────────────┐
-│                  Jetzig HTTP Server                           │
-│   GET /dashboard        → views/dashboard/index.zig          │
-│   GET /dashboard/config → views/dashboard/config.zig         │
-│   GET /api/status       → views/api/status.zig               │
+│          Dashboard HTTP Server（src/dashboard/server.zig）     │
+│   GET /dashboard        → renderDashboardPage()               │
+│   GET /dashboard/config → renderConfigPage()                  │
+│   GET /api/status       → renderStatusJson()                  │
 └───────────────────────────┬──────────────────────────────────┘
                             │ 呼叫
 ┌───────────────────────────▼──────────────────────────────────┐
@@ -291,22 +295,19 @@ ProviderState:
 **初始頁面載入：**
 ```
 Browser  GET /dashboard
-  → Jetzig Router
-  → views/dashboard/index.zig::index()
-    → dashboard/service.readSnapshot()
+  → src/dashboard/server.zig::handleRequest()
+    → dashboard/service.readDisplayData()
       → ddns.getProviderSnapshots()  // 讀 process-level 記憶體，無 I/O
-    → request.data(.object) 填入 3 個 provider 快照
-  → Zmpl 模板渲染 index.zmpl
+    → renderDashboardPage() 產生 HTML
   → 回傳 HTML（含靜態狀態）
 ```
 
 **前端定時輪詢（每 30 秒）：**
 ```
 Browser  fetch('/api/status.json')
-  → views/api/status.zig::index()
+  → src/dashboard/server.zig::renderStatusJson()
     → ddns.getProviderSnapshots()  // 同上，讀記憶體
-    → 填入 Jetzig data object
-  → Jetzig 自動回傳 JSON
+  → 回傳 JSON
   → 前端 JS 解析 → 更新 DOM 卡片
 ```
 
@@ -365,38 +366,45 @@ fn classifyDisplayStatus(snapshot, now) -> DisplayStatus {
 
 ---
 
-## 5. Jetzig 路由規劃
+## 5. HTTP 路由規劃
+
+### 5.0 Runtime 實作狀態
+
+目前主程式已在 `src/cli.zig` 啟動 `dashboard_server.runAndLog()`，並與 DDNS scheduler 共用同一個 `dynip` process。Dashboard 監聽由 `app.json` 的 `dashboard.enabled` / `dashboard.host` / `dashboard.port` 控制。
+
+`dashboard/` 子目錄已用 Jetzig CLI 初始化，作為後續切換 Jetzig views/templates 的 scaffold；但在本機 `D:\Runtime\zig\0.17.0` 測試時，Jetzig 相依套件仍有 Zig 語法相容性錯誤，因此目前 runtime 採用內建 HTTP server。
 
 ### 5.1 路由對應表
 
-Jetzig 採用**檔案系統路由**，只要把 `*.zig` 放在正確路徑，路由自動生成。
-
 | HTTP Method | URL Path | 對應檔案 | 回傳格式 |
 |-------------|----------|----------|----------|
-| GET | `/dashboard` | `src/app/views/dashboard/index.zig` | HTML |
-| GET | `/dashboard.json` | 同上 | JSON |
-| GET | `/dashboard/config` | `src/app/views/dashboard/config.zig` | HTML |
-| GET | `/api/status` | `src/app/views/api/status.zig` | JSON |
+| GET | `/dashboard` | `src/dashboard/server.zig::renderDashboardPage()` | HTML |
+| GET | `/dashboard/config` | `src/dashboard/server.zig::renderConfigPage()` | HTML |
+| GET | `/api/status` | `src/dashboard/server.zig::renderStatusJson()` | JSON |
 | GET | `/api/status.json` | 同上 | JSON |
 
-### 5.2 路由目錄結構
+### 5.2 目前目錄結構
 
 ```
 src/
-└── app/
-    └── views/
-        ├── dashboard/
-        │   ├── index.zig      ← GET /dashboard
-        │   ├── index.zmpl
-        │   ├── config.zig     ← GET /dashboard/config
-        │   └── config.zmpl
-        ├── api/
-        │   └── status.zig     ← GET /api/status
-        └── layouts/
-            └── application.zmpl
+└── dashboard/
+    ├── service.zig      ← process-memory display data layer
+    └── server.zig       ← GET /dashboard, /dashboard/config, /api/status.json
 ```
 
-### 5.3 Jetzig View 範例（`/api/status`）
+### 5.3 Jetzig scaffold 目錄（後續切換用）
+
+```
+dashboard/
+├── build.zig
+├── build.zig.zon
+├── src/
+│   ├── main.zig
+│   └── app/views/root/
+└── public/
+```
+
+### 5.4 Jetzig View 範例（後續切換用）
 
 ```zig
 // src/app/views/api/status.zig
@@ -701,65 +709,68 @@ setInterval(fetchStatus, REFRESH_INTERVAL_MS);
 
 ### Phase 0：環境準備（先決條件）
 
-- [ ] 確認 Zig 版本與 Jetzig 相容
-- [ ] 安裝 `jetzig` CLI 工具
-- [ ] 決定 Dashboard 整合方式（獨立子目錄 `dashboard/` 或整合進主專案）
-- [ ] 確認 Dashboard 監聽 port（建議 `8080`）
+- [x] 確認 Zig 版本與 Jetzig 相容性：本機 Zig 0.17 與目前 Jetzig scaffold 相依暫不相容
+- [x] 安裝/取得 `jetzig` CLI 工具（已用官方 Windows build 產生 scaffold）
+- [x] 決定 Dashboard 整合方式：使用獨立子目錄 `dashboard/`
+- [x] 確認 Dashboard 監聽設定：由 `app.json` 的 `dashboard.host` / `dashboard.port` 控制，預設 `0.0.0.0:9003`
 
 ### Phase 1：Jetzig 專案初始化
 
-- [ ] 在 `dynip/dashboard/` 初始化 Jetzig app（`jetzig init`）
-- [ ] 配置 `build.zig.zon` 引入 Jetzig dependency
+- [x] 在 `dynip/dashboard/` 初始化 Jetzig app（`jetzig init`）
+- [x] 產生 `dashboard/build.zig`、`dashboard/build.zig.zon` 與初始 views/public 目錄
 - [ ] 在 `build.zig` 讓 Dashboard 可以 `@import` `src/core/ddns.zig`
-- [ ] 驗證 `zig build dashboard` 可啟動 Jetzig 開發伺服器
+- [ ] 驗證 `zig build dashboard` 可啟動 Jetzig 開發伺服器（目前受 Zig/Jetzig 相依相容性阻擋）
 
 ### Phase 2a：核心擴充（`ddns.zig`）
 
 > **這個 Phase 改動 `dynip` 主體程式，不動 Jetzig 部分。**
 
-- [ ] 在 `ddns.zig` 新增 `ProcessProviderState` struct（固定 buffer，無 heap）
-- [ ] 新增 `process_provider_states: [3]ProcessProviderState` 全域變數
-- [ ] 新增 `process_provider_mutex: std.atomic.Mutex` 保護全域陣列
-- [ ] 實作 `memoryWriteProviderSuccess()` / `memoryWriteProviderFailure()` 私有函式
-- [ ] 在 `saveProviderSuccess()` 末尾呼叫 `memoryWriteProviderSuccess()`（Redis 路徑）
-- [ ] 在 `saveProviderFailure()` 末尾呼叫 `memoryWriteProviderFailure()`（Redis 路徑）
-- [ ] 在 `updateDdnsServices()` 成功/失敗分支呼叫對應的 memory write（非 Redis 路徑）
-- [ ] 對外公開 `ProviderSnapshot` 型別與 `getProviderSnapshots()` 函式
-- [ ] 單元測試 `getProviderSnapshots()` 的 mutex 安全性與複製語意
+- [x] 在 `ddns.zig` 新增 `ProcessProviderState` struct（固定 buffer，無 heap）
+- [x] 新增 `process_provider_states: [3]ProcessProviderState` 全域變數
+- [x] 新增 `process_provider_mutex: std.atomic.Mutex` 保護全域陣列
+- [x] 實作 `memoryWriteProviderSuccess()` / `memoryWriteProviderFailure()` 私有函式
+- [x] 在 `saveProviderSuccess()` 內部呼叫 `memoryWriteProviderSuccess()`（Redis 路徑）
+- [x] 在 `saveProviderFailure()` 內部呼叫 `memoryWriteProviderFailure()`（Redis 路徑）
+- [x] 在 `updateDdnsServices()` 成功/失敗分支呼叫對應的 memory write（非 Redis 路徑）
+- [x] 對外公開 `ProviderSnapshot` 型別與 `getProviderSnapshots()` 函式
+- [x] 單元測試 `getProviderSnapshots()` 的固定 slot、初始化狀態與複製語意
 
 ### Phase 2b：Dashboard Service Layer
 
-- [ ] 建立 `src/dashboard/service.zig`
-- [ ] 實作 `DisplayStatus` enum（含 `initializing` / `disabled` 狀態）
-- [ ] 實作 `classifyDisplayStatus(snap, now)` — 純邏輯，無 I/O
-- [ ] 實作 `readDisplayData(config)` — 呼叫 `ddns.getProviderSnapshots()`
-- [ ] 實作 `resolveDesiredIp(snapshots)` — 從快照選出最新公開 IP
-- [ ] 單元測試 `classifyDisplayStatus()` 各種邊界情境
+- [x] 建立 `src/dashboard/service.zig`
+- [x] 實作 `DisplayStatus` enum（含 `initializing` / `disabled` 狀態）
+- [x] 實作 `classifyDisplayStatus(snap, now)` — 純邏輯，無 I/O
+- [x] 實作 `readDisplayData(config)` — 呼叫 `ddns.getProviderSnapshots()`
+- [x] 實作 `resolveDesiredIp(snapshots)` — 從快照選出最新公開 IP
+- [x] 單元測試 `classifyDisplayStatus()` 各種邊界情境
 
-### Phase 3：JSON API 實作
+### Phase 3：JSON API 實作（內建 HTTP server 版本）
 
-- [ ] 建立 `src/app/views/api/status.zig`
-- [ ] 呼叫 `service.readDisplayData()` 填入 Jetzig data object
-- [ ] 回傳 `data_source: "process_memory"` 欄位
-- [ ] 測試 `GET /api/status.json` 回傳正確 JSON 格式
-- [ ] 確認服務剛啟動時（initialized == false）的回傳格式正確
+- [x] 建立 `src/dashboard/server.zig`
+- [x] `GET /api/status` / `GET /api/status.json` 呼叫 `service.readDisplayData()`
+- [x] 回傳 process-memory provider snapshots JSON
+- [x] 測試 JSON render 包含 `public_ip` 與 `providers`
+- [x] 確認服務剛啟動時（initialized == false）會由 service layer 顯示 `initializing`
 
-### Phase 4：HTML 頁面與模板
+### Phase 4：HTML 頁面
 
-- [ ] Layout template：Header（Logo、Nav、Public IP badge）、Footer（Data source 標示）
-- [ ] Dashboard index view + template（三欄卡片 + detail panel）
-  - 加入「Data source: Process Memory」資訊說明欄
-  - 加入「Initializing...」狀態的特殊顯示
-- [ ] Config view + template（設定摘要表格，顯示 Redis 是否啟用但說明 Dashboard 不直接連）
+- [x] `GET /dashboard` 產生 Dashboard HTML（三張 provider 卡片 + summary）
+- [x] `GET /dashboard/config` 產生設定摘要頁
+- [x] 加入 `initializing` / `success` / `failed` / `retry_deferred` / `updating` / `disabled` 狀態樣式
+- [x] 對 HTML 動態內容做 escaping
 
 ### Phase 5：前端互動
 
-- [ ] `public/dashboard.js`：輪詢、DOM 更新、detail panel、倒數計時器
-- [ ] `public/dashboard.css`：深色主題、6 種狀態顏色（含 initializing / disabled）、RWD
+- [x] 內嵌 JavaScript 每 5 秒輪詢 `/api/status.json`
+- [x] DOM 更新 provider 卡片與 public IP
+- [x] 內嵌 CSS 支援亮/暗色、6 種狀態顏色與 RWD
 
 ### Phase 6：整合與測試
 
-- [ ] 整合測試：同時啟動 `dynip` + Dashboard HTTP server
+- [x] `src/cli.zig` 於 `dynip service` 啟動 Dashboard HTTP server thread
+- [x] `zig build` 通過
+- [x] `zig build test` 通過
+- [ ] 實機瀏覽器驗證 `/dashboard` 與 `/api/status.json`
 - [ ] 驗證第一輪更新完成後卡片從「Initializing」切換到正確狀態
 - [ ] 測試 Redis 停用（`redis.enabled = false`）時 Dashboard 仍正常顯示
 - [ ] 跨瀏覽器測試（Chrome / Firefox / Edge）
@@ -767,8 +778,8 @@ setInterval(fetchStatus, REFRESH_INTERVAL_MS);
 
 ### Phase 7：部署整合
 
-- [ ] 決定啟動方式（獨立 binary / `dynip dashboard` subcommand）
-- [ ] 更新 `Dockerfile`、`control.sh`
+- [x] 決定啟動方式：單一 `dynip` process 內同時啟動 DDNS service 與 Dashboard HTTP server
+- [x] 更新 `Dockerfile`、`control.sh`：`EXPOSE 9003`，並於 `docker_start` publish Dashboard port
 - [ ] 更新 `README.zh-TW.md`（加入 Dashboard 說明）
 
 ### Phase 8（進階選項）
@@ -794,6 +805,12 @@ setInterval(fetchStatus, REFRESH_INTERVAL_MS);
   3. Dashboard 的職責是「展示目前狀態」，而非「持久化查詢」
 - **取捨**：服務重啟後記憶體狀態歸零，須等下一輪更新後才有資料顯示
 
+**ADR-002：先用內建 HTTP server 完成 runtime Dashboard**
+
+- **決策**：`dynip` runtime 先使用 `src/dashboard/server.zig` 的 `std.http.Server` 實作 Dashboard；`dashboard/` Jetzig app 保留為 scaffold。
+- **理由**：本機 Zig 0.17 可編譯主專案，但 Jetzig 產生的相依目前有語法相容性錯誤；內建 server 可先滿足「單一 process 內 DDNS service + Web 狀態呈現」目標。
+- **取捨**：短期少了 Jetzig view/template 分層；後續待 Jetzig 相依與 Zig 版本對齊後，可把 `server.zig` render 邏輯搬到 Jetzig views/templates。
+
 ### B. 目錄結構（完整）
 
 ```
@@ -802,23 +819,17 @@ dynip/
 │   ├── core/
 │   │   └── ddns.zig          ← 新增 ProcessProviderState、getProviderSnapshots()
 │   └── dashboard/            ← 新增目錄
-│       └── service.zig        ← Dashboard service layer
-└── dashboard/                ← Jetzig 子專案（或整合進主 build.zig）
+│       ├── service.zig        ← Dashboard service layer
+│       └── server.zig         ← 同進程 HTTP Dashboard server
+└── dashboard/                ← Jetzig app scaffold；待 Zig/Jetzig 相容後切換
     ├── build.zig
     ├── build.zig.zon
     ├── src/
     │   ├── main.zig
     │   └── app/
     │       └── views/
-    │           ├── layouts/application.zmpl
-    │           ├── dashboard/
-    │           │   ├── index.zig + index.zmpl
-    │           │   └── config.zig + config.zmpl
-    │           └── api/
-    │               └── status.zig
+    │           └── root/
     └── public/
-        ├── dashboard.js
-        └── dashboard.css
 ```
 
 ### C. Provider 狀態機圖（更新）
@@ -850,8 +861,9 @@ dynip/
 
 ---
 
-> **下一步確認事項：**
+> **確認結果：**
 >
-> 1. **Phase 2a（核心擴充）可以開始嗎？** 即在 `ddns.zig` 加入 in-memory state store。
-> 2. **整合方式**：Dashboard 獨立子目錄（`dashboard/`）還是整合進主 `build.zig`？
-> 3. **監聽 Port**：建議預設 `8080`，是否符合您的部署環境？
+> 1. **Phase 2a（核心擴充）可以開始。** 即在 `ddns.zig` 加入 in-memory state store。
+> 2. **整合方式**：Dashboard 採用獨立子目錄 `dashboard/` 管理 Jetzig views/templates/static assets，但執行時併入單一 `dynip` process。
+> 3. **監聽設定**：Dashboard 由 `app.json` 的 `dashboard.host` / `dashboard.port` 控制，預設 `0.0.0.0:9003`；也可用環境變數 `DASHBOARD_HOST` / `DASHBOARD_PORT` 覆寫。
+> 4. **啟動方式**：單一 `dynip` process 內同時啟動 DDNS scheduler 與 Dashboard HTTP server，讓 Dashboard 直接讀同一份 process-level memory state。

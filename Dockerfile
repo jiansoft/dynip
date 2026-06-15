@@ -41,5 +41,9 @@ COPY --chown=65532:65532 ./app.json /app/app.json
 # 最終容器一律用非 root 身分執行。
 USER 65532:65532
 
+# Dashboard HTTP server 預設監聽 9003；實際 port 仍可由 app.json 或
+# DASHBOARD_PORT 環境變數控制。
+EXPOSE 9003
+
 # 容器啟動後直接執行 `dynip service --config app.json`。
 ENTRYPOINT ["/app/dynip", "service", "--config", "app.json"]

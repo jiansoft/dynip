@@ -25,6 +25,8 @@ const config = dynip.config;
 const logging = dynip.logging;
 /// 排程模組，真正的常駐服務循環會交給它。
 const scheduler = dynip.scheduler;
+/// Dashboard HTTP server，與 DDNS scheduler 共用同一個 process。
+const dashboard_server = dynip.dashboard_server;
 /// 匯入 C 的 signal / exit API。
 ///
 /// 這裡主要會用到：
@@ -202,6 +204,30 @@ fn runCommand(
     try logLoadedConfig(allocator, app_config);
     // 補一筆簡短訊息，說明這次啟動用哪個設定檔路徑。
     std.log.info("ddns scheduler will use config: {s}", .{config_path});
+    // Dashboard 和 DDNS scheduler 採用「同一個 OS process、不同 thread」。
+    //
+    // 新手閱讀重點：
+    // - `std.Thread.spawn(...)` 會開一條背景 thread。
+    // - thread entry point 是 `dashboard_server.runAndLog`。
+    // - 傳進去的是同一份 `app_config`，所以 Dashboard 可讀到 host/port/provider enabled。
+    // - Dashboard 最後仍然透過 `ddns.getProviderSnapshots()` 讀 process memory，
+    //   沒有啟動第二個應用程式，也不直接連 Redis。
+    if (app_config.dashboard.enabled) {
+        const dashboard_thread = try std.Thread.spawn(
+            .{},
+            dashboard_server.runAndLog,
+            .{ allocator, io, app_config, stop_token },
+        );
+        // 這裡使用 detach，表示主 thread 不會 join 等 Dashboard thread 結束。
+        //
+        // 原因：
+        // - 主流程由 scheduler.runForever(...) 控制生命週期。
+        // - 程式收到 Ctrl+C/SIGTERM 時，stop_token 會讓 scheduler 收尾。
+        // - process 結束時，Dashboard thread 也會一起消失。
+        dashboard_thread.detach();
+    } else {
+        std.log.info("dashboard server disabled by config", .{});
+    }
     // 真正把控制權交給常駐排程器。
     try scheduler.runForever(allocator, io, app_config, stop_token);
 }

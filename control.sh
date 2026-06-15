@@ -75,13 +75,20 @@ docker_stop() {
 
 docker_start() {
   local docker_log_dir="${DOCKER_LOG_DIR:-$script_dir/log}"
+  local dashboard_host_port="${DASHBOARD_HOST_PORT:-9003}"
+  local dashboard_container_port="${DASHBOARD_PORT:-9003}"
+  local dashboard_host="${DASHBOARD_HOST:-0.0.0.0}"
 
   log "Docker log host path: $docker_log_dir"
+  log "Dashboard port mapping: ${dashboard_host_port}:${dashboard_container_port}"
   mkdir -p "$docker_log_dir"
 
   log "啟動 Docker 容器..."
   docker run --name "$docker_container_name" \
     -v="$docker_log_dir:/app/log:rw" \
+    -e "DASHBOARD_HOST=$dashboard_host" \
+    -e "DASHBOARD_PORT=$dashboard_container_port" \
+    -p "${dashboard_host_port}:${dashboard_container_port}" \
     -t -d "$docker_image_name"
   docker ps
 }
@@ -105,6 +112,11 @@ help() {
   echo "  docker_restart - 重啟容器"
   echo "  docker_build   - 建立映像檔"
   echo "  docker_update  - 完整更新映像檔並重啟容器"
+  echo
+  echo "Dashboard 環境變數:"
+  echo "  DASHBOARD_HOST_PORT - host 對外 port，預設 9003"
+  echo "  DASHBOARD_PORT      - container 內 Dashboard port，預設 9003"
+  echo "  DASHBOARD_HOST      - container 內綁定位址，預設 0.0.0.0"
 }
 
 case "$1" in

@@ -9,6 +9,8 @@ const std = @import("std");
 // 這樣外部在使用本模組時，可以透過 `@import("dynip").config` 存取。
 
 pub const config = @import("base/config.zig");
+pub const dashboard = @import("dashboard/service.zig");
+pub const dashboard_server = @import("dashboard/server.zig");
 pub const ddns = @import("core/ddns.zig");
 pub const http = @import("io/http.zig");
 pub const logging = @import("io/logging.zig");
@@ -21,6 +23,8 @@ test {
     // 這裡使用 inline else 或是單純的載入。
     // 在 Zig 中，這會觸發子模組內的 `test` 區塊編譯。
     _ = config;
+    _ = dashboard;
+    _ = dashboard_server;
     _ = ddns;
     _ = http;
     _ = logging;

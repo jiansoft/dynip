@@ -1,0 +1,6 @@
+zig-out/
+zig-cache/
+*.core
+.jetzig
+.zig-cache/
+zig-pkg/
