@@ -54,6 +54,8 @@ const PublicIpService = enum {
     myip,
     /// `https://api.bigdatacloud.net/data/client-ip`
     bigdatacloud,
+    /// `stun.l.google.com:19302`
+    stun,
 };
 
 /// 目前支援更新的 DDNS 供應商。
@@ -331,6 +333,8 @@ const Endpoint = struct {
         const myip = "https://api.myip.com";
         /// 回傳 JSON，IP 欄位名稱是 `ipString`。
         const bigdatacloud = "https://api.bigdatacloud.net/data/client-ip";
+        /// STUN 伺服器，格式為 `host:port`。
+        const stun = "stun.l.google.com:19302";
     };
 
     /// Dynu 更新 API 基底網址。
@@ -338,14 +342,6 @@ const Endpoint = struct {
     /// No-IP 更新 API 基底網址。
     const noip_update = "https://dynupdate.no-ip.com/nic/update";
 };
-
-/// 下次抓對外 IP 時，從哪個來源站開始嘗試。
-///
-/// 這樣每次更新檢查不會永遠都從第一個來源站開始打，
-/// 而是會做簡單的 round-robin。
-///
-/// 這裡用 atomic，避免並行 refresh 時對全域計數器產生 data race。
-var next_public_ip_index: std.atomic.Value(usize) = .init(0);
 
 /// 執行一次 DDNS 更新檢查。
 pub fn refresh(
@@ -1734,9 +1730,17 @@ fn getPublicIp(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
 ) ![]const u8 {
-    // 這裡把所有對外 IP 來源站集中成一個固定陣列，
-    // 之後會依序嘗試。
+    // 這裡把所有對外 IP 來源集中成一個固定陣列。
+    //
+    // 順序有意義：
+    // - `.stun` 放第一個，因為 STUN 直接問「外部看到我的 UDP 位址是什麼」。
+    //   對 DDNS 來說，這比第三方 HTTP echo API 更貼近 NAT 後的實際 public endpoint。
+    // - HTTP 來源放後面當 fallback，避免 STUN 被防火牆、公司網路或 ISP 阻擋時整輪失敗。
+    //
+    // 之前這裡做過 round-robin，會導致下一輪先打 `ipify`。
+    // 現在改成固定順序，確保每一輪都先嘗試 STUN。
     const services = [_]PublicIpService{
+        .stun,
         .ipify,
         .ipconfig,
         .ipinfo,
@@ -1745,24 +1749,36 @@ fn getPublicIp(
         .bigdatacloud,
     };
 
-    // 記住這次從哪個 index 開始試。
-    const start_index = next_public_ip_index.fetchAdd(1, .monotonic) % services.len;
-
-    // 如果所有來源站都失敗，就把每個錯誤接起來，最後一次打出。
+    // 如果所有來源都失敗，就把每個錯誤接起來，最後一次打出。
+    //
+    // 使用固定 buffer 的原因：
+    // - 這裡只是錯誤摘要，不值得再做 heap allocation。
+    // - 即使錯誤訊息太長，`Writer.fixed` 也只會讓後續 write 失敗；
+    //   我們在 `appendPublicIpLookupError()` 裡忽略摘要寫入失敗，不影響真正錯誤回傳。
     var error_buffer: [512]u8 = undefined;
     var error_writer: std.Io.Writer = .fixed(&error_buffer);
 
     // 最多試滿所有來源站一次。
-    for (0..services.len) |offset| {
-        // `(start_index + offset) % services.len` 可以實作循環往後取值。
-        const service = services[(start_index + offset) % services.len];
+    for (services) |service| {
+        std.log.debug("try public ip service: service={s}, endpoint={s}", .{
+            serviceName(service),
+            publicIpServiceUrl(service),
+        });
         // 嘗試用目前這個來源站抓 IP。
         const ip = fetchPublicIpFromService(allocator, client, service) catch |err| {
+            std.log.debug("public ip service failed: service={s}, error={s}", .{
+                serviceName(service),
+                @errorName(err),
+            });
             appendPublicIpLookupError(&error_writer, service, err);
             // 改試下一站。
             continue;
         };
         // 只要有一站成功，就直接回傳。
+        std.log.debug("public ip service succeeded: service={s}, ip={s}", .{
+            serviceName(service),
+            ip,
+        });
         return ip;
     }
 
@@ -1800,6 +1816,8 @@ fn fetchPublicIpFromService(
         .myip => fetchMyIpJson(allocator, client, url),
         // `bigdatacloud` 也回 JSON，但欄位名稱不同，所以走另一個輔助函式。
         .bigdatacloud => fetchBigDataCloudJson(allocator, client, url),
+        // STUN 協定分支，不使用 HTTP client。
+        .stun => fetchStunIp(allocator, client.io, url),
     };
 }
 
@@ -1813,6 +1831,7 @@ fn publicIpServiceUrl(service: PublicIpService) []const u8 {
         .seeip => Endpoint.PublicIp.seeip,
         .myip => Endpoint.PublicIp.myip,
         .bigdatacloud => Endpoint.PublicIp.bigdatacloud,
+        .stun => Endpoint.PublicIp.stun,
     };
 }
 
@@ -1836,6 +1855,384 @@ fn fetchTextIp(
     // `normalized` 只是指向 `response.body` 裡的一段 slice。
     // 因為後面會 `free(response.body)`，所以這裡要另外複製一份給呼叫端持有。
     return allocator.dupe(u8, normalized);
+}
+
+/// 解析 STUN 伺服器回傳的 Binding Response。
+///
+/// STUN Binding Response 的基本格式：
+/// - 前 20 bytes 是 STUN header。
+/// - header 後面是一串 attributes。
+/// - 我們需要的 attribute 是 XOR-MAPPED-ADDRESS (`0x0020`)。
+///
+/// 這個函式只做「解析封包」：
+/// - 不碰 socket。
+/// - 不碰 DNS。
+/// - 不寫全域狀態。
+///
+/// 這樣測試可以直接餵固定 byte array，驗證 parser 是否正確。
+fn parseStunResponse(
+    allocator: std.mem.Allocator,
+    response: []const u8,
+    transaction_id: []const u8,
+) ![]const u8 {
+    // STUN header 固定 20 bytes。
+    // 少於 20 bytes 代表連 message type / transaction id 都讀不到。
+    if (response.len < 20) return error.StunResponseTooShort;
+    // Binding Response 的 message type 是 0x0101。
+    // request 是 0x0001；如果收到的不是 response，就不是我們要解析的封包。
+    if (response[0] != 0x01 or response[1] != 0x01) return error.InvalidStunMessageType;
+    // transaction id 用來確認這包 response 是對應我們剛剛送出的 request。
+    // UDP 沒有連線狀態，這個檢查可以避免誤收其他封包。
+    if (!std.mem.eql(u8, response[8..20], transaction_id)) return error.StunTransactionIdMismatch;
+
+    // message length 是 big-endian u16，代表 attribute 區塊總長度。
+    // STUN 協議欄位都用 network byte order，也就是 big-endian。
+    const msg_len = std.mem.readInt(u16, response[2..][0..2], .big);
+    if (20 + msg_len > response.len) return error.InvalidStunMessageLength;
+
+    // 開始逐個解析 attribute。
+    //
+    // 每個 attribute 都是：
+    // - type: 2 bytes
+    // - length: 2 bytes
+    // - value: length bytes
+    // - padding: 補到 4-byte 對齊
+    var offset: usize = 20;
+    const end = 20 + msg_len;
+    while (offset + 4 <= end) {
+        const attr_type = std.mem.readInt(u16, response[offset..][0..2], .big);
+        const attr_len = std.mem.readInt(u16, response[offset + 2 ..][0..2], .big);
+        offset += 4;
+
+        if (offset + attr_len > end) return error.InvalidStunAttributeLength;
+
+        // XOR-MAPPED-ADDRESS: 0x0020
+        //
+        // 這是現代 STUN 最常用來回報「伺服器看到的來源 IP/port」的欄位。
+        // 它不是明文 IP，而是用 magic cookie 和 transaction id 做 XOR，
+        // 目的是避免某些 NAT 裝置誤判 payload 裡的 IP 字串並亂改封包。
+        if (attr_type == 0x0020) {
+            if (attr_len < 8) return error.InvalidXorMappedAddressLength;
+            // value 格式前兩 bytes：
+            // - byte 0 保留。
+            // - byte 1 是 family：1 = IPv4，2 = IPv6。
+            const family = response[offset + 1];
+            if (family == 1) { // IPv4
+                const x_ip = response[offset + 4 .. offset + 8];
+                const magic = [4]u8{ 0x21, 0x12, 0xA4, 0x42 };
+                const ip = [4]u8{
+                    x_ip[0] ^ magic[0],
+                    x_ip[1] ^ magic[1],
+                    x_ip[2] ^ magic[2],
+                    x_ip[3] ^ magic[3],
+                };
+                return try std.fmt.allocPrint(allocator, "{d}.{d}.{d}.{d}", .{ ip[0], ip[1], ip[2], ip[3] });
+            } else if (family == 2) { // IPv6
+                if (attr_len < 20) return error.InvalidXorMappedAddressLength;
+                const x_ip = response[offset + 4 .. offset + 20];
+                // IPv6 的 XOR key 是：
+                // - 前 4 bytes: magic cookie `0x2112A442`
+                // - 後 12 bytes: transaction id
+                //
+                // 所以先組出 16-byte key，再逐 byte XOR 回真正 IPv6。
+                var magic_and_tx: [16]u8 = undefined;
+                std.mem.writeInt(u32, magic_and_tx[0..4], 0x2112A442, .big);
+                @memcpy(magic_and_tx[4..16], transaction_id);
+
+                var ip: [16]u8 = undefined;
+                for (0..16) |i| {
+                    ip[i] = x_ip[i] ^ magic_and_tx[i];
+                }
+                return try std.fmt.allocPrint(allocator, "{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}", .{
+                    ip[0], ip[1], ip[2],  ip[3],  ip[4],  ip[5],  ip[6],  ip[7],
+                    ip[8], ip[9], ip[10], ip[11], ip[12], ip[13], ip[14], ip[15],
+                });
+            }
+        }
+        // Attribute value 後面可能有 padding。
+        // STUN 規定每個 attribute 都要 4-byte aligned，
+        // `(attr_len + 3) & ~3` 是常見的「向上補到 4 的倍數」寫法。
+        offset += (attr_len + 3) & ~@as(usize, 3);
+    }
+
+    return error.XorMappedAddressNotFound;
+}
+
+/// 把 Zig `std.Io.net.IpAddress` 轉成 `std.posix.sockaddr.*`。
+///
+/// STUN 實作最後要呼叫低階 UDP `sendto()`，而 `sendto()` 需要 C-style sockaddr。
+/// `std.Io.net.IpAddress` 比較適合 Zig 高階 DNS / network API；
+/// `std.posix.sockaddr.in` / `in6` 則是 socket syscall 需要的 ABI layout。
+fn ipAddressToPosix(a: std.Io.net.IpAddress) union(enum) { ip4: std.posix.sockaddr.in, ip6: std.posix.sockaddr.in6 } {
+    return switch (a) {
+        .ip4 => |ip4| .{
+            .ip4 = .{
+                .family = std.posix.AF.INET,
+                // sockaddr 裡的 port 必須是 network byte order。
+                // `nativeToBig` 讓 little-endian Windows/x86 也能寫出正確 wire format。
+                .port = std.mem.nativeToBig(u16, ip4.port),
+                .addr = @bitCast(ip4.bytes),
+            },
+        },
+        .ip6 => |ip6| .{
+            .ip6 = .{
+                .family = std.posix.AF.INET6,
+                .port = std.mem.nativeToBig(u16, ip6.port),
+                .flowinfo = ip6.flow,
+                .addr = ip6.bytes,
+                .scope_id = ip6.interface.index,
+            },
+        },
+    };
+}
+
+/// 把 libc/socket API 回傳值轉成 Zig `std.posix.socket_t`。
+///
+/// 這版 Zig 0.17-dev 在 Windows + libc path 下，
+/// `std.posix.system.socket()` 回傳值型別仍走 `c_int`。
+/// 但 `std.posix.socket_t` 在 Windows 是 HANDLE-like pointer。
+/// 因此 Windows 分支需要把整數 bit pattern 轉成 pointer。
+///
+/// 非 Windows 的 socket fd 本來就是整數，直接 `@intCast` 即可。
+fn castSocket(rc: anytype) std.posix.socket_t {
+    if (comptime builtin.os.tag == .windows) {
+        return @ptrFromInt(@as(usize, @bitCast(@as(isize, rc))));
+    } else {
+        return @intCast(rc);
+    }
+}
+
+/// 建立 UDP socket。
+///
+/// 為什麼不用 HTTP client：
+/// - STUN 是 UDP 協議，不是 HTTP。
+/// - `std.http.Client` 只能處理 HTTP/TLS，不能直接送 STUN Binding Request。
+///
+/// Windows 注意事項：
+/// - Winsock 在使用 socket 前必須先 `WSAStartup()`。
+/// - Windows 的 socket type 不接受 POSIX `SOCK.CLOEXEC` bit，
+///   所以 Windows 分支不能把 `CLOEXEC` OR 進 flags。
+fn createUdpSocket(family: std.posix.sa_family_t) !std.posix.socket_t {
+    try ensureWindowsSocketsStarted();
+
+    const cloexec: u32 = if (comptime builtin.os.tag == .windows)
+        0
+    else if (comptime @hasDecl(std.posix.SOCK, "CLOEXEC"))
+        std.posix.SOCK.CLOEXEC
+    else
+        0;
+    const flags: u32 = std.posix.SOCK.DGRAM | cloexec;
+    const rc = std.posix.system.socket(family, flags, std.posix.IPPROTO.UDP);
+    if (rc == -1) return error.SocketCreationFailed;
+    return castSocket(rc);
+}
+
+/// 關閉 socket。
+///
+/// POSIX socket 是 file descriptor，用 `close()`。
+/// Windows socket 不是一般 file handle，必須用 `closesocket()`。
+fn closeSocket(fd: std.posix.socket_t) void {
+    if (comptime builtin.os.tag == .windows) {
+        _ = ws2_32.closesocket(fd);
+    } else {
+        _ = std.posix.system.close(fd);
+    }
+}
+
+/// 本檔案需要用到的 Winsock declarations。
+///
+/// 不放在 `src/c.zig` 的原因：
+/// - 這些 API 只服務 STUN UDP socket。
+/// - 放在 STUN 附近，讀者比較容易理解為什麼需要 `WSAStartup()` / `closesocket()`。
+const ws2_32 = if (builtin.os.tag == .windows) struct {
+    extern "ws2_32" fn WSAStartup(wVersionRequired: u16, lpWSAData: *WSADATA) callconv(.winapi) c_int;
+    extern "ws2_32" fn closesocket(s: std.posix.socket_t) callconv(.winapi) c_int;
+} else struct {};
+
+/// Windows Winsock 是否已初始化。
+///
+/// `WSAStartup()` 是 process-level 初始化；呼叫一次成功後，
+/// 後續 STUN 查詢就不需要重複初始化。
+var windows_sockets_started = false;
+
+/// 確保 Windows Winsock 已初始化。
+///
+/// 非 Windows 平台直接 return，因為 POSIX socket 不需要這個步驟。
+/// Windows 下要求版本 `0x0202`，也就是 Winsock 2.2。
+fn ensureWindowsSocketsStarted() !void {
+    if (comptime builtin.os.tag != .windows) return;
+    if (windows_sockets_started) return;
+
+    var data: WSADATA = undefined;
+    const rc = ws2_32.WSAStartup(0x0202, &data);
+    if (rc != 0) return error.WindowsSocketStartupFailed;
+    windows_sockets_started = true;
+}
+
+/// WinSock `WSADATA` ABI layout。
+///
+/// `WSAStartup()` 需要 caller 傳入這個 struct 讓 Winsock 填版本與狀態資訊。
+/// 本專案目前不讀裡面的欄位，但 layout 必須正確，API 才能安全寫入。
+const WSADATA = extern struct {
+    wVersion: u16,
+    wHighVersion: u16,
+    szDescription: [257]u8,
+    szSystemStatus: [129]u8,
+    iMaxSockets: u16,
+    iMaxUdpDg: u16,
+    lpVendorInfo: ?[*:0]u8,
+};
+
+/// 設定 socket receive timeout。
+///
+/// STUN 是 UDP；如果對方或網路不回應，沒有 timeout 就可能卡住。
+/// 這裡只設定 `SO_RCVTIMEO`，讓 `recvfrom()` 最多等指定時間。
+fn setSocketTimeout(fd: std.posix.socket_t, timeout_val: std.posix.timeval) !void {
+    const opt_bytes = std.mem.asBytes(&timeout_val);
+    const rc = std.posix.system.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, opt_bytes.ptr, @intCast(opt_bytes.len));
+    if (rc == -1) {
+        return error.SetSocketTimeoutFailed;
+    }
+}
+
+/// 對 UDP socket 送資料。
+///
+/// 包成 helper 的原因：
+/// - 呼叫端可以用 Zig error union (`!usize`)。
+/// - 低階 C API 的 `-1` 錯誤值集中在這裡轉成 Zig error。
+fn sendtoSocket(
+    fd: std.posix.socket_t,
+    buf: []const u8,
+    flags: u32,
+    dest_addr: *const std.posix.sockaddr,
+    addrlen: std.posix.socklen_t,
+) !usize {
+    const rc = std.posix.system.sendto(fd, buf.ptr, @intCast(buf.len), @intCast(flags), dest_addr, addrlen);
+    if (rc == -1) {
+        return error.SendFailed;
+    }
+    return @intCast(rc);
+}
+
+/// 從 UDP socket 收資料。
+///
+/// STUN server 回應會從這裡進來，呼叫端再把收到的 bytes 交給
+/// `parseStunResponse()` 做協議解析。
+fn recvfromSocket(
+    fd: std.posix.socket_t,
+    buf: []u8,
+    flags: u32,
+    src_addr: *std.posix.sockaddr,
+    addrlen: *std.posix.socklen_t,
+) !usize {
+    const rc = std.posix.system.recvfrom(fd, buf.ptr, @intCast(buf.len), @intCast(flags), src_addr, addrlen);
+    if (rc == -1) {
+        return error.ReceiveFailed;
+    }
+    return @intCast(rc);
+}
+
+/// 透過 STUN 協議從指定主機與埠號取得公網對外 IP。
+fn fetchStunIp(allocator: std.mem.Allocator, io: std.Io, stun_endpoint: []const u8) ![]const u8 {
+    // STUN endpoint 在設定區用簡單字串表示，例如：
+    // `stun.l.google.com:19302`
+    //
+    // 這裡先拆成 host 和 port，後續 DNS lookup 需要 host，
+    // socket address 則需要 port。
+    const colon_idx = std.mem.indexOfScalar(u8, stun_endpoint, ':') orelse return error.InvalidStunEndpoint;
+    const host = stun_endpoint[0..colon_idx];
+    const port_str = stun_endpoint[colon_idx + 1 ..];
+    const port = try std.fmt.parseUnsigned(u16, port_str, 10);
+
+    // 1. 使用 std.Io 解析 STUN 伺服器 DNS。
+    //
+    // `std.Io.net.HostName.lookup` 是 async API：
+    // - 它把 lookup 結果丟進 queue。
+    // - caller 從 queue 讀 address。
+    // - 最後 await future，確保背景工作已結束。
+    const host_name = try std.Io.net.HostName.init(host);
+
+    var canonical_name_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
+    var lookup_buffer: [1]std.Io.net.HostName.LookupResult = undefined;
+    var lookup_queue: std.Io.Queue(std.Io.net.HostName.LookupResult) = .init(&lookup_buffer);
+    var lookup_future = io.async(std.Io.net.HostName.lookup, .{ host_name, io, &lookup_queue, .{
+        .port = port,
+        .canonical_name_buffer = &canonical_name_buffer,
+    } });
+    defer lookup_future.cancel(io) catch {};
+
+    var resolved_addr: ?std.Io.net.IpAddress = null;
+    while (lookup_queue.getOne(io)) |dns_result| switch (dns_result) {
+        .address => |address| {
+            if (resolved_addr == null) {
+                resolved_addr = address;
+            }
+        },
+        .canonical_name => continue,
+    } else |err| switch (err) {
+        error.Canceled => return err,
+        error.Closed => {},
+    }
+
+    try lookup_future.await(io);
+
+    const stun_addr = resolved_addr orelse return error.DnsResolutionFailed;
+    const posix_addr = ipAddressToPosix(stun_addr);
+
+    // 2. 建立 UDP socket。
+    //
+    // 如果 DNS 結果是 IPv4，就建立 AF_INET socket；
+    // 如果是 IPv6，就建立 AF_INET6 socket。
+    // STUN request/response 的 socket family 必須和目的地址一致。
+    const socket = try createUdpSocket(switch (posix_addr) {
+        .ip4 => std.posix.AF.INET,
+        .ip6 => std.posix.AF.INET6,
+    });
+    // `defer` 讓函式離開時一定會關 socket。
+    // 無論後面 send/recv/parse 哪一步失敗，都不會漏掉 socket handle。
+    defer closeSocket(socket);
+
+    // 3. 設定讀取逾時 (2 秒)
+    const timeout = if (comptime @hasField(std.posix.timeval, "tv_sec"))
+        std.posix.timeval{ .tv_sec = 2, .tv_usec = 0 }
+    else
+        std.posix.timeval{ .sec = 2, .usec = 0 };
+    try setSocketTimeout(socket, timeout);
+
+    // 4. 建立 20-byte STUN Binding Request 封包。
+    //
+    // STUN header:
+    // - bytes 0..2: message type，Binding Request = 0x0001
+    // - bytes 2..4: message length。這裡沒有 attributes，所以是 0。
+    // - bytes 4..8: magic cookie，固定是 0x2112A442。
+    // - bytes 8..20: transaction id，用來配對 response。
+    var request: [20]u8 = undefined;
+    request[0] = 0x00;
+    request[1] = 0x01; // Message Type: 0x0001 (Binding Request)
+    request[2] = 0x00;
+    request[3] = 0x00; // Message Length: 0
+    request[4] = 0x21;
+    request[5] = 0x12;
+    request[6] = 0xA4;
+    request[7] = 0x42; // Magic Cookie
+    // transaction id 必須剛好 12 bytes。
+    // 這裡用固定字串方便測試與除錯；正式 STUN client 通常會用隨機值。
+    const transaction_id = "antigravity1";
+    @memcpy(request[8..20], transaction_id);
+
+    // 5. 送出 UDP 封包
+    _ = switch (posix_addr) {
+        .ip4 => |*addr| try sendtoSocket(socket, &request, 0, @ptrCast(addr), @sizeOf(std.posix.sockaddr.in)),
+        .ip6 => |*addr| try sendtoSocket(socket, &request, 0, @ptrCast(addr), @sizeOf(std.posix.sockaddr.in6)),
+    };
+
+    // 6. 接收回應 (緩衝區 512 位元組已足夠)
+    var response: [512]u8 = undefined;
+    var from_addr: std.posix.sockaddr = undefined;
+    var from_len: std.posix.socklen_t = @intCast(@sizeOf(std.posix.sockaddr));
+    const recv_len = try recvfromSocket(socket, &response, 0, &from_addr, &from_len);
+
+    return try parseStunResponse(allocator, response[0..recv_len], transaction_id);
 }
 
 /// 從 `api.myip.com` 的 JSON 回應中取出對外 IP。
@@ -1938,6 +2335,7 @@ fn serviceName(service: PublicIpService) []const u8 {
         .seeip => "seeip",
         .myip => "myip",
         .bigdatacloud => "bigdatacloud",
+        .stun => "stun",
     };
 }
 
@@ -2466,4 +2864,92 @@ test "local dedupe cache shrinks after pruning many expired entries" {
     try std.testing.expectEqual(@as(usize, 0), local_dedupe_entries.items.len);
     try std.testing.expect(local_dedupe_entries.capacity <= capacity_before);
     try std.testing.expect(local_dedupe_entries.capacity <= local_dedupe_shrink_min_capacity);
+}
+
+test "parseStunResponse decodes valid ipv4 xor-mapped-address" {
+    const allocator = std.testing.allocator;
+    const tx_id = "antigravity1";
+    var response = [_]u8{
+        0x01, 0x01, // Message Type (Binding Response)
+        0x00, 0x0c, // Message Length (12 bytes)
+        0x21, 0x12, 0xA4, 0x42, // Magic Cookie
+        // Transaction ID:
+        'a',  'n',  't',  'i',
+        'g',  'r',  'a',  'v',
+        'i',  't',  'y',  '1',
+        // Attribute XOR-MAPPED-ADDRESS
+        0x00, 0x20, // Attribute Type: XOR-MAPPED-ADDRESS
+        0x00, 0x08, // Attribute Length: 8 bytes
+        0x00, 0x01, // Reserved, Family: IPv4
+        0x32, 0xA1, // X-Port
+        0xE1, 0xBA, 0xA5, 0x26, // X-Address (XOR'd 192.168.1.100)
+    };
+
+    const ip = try parseStunResponse(allocator, &response, tx_id);
+    defer allocator.free(ip);
+    try std.testing.expectEqualStrings("192.168.1.100", ip);
+}
+
+test "parseStunResponse decodes valid ipv6 xor-mapped-address" {
+    const allocator = std.testing.allocator;
+    const tx_id = "antigravity1";
+
+    const ip_bytes = [_]u8{
+        0x20, 0x01, 0x0d, 0xb8,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x01,
+    };
+
+    var magic_and_tx: [16]u8 = undefined;
+    std.mem.writeInt(u32, magic_and_tx[0..4], 0x2112A442, .big);
+    @memcpy(magic_and_tx[4..16], tx_id);
+
+    var x_ip: [16]u8 = undefined;
+    for (0..16) |i| {
+        x_ip[i] = ip_bytes[i] ^ magic_and_tx[i];
+    }
+
+    var response: [20 + 4 + 24]u8 = undefined;
+    // STUN Header
+    response[0] = 0x01;
+    response[1] = 0x01; // Message Type
+    std.mem.writeInt(u16, response[2..4], 24, .big); // Message Length (24 bytes for IPv6 attr)
+    std.mem.writeInt(u32, response[4..8], 0x2112A442, .big); // Magic Cookie
+    @memcpy(response[8..20], tx_id); // Transaction ID
+
+    // XOR-MAPPED-ADDRESS attribute
+    std.mem.writeInt(u16, response[20..22], 0x0020, .big); // Attr Type
+    std.mem.writeInt(u16, response[22..24], 20, .big); // Attr Length: 20 bytes
+    response[24] = 0x00; // Reserved
+    response[25] = 0x02; // Family: IPv6
+    response[26] = 0x32;
+    response[27] = 0xA1; // X-Port
+    @memcpy(response[28..44], &x_ip); // XOR-MAPPED IPv6 address
+
+    const ip = try parseStunResponse(allocator, &response, tx_id);
+    defer allocator.free(ip);
+    try std.testing.expectEqualStrings("2001:0db8:0000:0000:0000:0000:0000:0001", ip);
+}
+
+test "fetchStunIp retrieves public ip or fails gracefully due to network" {
+    const allocator = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const ip = fetchStunIp(allocator, io, Endpoint.PublicIp.stun) catch |err| {
+        switch (err) {
+            error.DnsResolutionFailed, error.SocketCreationFailed, error.SendFailed, error.ReceiveFailed, error.SetSocketTimeoutFailed => {
+                // Return gracefully on expected network/connectivity errors in offline environments
+                return;
+            },
+            else => return err,
+        }
+    };
+    defer allocator.free(ip);
+
+    // Verify the IP returns a valid public IP format
+    const normalized = try normalizePublicIp(ip);
+    try std.testing.expectEqualStrings(ip, normalized);
 }
