@@ -212,6 +212,13 @@ fn renderDashboardPage(allocator: std.mem.Allocator, app_config: config_mod.AppC
     // 取得實際 Public IP 快照。
     const ip_snap = ddns.getPublicIpSnapshot();
     const public_ip = if (ip_snap.initialized) ip_snap.ipSlice() else "—";
+    // Public IP 來源，例如 "stun" / "ipify"。
+    //
+    // Dashboard 不自己推測來源；來源必須由 DDNS core 在成功 lookup 時寫入。
+    // 這樣畫面看到的值才會和 log 裡的 `public ip service succeeded` 一致。
+    const public_ip_source = if (ip_snap.initialized and ip_snap.source_len != 0) ip_snap.sourceSlice() else "—";
+    const public_ip_stun_status = publicIpStunStatus(&ip_snap);
+    const public_ip_stun_error = if (ip_snap.initialized and ip_snap.stun_error_len != 0) ip_snap.stunErrorSlice() else "";
 
     // ArrayList 是可成長 byte buffer，適合組 HTML/JSON 字串。
     var buffer = std.ArrayList(u8).empty;
@@ -229,7 +236,17 @@ fn renderDashboardPage(allocator: std.mem.Allocator, app_config: config_mod.AppC
     try out.writeAll("<main class=\"shell\"><header class=\"hero\"><div class=\"brand\"><strong>dynip Dashboard</strong><span>DDNS monitor center</span><nav><a href=\"/dashboard\">Dashboard</a><a href=\"/dashboard/config\">Config</a></nav></div><section class=\"public-ip\"><span>Public IP</span><strong id=\"desired-ip\">");
     // IP 是動態資料，所以必須 HTML escape，避免狀態文字破壞 HTML。
     try writeHtml(out, public_ip);
-    try out.print("</strong><small id=\"last-updated\">Last Updated: -</small></section></header><div class=\"status-row\"><span>Provider Status Cards</span><strong>Memory Store: Active</strong><button type=\"button\" id=\"refresh-toggle\" onclick=\"toggleRefresh()\">⟳ Auto-refresh: ON</button></div><section id=\"providers\" class=\"provider-grid\">", .{});
+    try out.writeAll("</strong><small>Source: <span id=\"public-ip-source\">");
+    try writeHtml(out, public_ip_source);
+    try out.writeAll("</span></small><small>STUN: <span id=\"public-ip-stun-status\">");
+    try writeHtml(out, public_ip_stun_status);
+    try out.writeAll("</span><span id=\"public-ip-stun-error\">");
+    if (public_ip_stun_error.len != 0) {
+        try out.writeAll(" (");
+        try writeHtml(out, public_ip_stun_error);
+        try out.writeAll(")");
+    }
+    try out.print("</span></small><small id=\"last-updated\">Last Updated: -</small></section></header><div class=\"status-row\"><span>Provider Status Cards</span><strong>Memory Store: Active</strong><button type=\"button\" id=\"refresh-toggle\" onclick=\"toggleRefresh()\">⟳ Auto-refresh: ON</button></div><section id=\"providers\" class=\"provider-grid\">", .{});
     // 首次載入時先 server-side render 一版卡片；JS 載入後會再用 JSON 重畫一次。
     for (data) |provider| try writeProviderCard(out, provider);
     // 這段是頁面底部、detail panel，以及前端輪詢 JS。
@@ -244,7 +261,10 @@ fn renderDashboardPage(allocator: std.mem.Allocator, app_config: config_mod.AppC
         \\   const r=await fetch('/api/status.json',{cache:'no-store'}); if(!r.ok)return;
         \\   const data=await r.json(); latestProviders=data.providers||[];
         \\   document.getElementById('desired-ip').textContent=data.desired_ip||data.public_ip||'-';
-        \\   document.getElementById('last-updated').textContent='Last Updated: '+new Date().toLocaleString();
+        \\   document.getElementById('public-ip-source').textContent=data.public_ip_source||'-';
+        \\   document.getElementById('public-ip-stun-status').textContent=data.public_ip_stun_status||'-';
+        \\   document.getElementById('public-ip-stun-error').textContent=data.public_ip_stun_error?' ('+data.public_ip_stun_error+')':'';
+        \\   document.getElementById('last-updated').textContent='Last Updated: '+formatRfc3339(new Date());
         \\   document.getElementById('providers').innerHTML=latestProviders.map(providerCard).join('');
         \\ } catch(e) { console.error(e); }
         \\}
@@ -264,7 +284,15 @@ fn renderDashboardPage(allocator: std.mem.Allocator, app_config: config_mod.AppC
         \\}
         \\function hideDetail(){document.getElementById('detail-panel').hidden=true;}
         \\function label(v){return String(v||'').replace('_',' ');}
-        \\function formatTime(v){return v?new Date(v*1000).toLocaleString():'-';}
+        \\function formatTime(v){return v?formatRfc3339(new Date(v*1000)):'-';}
+        \\function formatRfc3339(d){
+        \\ const pad=n=>String(Math.trunc(Math.abs(n))).padStart(2,'0');
+        \\ const offsetMinutes=-d.getTimezoneOffset();
+        \\ const sign=offsetMinutes>=0?'+':'-';
+        \\ const offsetHours=pad(offsetMinutes/60);
+        \\ const offsetMins=pad(offsetMinutes%60);
+        \\ return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}${sign}${offsetHours}:${offsetMins}`;
+        \\}
         \\function escapeAttr(v){return String(v||'').replace(/['\\]/g,'');}
         \\function escapeHtml(v){return String(v||'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));}
         \\function startRefresh(){
@@ -296,7 +324,7 @@ fn renderDashboardPage(allocator: std.mem.Allocator, app_config: config_mod.AppC
         try writeProviderJson(out, provider);
     }
     try out.writeAll(
-        \\]; document.getElementById('providers').innerHTML=latestProviders.map(providerCard).join(''); document.getElementById('last-updated').textContent='Last Updated: '+new Date().toLocaleString();
+        \\]; document.getElementById('providers').innerHTML=latestProviders.map(providerCard).join(''); document.getElementById('last-updated').textContent='Last Updated: '+formatRfc3339(new Date());
         \\startRefresh();
         \\</script>
     );
@@ -318,7 +346,7 @@ fn renderConfigPage(allocator: std.mem.Allocator, app_config: config_mod.AppConf
     const out = &writer.writer;
 
     try writePageStart(out, "DDNS Dashboard Config");
-    
+
     // Header consistent with Dashboard
     try out.print(
         \\<main class="shell"><header class="hero" style="grid-template-columns: 1fr;"><div class="brand"><strong>dynip Dashboard</strong><span>DDNS monitor center</span><nav><a href="/dashboard">Dashboard</a><a href="/dashboard/config">Config</a></nav></div></header>
@@ -327,15 +355,13 @@ fn renderConfigPage(allocator: std.mem.Allocator, app_config: config_mod.AppConf
         \\<table class="config-table">
         \\<thead><tr><th>Provider</th><th>Enabled</th><th>Configured</th><th>URL</th></tr></thead>
         \\<tbody>
-        , .{}
-    );
+    , .{});
 
     // Render Afraid
     const afraid_configured = app_config.afraid.token.len > 0;
     try out.print(
         \\<tr><td><strong>Afraid.org</strong></td><td>{}</td><td>{s}</td><td>
-        , .{ app_config.afraid.enabled, if (afraid_configured) "✅ Yes" else "❌ No" }
-    );
+    , .{ app_config.afraid.enabled, if (afraid_configured) "✅ Yes" else "❌ No" });
     try writeHtml(out, app_config.afraid.url);
     try out.print("</td></tr>\n", .{});
 
@@ -343,8 +369,7 @@ fn renderConfigPage(allocator: std.mem.Allocator, app_config: config_mod.AppConf
     const dynu_configured = app_config.dynu.username.len > 0 and app_config.dynu.password.len > 0;
     try out.print(
         \\<tr><td><strong>Dynu</strong></td><td>{}</td><td>{s}</td><td>
-        , .{ app_config.dynu.enabled, if (dynu_configured) "✅ Yes" else "❌ No" }
-    );
+    , .{ app_config.dynu.enabled, if (dynu_configured) "✅ Yes" else "❌ No" });
     try writeHtml(out, app_config.dynu.url);
     try out.print("</td></tr>\n", .{});
 
@@ -352,8 +377,7 @@ fn renderConfigPage(allocator: std.mem.Allocator, app_config: config_mod.AppConf
     const noip_configured = app_config.noip.username.len > 0 and app_config.noip.password.len > 0;
     try out.print(
         \\<tr><td><strong>No-IP</strong></td><td>{}</td><td>{s}</td><td>
-        , .{ app_config.noip.enabled, if (noip_configured) "✅ Yes" else "❌ No" }
-    );
+    , .{ app_config.noip.enabled, if (noip_configured) "✅ Yes" else "❌ No" });
     try writeHtml(out, app_config.noip.url);
     try out.print("</td></tr>\n", .{});
 
@@ -365,10 +389,9 @@ fn renderConfigPage(allocator: std.mem.Allocator, app_config: config_mod.AppConf
         \\<section class="config-list">
         \\<div><span>Refresh Interval</span><strong>{d}s</strong></div>
         \\<div><span>Dashboard Listen</span><strong>
-        , .{ app_config.ddns.refresh_interval_seconds }
-    );
+    , .{app_config.ddns.refresh_interval_seconds});
     try writeHtml(out, app_config.dashboard.host);
-    try out.print(":{d}</strong></div>\n", .{ app_config.dashboard.port });
+    try out.print(":{d}</strong></div>\n", .{app_config.dashboard.port});
 
     try out.print(
         \\<div><span>Redis Enabled</span><strong>{}</strong></div>
@@ -376,8 +399,7 @@ fn renderConfigPage(allocator: std.mem.Allocator, app_config: config_mod.AppConf
         \\</section>
         \\</section>
         \\</main>
-        , .{ app_config.ddns.redis.enabled }
-    );
+    , .{app_config.ddns.redis.enabled});
 
     try writePageEnd(out);
 
@@ -390,6 +412,9 @@ fn renderStatusJson(allocator: std.mem.Allocator, app_config: config_mod.AppConf
     const data = service.readDisplayData(app_config);
     const ip_snap = ddns.getPublicIpSnapshot();
     const public_ip = if (ip_snap.initialized) ip_snap.ipSlice() else "";
+    const public_ip_source = if (ip_snap.initialized and ip_snap.source_len != 0) ip_snap.sourceSlice() else "";
+    const public_ip_stun_status = publicIpStunStatus(&ip_snap);
+    const public_ip_stun_error = if (ip_snap.initialized and ip_snap.stun_error_len != 0) ip_snap.stunErrorSlice() else "";
 
     var buffer = std.ArrayList(u8).empty;
     defer buffer.deinit(allocator);
@@ -402,6 +427,12 @@ fn renderStatusJson(allocator: std.mem.Allocator, app_config: config_mod.AppConf
     try writeJsonStringContent(out, public_ip);
     try out.writeAll("\",\"public_ip\":\"");
     try writeJsonStringContent(out, public_ip);
+    try out.writeAll("\",\"public_ip_source\":\"");
+    try writeJsonStringContent(out, public_ip_source);
+    try out.writeAll("\",\"public_ip_stun_status\":\"");
+    try writeJsonStringContent(out, public_ip_stun_status);
+    try out.writeAll("\",\"public_ip_stun_error\":\"");
+    try writeJsonStringContent(out, public_ip_stun_error);
     try out.writeAll("\",\"data_source\":\"process_memory\",\"providers\":[");
     // providers 是固定三筆：afraid, dynu, noip。
     for (data, 0..) |provider, index| {
@@ -582,6 +613,20 @@ fn displayStatusLabel(status: service.DisplayStatus) []const u8 {
     };
 }
 
+/// 將 public IP 快照中的 STUN 結果轉成 dashboard 顯示字串。
+///
+/// 給 Zig 新手：
+/// - `PublicIpSnapshot` 只保存「最後一輪 public IP lookup」的結果。
+/// - STUN 成功時，public IP 的來源就是 "stun"，錯誤欄位為空。
+/// - STUN 失敗但 HTTP fallback 成功時，來源會是 "ipify" 等 HTTP 服務，
+///   而 `stun_error_len` 會保存失敗原因，畫面就能顯示 `failed`。
+fn publicIpStunStatus(snapshot: *const ddns.PublicIpSnapshot) []const u8 {
+    if (!snapshot.initialized) return "—";
+    if (std.mem.eql(u8, snapshot.sourceSlice(), "stun")) return "success";
+    if (snapshot.stun_error_len != 0) return "failed";
+    return "—";
+}
+
 test "dashboard json exposes providers" {
     const allocator = std.testing.allocator;
     const json = try renderStatusJson(allocator, .{});
@@ -589,6 +634,9 @@ test "dashboard json exposes providers" {
 
     try std.testing.expect(std.mem.indexOf(u8, json, "\"providers\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"public_ip\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"public_ip_source\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"public_ip_stun_status\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"public_ip_stun_error\"") != null);
 }
 
 test "dashboard html escapes dynamic content" {

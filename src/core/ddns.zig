@@ -58,6 +58,27 @@ const PublicIpService = enum {
     stun,
 };
 
+/// 單次對外 IP 查詢成功後的結果。
+///
+/// 給 Zig 新手：
+/// - 之前 `getPublicIp()` 只回傳 `[]const u8`，也就是「IP 字串」。
+/// - Dashboard 想顯示 STUN / ipify，就不能只知道 IP，還要知道是哪個服務成功。
+/// - 所以這裡用 struct 把兩個值包在一起回傳。
+const PublicIpLookup = struct {
+    /// 成功取得的 public IP 字串。
+    ///
+    /// 這個 slice 的生命週期跟 `getPublicIp()` 使用的 allocator 相關。
+    /// 目前呼叫端用 arena allocator，所以整輪 refresh 結束前都有效。
+    ip: []const u8,
+    /// 實際成功的來源服務，例如 `.stun` 或 `.ipify`。
+    service: PublicIpService,
+    /// 如果 STUN 有被嘗試但失敗，這裡保存錯誤名稱。
+    ///
+    /// STUN 固定排第一個，所以 fallback 到 ipify 時，Dashboard 可以顯示
+    /// "STUN: failed (ReceiveFailed)"，而不是只看到最後成功的 ipify。
+    stun_error: ?[]const u8 = null,
+};
+
 /// 目前支援更新的 DDNS 供應商。
 const DdnsProvider = enum {
     afraid,
@@ -173,6 +194,18 @@ const ProcessPublicIpState = struct {
     len: usize = 0,
     /// public IPv4 / IPv6 文字都很短，用固定 buffer 就夠。
     buffer: [64]u8 = undefined,
+    /// 最近一次 public IP 是由哪個來源服務取得。
+    ///
+    /// 例如 "stun" / "ipify"。Dashboard 會讀這個欄位顯示在 Public IP 旁邊。
+    source_len: usize = 0,
+    /// 來源服務名稱很短，固定 buffer 可以避免為了 dashboard 狀態配置 heap 記憶體。
+    source: [16]u8 = undefined,
+    /// 最近一次 STUN 嘗試的錯誤名稱長度。
+    ///
+    /// 0 代表 STUN 成功，或目前尚未有任何 public IP 狀態。
+    stun_error_len: usize = 0,
+    /// 最近一次 STUN 錯誤名稱，例如 "ReceiveFailed"。
+    stun_error: [64]u8 = undefined,
 };
 
 /// 對外公開的 public IP 狀態快照（值語意，複製自 process-level 記憶體）。
@@ -183,10 +216,28 @@ pub const PublicIpSnapshot = struct {
     len: usize = 0,
     /// public IP 值的固定 buffer。
     buffer: [64]u8 = undefined,
+    /// public IP 來源服務名稱長度。
+    source_len: usize = 0,
+    /// public IP 來源服務名稱固定 buffer。
+    source: [16]u8 = undefined,
+    /// STUN 錯誤名稱長度；0 代表沒有 STUN 錯誤。
+    stun_error_len: usize = 0,
+    /// STUN 錯誤名稱固定 buffer。
+    stun_error: [64]u8 = undefined,
 
     /// 將固定 buffer 轉成正常 slice。
     pub fn ipSlice(self: *const PublicIpSnapshot) []const u8 {
         return self.buffer[0..self.len];
+    }
+
+    /// 將來源服務固定 buffer 轉成正常 slice。
+    pub fn sourceSlice(self: *const PublicIpSnapshot) []const u8 {
+        return self.source[0..self.source_len];
+    }
+
+    /// 將 STUN 錯誤固定 buffer 轉成正常 slice。
+    pub fn stunErrorSlice(self: *const PublicIpSnapshot) []const u8 {
+        return self.stun_error[0..self.stun_error_len];
     }
 };
 
@@ -365,10 +416,18 @@ pub fn refresh(
     const scratch = arena.allocator();
 
     // 先抓目前對外 IP。
-    const ip_now = try getPublicIp(scratch, client);
+    const public_ip_lookup = try getPublicIp(scratch, client);
+    const ip_now = public_ip_lookup.ip;
+    const ip_source = serviceName(public_ip_lookup.service);
     // 如果同一個行程上次已經成功處理過相同 IP，
     // 這一輪就直接跳過，不再碰 Redis。
     if (isSameAsLastProcessedIp(ip_now)) {
+        // IP 沒變仍然重寫一次來源。
+        //
+        // 原因：Dashboard 顯示的是「本次成功查詢 public IP 的來源」。
+        // 假設上一輪 STUN 失敗走 ipify，下一輪 STUN 成功但 IP 相同；
+        // 如果這裡直接 return，畫面會繼續顯示 ipify，看起來像 STUN 沒生效。
+        rememberLastProcessedIp(ip_now, ip_source, public_ip_lookup.stun_error);
         std.log.info(
             "skip ddns refresh because public ip is unchanged in current process: {s}",
             .{ip_now},
@@ -389,6 +448,8 @@ pub fn refresh(
             client,
             config,
             ip_now,
+            ip_source,
+            public_ip_lookup.stun_error,
             ttl_seconds,
             now_seconds,
         );
@@ -413,7 +474,7 @@ pub fn refresh(
     // 只有全部 provider 都成功時才記在行程內狀態。
     // 如果只有部分成功，下一輪同 IP 仍要進 Redis provider key 檢查，讓缺的 provider 有機會補更新。
     if (summary.succeeded == summary.attempted) {
-        rememberLastProcessedIp(ip_now);
+        rememberLastProcessedIp(ip_now, ip_source, public_ip_lookup.stun_error);
     }
 
     // 最後寫一筆總結 log，讓你知道這輪使用哪個 IP，以及成功幾個供應商。
@@ -431,6 +492,8 @@ fn refreshWithRedisProviderState(
     client: *std.http.Client,
     config: config_mod.AppConfig,
     ip: []const u8,
+    ip_source: []const u8,
+    stun_error: ?[]const u8,
     ttl_seconds: u64,
     now_seconds: i64,
 ) !RefreshStatus {
@@ -510,7 +573,7 @@ fn refreshWithRedisProviderState(
     // 但如果有 provider 失敗或 backoff 中，就不能寫這個 cache，
     // 否則下一輪會被本機快取擋掉，失敗 provider 就沒有機會補更新。
     if (summary.already_current + summary.succeeded == summary.configured) {
-        rememberLastProcessedIp(ip);
+        rememberLastProcessedIp(ip, ip_source, stun_error);
     }
 
     // 沒有任何變化時，summary 只放 debug，避免常駐服務每分鐘洗版。
@@ -638,8 +701,22 @@ pub fn getPublicIpSnapshot() PublicIpSnapshot {
     var snapshot = PublicIpSnapshot{
         .initialized = true,
         .len = process_public_ip_state.len,
+        .source_len = process_public_ip_state.source_len,
+        .stun_error_len = process_public_ip_state.stun_error_len,
     };
     @memcpy(snapshot.buffer[0..process_public_ip_state.len], process_public_ip_state.buffer[0..process_public_ip_state.len]);
+    if (process_public_ip_state.source_len != 0) {
+        @memcpy(
+            snapshot.source[0..process_public_ip_state.source_len],
+            process_public_ip_state.source[0..process_public_ip_state.source_len],
+        );
+    }
+    if (process_public_ip_state.stun_error_len != 0) {
+        @memcpy(
+            snapshot.stun_error[0..process_public_ip_state.stun_error_len],
+            process_public_ip_state.stun_error[0..process_public_ip_state.stun_error_len],
+        );
+    }
     return snapshot;
 }
 
@@ -775,13 +852,35 @@ fn isSameAsLastProcessedIp(ip: []const u8) bool {
 }
 
 /// 把這次已成功處理的 public IP 記到行程內狀態。
-fn rememberLastProcessedIp(ip: []const u8) void {
+///
+/// `source` 是 public IP 查詢來源，例如 "stun"。
+/// 這個函式會把 IP 和來源都 copy 進固定 buffer，呼叫端之後就算釋放 arena，
+/// Dashboard 仍可安全讀到最後一筆狀態。
+fn rememberLastProcessedIp(ip: []const u8, source: []const u8, stun_error: ?[]const u8) void {
     lockProcessPublicIpState();
     defer process_public_ip_state.mutex.unlock();
 
     const copy_len = @min(ip.len, process_public_ip_state.buffer.len);
     @memcpy(process_public_ip_state.buffer[0..copy_len], ip[0..copy_len]);
     process_public_ip_state.len = copy_len;
+    const source_copy_len = @min(source.len, process_public_ip_state.source.len);
+    if (source_copy_len != 0) {
+        @memcpy(process_public_ip_state.source[0..source_copy_len], source[0..source_copy_len]);
+    }
+    process_public_ip_state.source_len = source_copy_len;
+
+    if (stun_error) |err_name| {
+        const stun_error_copy_len = @min(err_name.len, process_public_ip_state.stun_error.len);
+        if (stun_error_copy_len != 0) {
+            @memcpy(
+                process_public_ip_state.stun_error[0..stun_error_copy_len],
+                err_name[0..stun_error_copy_len],
+            );
+        }
+        process_public_ip_state.stun_error_len = stun_error_copy_len;
+    } else {
+        process_public_ip_state.stun_error_len = 0;
+    }
     process_public_ip_state.initialized = true;
 }
 
@@ -792,6 +891,8 @@ fn resetProcessPublicIpState() void {
 
     process_public_ip_state.initialized = false;
     process_public_ip_state.len = 0;
+    process_public_ip_state.source_len = 0;
+    process_public_ip_state.stun_error_len = 0;
 }
 
 /// 用和本模組其他 shared state 一致的方式取得 process IP mutex。
@@ -1729,7 +1830,7 @@ fn containsExpectedAfraidResponse(body: []const u8) bool {
 fn getPublicIp(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
-) ![]const u8 {
+) !PublicIpLookup {
     // 這裡把所有對外 IP 來源集中成一個固定陣列。
     //
     // 順序有意義：
@@ -1757,6 +1858,7 @@ fn getPublicIp(
     //   我們在 `appendPublicIpLookupError()` 裡忽略摘要寫入失敗，不影響真正錯誤回傳。
     var error_buffer: [512]u8 = undefined;
     var error_writer: std.Io.Writer = .fixed(&error_buffer);
+    var stun_error: ?[]const u8 = null;
 
     // 最多試滿所有來源站一次。
     for (services) |service| {
@@ -1766,6 +1868,9 @@ fn getPublicIp(
         });
         // 嘗試用目前這個來源站抓 IP。
         const ip = fetchPublicIpFromService(allocator, client, service) catch |err| {
+            if (service == .stun) {
+                stun_error = @errorName(err);
+            }
             std.log.debug("public ip service failed: service={s}, error={s}", .{
                 serviceName(service),
                 @errorName(err),
@@ -1775,11 +1880,18 @@ fn getPublicIp(
             continue;
         };
         // 只要有一站成功，就直接回傳。
+        //
+        // 注意這裡不是只回傳 `ip`，而是連同 `service` 一起回傳。
+        // Dashboard 的 "Source: stun" 就是靠這個 service 一路傳到 process snapshot。
         std.log.debug("public ip service succeeded: service={s}, ip={s}", .{
             serviceName(service),
             ip,
         });
-        return ip;
+        return .{
+            .ip = ip,
+            .service = service,
+            .stun_error = stun_error,
+        };
     }
 
     // 走到這裡代表全部來源站都失敗。
@@ -2747,9 +2859,20 @@ test "process local public ip state skips unchanged ip" {
     defer resetProcessPublicIpState();
 
     try std.testing.expect(!isSameAsLastProcessedIp("1.2.3.4"));
-    rememberLastProcessedIp("1.2.3.4");
+    rememberLastProcessedIp("1.2.3.4", "stun", null);
     try std.testing.expect(isSameAsLastProcessedIp("1.2.3.4"));
     try std.testing.expect(!isSameAsLastProcessedIp("5.6.7.8"));
+
+    const snapshot = getPublicIpSnapshot();
+    try std.testing.expect(snapshot.initialized);
+    try std.testing.expectEqualStrings("1.2.3.4", snapshot.ipSlice());
+    try std.testing.expectEqualStrings("stun", snapshot.sourceSlice());
+    try std.testing.expectEqualStrings("", snapshot.stunErrorSlice());
+
+    rememberLastProcessedIp("1.2.3.4", "ipify", "ReceiveFailed");
+    const fallback_snapshot = getPublicIpSnapshot();
+    try std.testing.expectEqualStrings("ipify", fallback_snapshot.sourceSlice());
+    try std.testing.expectEqualStrings("ReceiveFailed", fallback_snapshot.stunErrorSlice());
 }
 
 test "provider snapshots expose fixed provider slots before initialization" {
