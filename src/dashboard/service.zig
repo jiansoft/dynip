@@ -51,7 +51,7 @@ pub fn readDisplayData(config: config_mod.AppConfig) [3]ProviderDisplayData {
     // 即使 snapshot 裡有資料，只要 provider 設成 disabled，UI 就顯示 disabled。
     return .{
         buildDisplayData(snapshots[0], config.afraid.enabled, now),
-        buildDisplayData(snapshots[1], config.dyny.enabled, now),
+        buildDisplayData(snapshots[1], config.dynu.enabled, now),
         buildDisplayData(snapshots[2], config.noip.enabled, now),
     };
 }

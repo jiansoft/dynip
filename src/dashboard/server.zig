@@ -17,6 +17,7 @@ const config_mod = @import("../base/config.zig");
 const scheduler = @import("../core/scheduler.zig");
 /// Dashboard 展示資料整理層。HTTP server 不直接讀 ddns 全域狀態。
 const service = @import("service.zig");
+const ddns = @import("../core/ddns.zig");
 
 /// HTML 回應共用 headers。
 ///
@@ -208,10 +209,9 @@ fn handleRequest(
 fn renderDashboardPage(allocator: std.mem.Allocator, app_config: config_mod.AppConfig) ![]u8 {
     // 讀出三個 provider 的「展示用資料」。
     const data = service.readDisplayData(app_config);
-    // resolveDesiredIp 需要 [3]ProviderSnapshot，所以從 display data 拿出 snapshot。
-    var snapshots = [_]@TypeOf(data[0].snapshot){ data[0].snapshot, data[1].snapshot, data[2].snapshot };
-    // Dashboard header 顯示的 public IP。沒有任何成功快照時會是空字串。
-    const desired_ip = service.resolveDesiredIp(&snapshots);
+    // 取得實際 Public IP 快照。
+    const ip_snap = ddns.getPublicIpSnapshot();
+    const public_ip = if (ip_snap.initialized) ip_snap.ipSlice() else "—";
 
     // ArrayList 是可成長 byte buffer，適合組 HTML/JSON 字串。
     var buffer = std.ArrayList(u8).empty;
@@ -228,8 +228,8 @@ fn renderDashboardPage(allocator: std.mem.Allocator, app_config: config_mod.AppC
     // 第一段是靜態 HTML 骨架：header、Public IP、nav、狀態列。
     try out.writeAll("<main class=\"shell\"><header class=\"hero\"><div class=\"brand\"><strong>dynip Dashboard</strong><span>DDNS monitor center</span><nav><a href=\"/dashboard\">Dashboard</a><a href=\"/dashboard/config\">Config</a></nav></div><section class=\"public-ip\"><span>Public IP</span><strong id=\"desired-ip\">");
     // IP 是動態資料，所以必須 HTML escape，避免狀態文字破壞 HTML。
-    try writeHtml(out, desired_ip);
-    try out.print("</strong><small id=\"last-updated\">Last Updated: -</small></section></header><div class=\"status-row\"><span>Provider Status Cards</span><strong>Memory Store: Active</strong><em>Auto-refresh: 5s</em></div><section id=\"providers\" class=\"provider-grid\">", .{});
+    try writeHtml(out, public_ip);
+    try out.print("</strong><small id=\"last-updated\">Last Updated: -</small></section></header><div class=\"status-row\"><span>Provider Status Cards</span><strong>Memory Store: Active</strong><button type=\"button\" id=\"refresh-toggle\" onclick=\"toggleRefresh()\">⟳ Auto-refresh: ON</button></div><section id=\"providers\" class=\"provider-grid\">", .{});
     // 首次載入時先 server-side render 一版卡片；JS 載入後會再用 JSON 重畫一次。
     for (data) |provider| try writeProviderCard(out, provider);
     // 這段是頁面底部、detail panel，以及前端輪詢 JS。
@@ -237,15 +237,22 @@ fn renderDashboardPage(allocator: std.mem.Allocator, app_config: config_mod.AppC
         \\</section><aside class="memory-note"><strong>Note:</strong> State is from process memory. Restarting the service resets counters until the next update cycle writes fresh snapshots.</aside>
         \\<section id="detail-panel" class="detail-panel" hidden><header><strong id="detail-title">Provider detail</strong><button type="button" onclick="hideDetail()">Close</button></header><dl id="detail-body"></dl></section></main><script>
         \\let latestProviders = [];
+        \\let refreshInterval = null;
+        \\let isRefreshing = true;
         \\async function refresh(){
-        \\ const r=await fetch('/api/status.json',{cache:'no-store'}); if(!r.ok)return;
-        \\ const data=await r.json(); latestProviders=data.providers||[];
-        \\ document.getElementById('desired-ip').textContent=data.public_ip||'-';
-        \\ document.getElementById('last-updated').textContent='Last Updated: '+new Date().toLocaleString();
-        \\ document.getElementById('providers').innerHTML=latestProviders.map(providerCard).join('');
+        \\ try {
+        \\   const r=await fetch('/api/status.json',{cache:'no-store'}); if(!r.ok)return;
+        \\   const data=await r.json(); latestProviders=data.providers||[];
+        \\   document.getElementById('desired-ip').textContent=data.desired_ip||data.public_ip||'-';
+        \\   document.getElementById('last-updated').textContent='Last Updated: '+new Date().toLocaleString();
+        \\   document.getElementById('providers').innerHTML=latestProviders.map(providerCard).join('');
+        \\ } catch(e) { console.error(e); }
         \\}
         \\function providerCard(p){
-        \\ return `<article class="provider ${p.display_status}"><div class="status-strip"></div><header><span>${escapeHtml(p.name)}</span><strong>${label(p.display_status)}</strong></header><dl><div><dt>Status</dt><dd>${label(p.display_status)}</dd></div><div><dt>IP</dt><dd>${escapeHtml(p.current_ip)||'-'}</dd></div><div><dt>Retry</dt><dd>${p.retry_count}</dd></div><div><dt>Updated</dt><dd>${formatTime(p.updated_at)}</dd></div></dl><button type="button" onclick="showDetail('${escapeAttr(p.name)}')">View Details</button></article>`;
+        \\ const isFailed = p.display_status === 'failed' || p.display_status === 'retry_deferred';
+        \\ const timeLabel = isFailed ? 'Next' : 'Updated';
+        \\ const timeValue = isFailed ? formatTime(p.next_retry_at) : formatTime(p.updated_at);
+        \\ return `<article class="provider ${p.display_status}"><div class="status-strip"></div><header><span>${escapeHtml(p.name)}</span><strong>${label(p.display_status)}</strong></header><dl><div><dt>Status</dt><dd>${label(p.display_status)}</dd></div><div><dt>IP</dt><dd>${escapeHtml(p.current_ip)||'-'}</dd></div><div><dt>Retry</dt><dd>${p.retry_count}</dd></div><div><dt>${timeLabel}</dt><dd>${timeValue}</dd></div></dl><button type="button" onclick="showDetail('${escapeAttr(p.name)}')">View Details</button></article>`;
         \\}
         \\function showDetail(name){
         \\ const p=latestProviders.find(x=>x.name===name); if(!p)return;
@@ -260,6 +267,27 @@ fn renderDashboardPage(allocator: std.mem.Allocator, app_config: config_mod.AppC
         \\function formatTime(v){return v?new Date(v*1000).toLocaleString():'-';}
         \\function escapeAttr(v){return String(v||'').replace(/['\\]/g,'');}
         \\function escapeHtml(v){return String(v||'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));}
+        \\function startRefresh(){
+        \\  if (refreshInterval) clearInterval(refreshInterval);
+        \\  refreshInterval = setInterval(refresh, 30000);
+        \\}
+        \\function toggleRefresh(){
+        \\  isRefreshing = !isRefreshing;
+        \\  const btn = document.getElementById('refresh-toggle');
+        \\  if (isRefreshing) {
+        \\    btn.textContent = '⟳ Auto-refresh: ON';
+        \\    btn.classList.remove('off');
+        \\    refresh();
+        \\    startRefresh();
+        \\  } else {
+        \\    btn.textContent = '⟳ Auto-refresh: OFF';
+        \\    btn.classList.add('off');
+        \\    if (refreshInterval) {
+        \\      clearInterval(refreshInterval);
+        \\      refreshInterval = null;
+        \\    }
+        \\  }
+        \\}
         \\latestProviders=[
     );
     // 把目前三個 provider 狀態也嵌成 JSON，讓初始 detail panel 不必等第一次 fetch。
@@ -269,7 +297,7 @@ fn renderDashboardPage(allocator: std.mem.Allocator, app_config: config_mod.AppC
     }
     try out.writeAll(
         \\]; document.getElementById('providers').innerHTML=latestProviders.map(providerCard).join(''); document.getElementById('last-updated').textContent='Last Updated: '+new Date().toLocaleString();
-        \\setInterval(refresh,5000);
+        \\startRefresh();
         \\</script>
     );
     // 寫入 body/html 結尾。
@@ -282,8 +310,6 @@ fn renderDashboardPage(allocator: std.mem.Allocator, app_config: config_mod.AppC
 }
 
 /// 產生 `/dashboard/config` 設定摘要頁。
-///
-/// 注意：這頁故意不印 token/password，只印 enabled/host/port 這類低敏感資訊。
 fn renderConfigPage(allocator: std.mem.Allocator, app_config: config_mod.AppConfig) ![]u8 {
     var buffer = std.ArrayList(u8).empty;
     defer buffer.deinit(allocator);
@@ -292,15 +318,67 @@ fn renderConfigPage(allocator: std.mem.Allocator, app_config: config_mod.AppConf
     const out = &writer.writer;
 
     try writePageStart(out, "DDNS Dashboard Config");
+    
+    // Header consistent with Dashboard
     try out.print(
-        "<main class=\"shell\"><nav class=\"topbar\"><div><strong>Dashboard Config</strong><span>effective app.json values</span></div><a href=\"/dashboard\">Status</a></nav><section class=\"config-list\"><div><span>Dashboard enabled</span><strong>{}</strong></div><div><span>Dashboard host</span><strong>",
-        .{app_config.dashboard.enabled},
+        \\<main class="shell"><header class="hero" style="grid-template-columns: 1fr;"><div class="brand"><strong>dynip Dashboard</strong><span>DDNS monitor center</span><nav><a href="/dashboard">Dashboard</a><a href="/dashboard/config">Config</a></nav></div></header>
+        \\<section class="config-section">
+        \\<h2>Provider Configuration</h2>
+        \\<table class="config-table">
+        \\<thead><tr><th>Provider</th><th>Enabled</th><th>Configured</th><th>URL</th></tr></thead>
+        \\<tbody>
+        , .{}
+    );
+
+    // Render Afraid
+    const afraid_configured = app_config.afraid.token.len > 0;
+    try out.print(
+        \\<tr><td><strong>Afraid.org</strong></td><td>{}</td><td>{s}</td><td>
+        , .{ app_config.afraid.enabled, if (afraid_configured) "✅ Yes" else "❌ No" }
+    );
+    try writeHtml(out, app_config.afraid.url);
+    try out.print("</td></tr>\n", .{});
+
+    // Render Dynu
+    const dynu_configured = app_config.dynu.username.len > 0 and app_config.dynu.password.len > 0;
+    try out.print(
+        \\<tr><td><strong>Dynu</strong></td><td>{}</td><td>{s}</td><td>
+        , .{ app_config.dynu.enabled, if (dynu_configured) "✅ Yes" else "❌ No" }
+    );
+    try writeHtml(out, app_config.dynu.url);
+    try out.print("</td></tr>\n", .{});
+
+    // Render No-IP
+    const noip_configured = app_config.noip.username.len > 0 and app_config.noip.password.len > 0;
+    try out.print(
+        \\<tr><td><strong>No-IP</strong></td><td>{}</td><td>{s}</td><td>
+        , .{ app_config.noip.enabled, if (noip_configured) "✅ Yes" else "❌ No" }
+    );
+    try writeHtml(out, app_config.noip.url);
+    try out.print("</td></tr>\n", .{});
+
+    try out.print(
+        \\</tbody>
+        \\</table>
+        \\
+        \\<h2>System Settings</h2>
+        \\<section class="config-list">
+        \\<div><span>Refresh Interval</span><strong>{d}s</strong></div>
+        \\<div><span>Dashboard Listen</span><strong>
+        , .{ app_config.ddns.refresh_interval_seconds }
     );
     try writeHtml(out, app_config.dashboard.host);
+    try out.print(":{d}</strong></div>\n", .{ app_config.dashboard.port });
+
     try out.print(
-        "</strong></div><div><span>Dashboard port</span><strong>{d}</strong></div><div><span>Redis enabled</span><strong>{}</strong></div><div><span>Afraid enabled</span><strong>{}</strong></div><div><span>Dynu enabled</span><strong>{}</strong></div><div><span>No-IP enabled</span><strong>{}</strong></div></section></main>",
-        .{ app_config.dashboard.port, app_config.ddns.redis.enabled, app_config.afraid.enabled, app_config.dyny.enabled, app_config.noip.enabled },
+        \\<div><span>Redis Enabled</span><strong>{}</strong></div>
+        \\<div><span>Data Source</span><strong>Process Memory</strong></div>
+        \\</section>
+        \\</section>
+        \\</main>
+        , .{ app_config.ddns.redis.enabled }
     );
+
     try writePageEnd(out);
 
     buffer = writer.toArrayList();
@@ -308,13 +386,10 @@ fn renderConfigPage(allocator: std.mem.Allocator, app_config: config_mod.AppConf
 }
 
 /// 產生 `/api/status.json` 的 JSON response body。
-///
-/// 這裡手寫 JSON，而不是依賴 `std.json.Stringify`，主要是因為資料結構中
-/// 有很多固定 buffer + slice helper，手寫可以精準控制欄位名稱與輸出內容。
 fn renderStatusJson(allocator: std.mem.Allocator, app_config: config_mod.AppConfig) ![]u8 {
     const data = service.readDisplayData(app_config);
-    var snapshots = [_]@TypeOf(data[0].snapshot){ data[0].snapshot, data[1].snapshot, data[2].snapshot };
-    const desired_ip = service.resolveDesiredIp(&snapshots);
+    const ip_snap = ddns.getPublicIpSnapshot();
+    const public_ip = if (ip_snap.initialized) ip_snap.ipSlice() else "";
 
     var buffer = std.ArrayList(u8).empty;
     defer buffer.deinit(allocator);
@@ -322,10 +397,12 @@ fn renderStatusJson(allocator: std.mem.Allocator, app_config: config_mod.AppConf
     errdefer writer.deinit();
     const out = &writer.writer;
 
-    // JSON object 起始，先寫 public_ip。
-    try out.writeAll("{\"public_ip\":\"");
-    try writeJsonStringContent(out, desired_ip);
-    try out.writeAll("\",\"providers\":[");
+    // JSON object 起始，寫 desired_ip (即 public_ip), data_source
+    try out.writeAll("{\"desired_ip\":\"");
+    try writeJsonStringContent(out, public_ip);
+    try out.writeAll("\",\"public_ip\":\"");
+    try writeJsonStringContent(out, public_ip);
+    try out.writeAll("\",\"data_source\":\"process_memory\",\"providers\":[");
     // providers 是固定三筆：afraid, dynu, noip。
     for (data, 0..) |provider, index| {
         // JSON 陣列元素之間需要逗號，但第一筆前面不能有。
@@ -339,27 +416,24 @@ fn renderStatusJson(allocator: std.mem.Allocator, app_config: config_mod.AppConf
 }
 
 /// 寫一張 provider 卡片的 HTML。
-///
-/// 這個 helper 被 server-side render 使用；前端輪詢後的卡片由 JS 的
-/// `providerCard(p)` 產生，兩邊 HTML 結構保持一致。
 fn writeProviderCard(out: *std.Io.Writer, provider: service.ProviderDisplayData) !void {
-    // snapshot 內是固定 buffer，透過 `xxxSlice()` 取出實際有效內容。
     const snap = provider.snapshot;
     try out.print("<article class=\"provider {s}\"><div class=\"status-strip\"></div><header><span>", .{@tagName(provider.display_status)});
     try writeHtml(out, snap.nameSlice());
     try out.print("</span><strong>{s}</strong></header><dl>", .{displayStatusLabel(provider.display_status)});
     try writeMetric(out, "Status", displayStatusLabel(provider.display_status));
     try writeMetric(out, "IP", snap.currentIpSlice());
-    try out.print("<div><dt>Retry</dt><dd>{d}</dd></div><div><dt>Updated</dt><dd>{d}</dd></div>", .{ snap.retry_count, snap.updated_at });
+
+    const is_failed = (provider.display_status == .failed or provider.display_status == .retry_deferred);
+    const time_label = if (is_failed) "Next" else "Updated";
+    try out.print("<div><dt>Retry</dt><dd>{d}</dd></div><div><dt>{s}</dt><dd>—</dd></div>", .{ snap.retry_count, time_label });
+
     try out.writeAll("</dl><button type=\"button\" onclick=\"showDetail('");
     try writeHtml(out, snap.nameSlice());
     try out.writeAll("')\">View Details</button></article>");
 }
 
 /// 將單一 provider 寫成 JSON object。
-///
-/// 所有字串都呼叫 `writeJsonStringContent()`，避免 quote/backslash/newline
-/// 造成 JSON 格式壞掉。
 fn writeProviderJson(out: *std.Io.Writer, provider: service.ProviderDisplayData) !void {
     const snap = provider.snapshot;
     try out.writeAll("{\"name\":\"");
@@ -390,16 +464,18 @@ fn writePageStart(out: *std.Io.Writer, title: []const u8) !void {
     try writeHtml(out, title);
     try out.writeAll(
         \\</title><style>
-        \\:root{color-scheme:light dark;--bg:#f6f7f9;--fg:#15171a;--muted:#667085;--line:#d8dde5;--panel:#fff;--ok:#0f7b44;--bad:#b42318;--wait:#9a5b13;--info:#175cd3;--off:#6b7280}
+        \\:root{color-scheme:light dark;--bg:#f6f7f9;--fg:#15171a;--muted:#667085;--line:#d8dde5;--panel:#fff;--ok:#22c55e;--bad:#ef4444;--wait:#f97316;--init:#64748b;--info:#3b82f6;--off:#6b7280}
         \\@media (prefers-color-scheme:dark){:root{--bg:#101214;--fg:#f3f5f7;--muted:#a8b0bb;--line:#303741;--panel:#171a1f}}
         \\*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
-        \\.shell{width:min(1180px,calc(100% - 32px));margin:0 auto;padding:22px 0 40px}.hero{display:grid;grid-template-columns:1fr minmax(320px,440px);gap:16px;align-items:stretch;margin-bottom:14px}.brand,.public-ip,.provider,.memory-note,.detail-panel,.config-list>div{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px}.brand{display:grid;gap:8px}.brand strong{font-size:26px}.brand span,.public-ip span,.status-row span,.config-list span,dt{color:var(--muted)}nav{display:flex;gap:14px;margin-top:6px}a{color:var(--info);text-decoration:none;font-weight:650}.public-ip{display:grid;align-content:center}.public-ip strong{font-size:28px;overflow-wrap:anywhere}.public-ip small{color:var(--muted)}
+        \\.shell{width:min(1180px,calc(100% - 32px));margin:0 auto;padding:22px 0 40px}.hero{display:grid;grid-template-columns:1fr minmax(320px,440px);gap:16px;align-items:stretch;margin-bottom:14px}.brand,.public-ip,.provider,.memory-note,.detail-panel,.config-list>div,.config-section{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px}.brand{display:grid;gap:8px}.brand strong{font-size:26px}.brand span,.public-ip span,.status-row span,.config-list span,dt{color:var(--muted)}nav{display:flex;gap:14px;margin-top:6px}a{color:var(--info);text-decoration:none;font-weight:650}.public-ip{display:grid;align-content:center}.public-ip strong{font-size:28px;overflow-wrap:anywhere}.public-ip small{color:var(--muted)}
         \\.status-row{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:18px 0 12px}.status-row strong{color:var(--ok)}.status-row em{font-style:normal;color:var(--muted)}
         \\.provider-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.provider{position:relative;overflow:hidden}.status-strip{height:4px;background:var(--off);position:absolute;inset:0 0 auto}.provider header{display:flex;justify-content:space-between;gap:12px;align-items:center;margin:10px 0 12px}.provider header span{font-size:18px;font-weight:750;text-transform:uppercase}.provider header strong{text-transform:capitalize;font-size:12px;padding:2px 8px;border:1px solid var(--line);border-radius:999px}
-        \\.provider.success .status-strip{background:var(--ok)}.provider.failed .status-strip{background:var(--bad)}.provider.retry_deferred .status-strip,.provider.initializing .status-strip{background:var(--wait)}.provider.updating .status-strip{background:var(--info)}.provider.disabled{opacity:.72}.provider.success header strong{color:var(--ok)}.provider.failed header strong{color:var(--bad)}.provider.retry_deferred header strong,.provider.initializing header strong{color:var(--wait)}.provider.updating header strong{color:var(--info)}
+        \\.provider.success .status-strip{background:var(--ok)}.provider.failed .status-strip{background:var(--bad)}.provider.retry_deferred .status-strip{background:var(--wait)}.provider.initializing .status-strip{background:var(--init)}.provider.updating .status-strip{background:var(--info)}.provider.disabled .status-strip{background:var(--off)}.provider.disabled{opacity:.72}.provider.success header strong{color:var(--ok)}.provider.failed header strong{color:var(--bad)}.provider.retry_deferred header strong{color:var(--wait)}.provider.initializing header strong{color:var(--init)}.provider.updating header strong{color:var(--info)}.provider.disabled header strong{color:var(--off)}
         \\dl{margin:0;display:grid;gap:8px}dl div{display:grid;grid-template-columns:92px minmax(0,1fr);gap:10px}dd{margin:0;font-weight:650;overflow-wrap:anywhere}button{border:1px solid var(--line);background:transparent;color:var(--fg);border-radius:7px;padding:7px 10px;font:inherit;font-weight:650;cursor:pointer}.provider button{width:100%;margin-top:14px}.memory-note{margin-top:14px;color:var(--muted)}.memory-note strong{color:var(--fg)}
         \\.detail-panel{margin-top:14px}.detail-panel[hidden]{display:none}.detail-panel header{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:12px}.detail-panel header strong{font-size:18px}.detail-panel dl div{grid-template-columns:150px minmax(0,1fr);border-top:1px solid var(--line);padding-top:8px}.config-list{display:grid;gap:10px}.config-list>div{display:flex;justify-content:space-between;gap:16px}.config-list strong{overflow-wrap:anywhere;text-align:right}
-        \\@media (max-width:760px){.shell{width:min(100% - 20px,1180px);padding-top:12px}.hero,.provider-grid{grid-template-columns:1fr}.brand strong{font-size:21px}.public-ip strong{font-size:22px}.status-row{align-items:flex-start;flex-direction:column}.config-list>div{align-items:flex-start}.detail-panel dl div{grid-template-columns:1fr}}
+        \\.config-section{padding:20px;margin-bottom:14px}.config-section h2{margin:0 0 12px;font-size:18px}.config-table{width:100%;border-collapse:collapse;margin:12px 0 24px}.config-table th,.config-table td{border:1px solid var(--line);padding:10px;text-align:left}.config-table th{background:var(--bg);font-weight:650}
+        \\#refresh-toggle{padding:4px 10px;font-size:12px;border-radius:999px;border:1px solid var(--line);background:transparent;cursor:pointer;font-weight:650;color:var(--info);border-color:var(--info)}#refresh-toggle.off{color:var(--muted);border-color:var(--line)}
+        \\@media (max-width:760px){.shell{width:min(100% - 20px,1180px);padding-top:12px}.hero,.provider-grid{grid-template-columns:1fr}.brand strong{font-size:21px}.public-ip strong{font-size:22px}.status-row{align-items:flex-start;flex-direction:column}.config-list>div{align-items:flex-start}.detail-panel dl div{grid-template-columns:1fr}.config-table th,.config-table td{padding:6px;font-size:12px}}
         \\</style></head><body>
     );
 }

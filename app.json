@@ -5,7 +5,7 @@
     "path": "/dynamic/update.php?",
     "token": ""
   },
-  "dyny": {
+  "dynu": {
     "enabled": true,
     "url": "https://api.dynu.com/nic/update",
     "username": "",

@@ -24,7 +24,7 @@ pub const AppConfig = struct {
     /// Afraid.org 相關設定。
     afraid: Afraid = .{},
     /// Dynu 相關設定。
-    dyny: Dynu = .{},
+    dynu: Dynu = .{},
     /// No-IP 相關設定。
     noip: NoIp = .{},
     /// DDNS 服務本身的執行設定。
@@ -198,7 +198,7 @@ pub fn redactedForLog(app_config: AppConfig) AppConfig {
     // 如果 Afraid token 不是空字串，就把它換成固定遮罩字串。
     redactIfPresent(&redacted.afraid.token);
     // 如果 Dynu 密碼不是空字串，就把它換成固定遮罩字串。
-    redactIfPresent(&redacted.dyny.password);
+    redactIfPresent(&redacted.dynu.password);
     // 如果 No-IP 密碼不是空字串，就把它換成固定遮罩字串。
     redactIfPresent(&redacted.noip.password);
     // 如果 Redis 密碼不是空字串，就把它換成固定遮罩字串。
@@ -377,10 +377,10 @@ const env_overrides = [_]EnvOverride{
     .{ .key = "AFRAID_ENABLED", .field = "afraid.enabled", .kind = .bool },
     .{ .key = "AFRAID_PATH", .field = "afraid.path", .kind = .str },
     .{ .key = "AFRAID_TOKEN", .field = "afraid.token", .kind = .str },
-    .{ .key = "DYNU_ENABLED", .field = "dyny.enabled", .kind = .bool },
-    .{ .key = "DYNU_URL", .field = "dyny.url", .kind = .str },
-    .{ .key = "DYNU_USERNAME", .field = "dyny.username", .kind = .str },
-    .{ .key = "DYNU_PASSWORD", .field = "dyny.password", .kind = .str },
+    .{ .key = "DYNU_ENABLED", .field = "dynu.enabled", .kind = .bool },
+    .{ .key = "DYNU_URL", .field = "dynu.url", .kind = .str },
+    .{ .key = "DYNU_USERNAME", .field = "dynu.username", .kind = .str },
+    .{ .key = "DYNU_PASSWORD", .field = "dynu.password", .kind = .str },
     .{ .key = "NOIP_ENABLED", .field = "noip.enabled", .kind = .bool },
     .{ .key = "NOIP_URL", .field = "noip.url", .kind = .str },
     .{ .key = "NOIP_USERNAME", .field = "noip.username", .kind = .str },
@@ -549,7 +549,7 @@ test "load config ignores unrelated rust settings" {
         \\{
         \\  "system": { "grpc_use_port": 9001 },
         \\  "afraid": { "enabled": false, "url": "https://freedns.afraid.org", "path": "/dynamic/update.php?", "token": "aaa" },
-        \\  "dyny": {
+        \\  "dynu": {
         \\    "enabled": true,
         \\    "url": "https://api.dynu.com/nic/update",
         \\    "username": "dynu-user",
@@ -582,9 +582,9 @@ test "load config ignores unrelated rust settings" {
     try std.testing.expectEqualStrings("https://freedns.afraid.org", config.afraid.url);
     try std.testing.expectEqualStrings("/dynamic/update.php?", config.afraid.path);
     try std.testing.expectEqualStrings("aaa", config.afraid.token);
-    try std.testing.expect(config.dyny.enabled);
-    try std.testing.expectEqualStrings("https://api.dynu.com/nic/update", config.dyny.url);
-    try std.testing.expectEqualStrings("dynu-user", config.dyny.username);
+    try std.testing.expect(config.dynu.enabled);
+    try std.testing.expectEqualStrings("https://api.dynu.com/nic/update", config.dynu.url);
+    try std.testing.expectEqualStrings("dynu-user", config.dynu.username);
     try std.testing.expect(!config.noip.enabled);
     try std.testing.expectEqualStrings("https://dynupdate.no-ip.com/nic/update", config.noip.url);
     try std.testing.expectEqualStrings("noip-user", config.noip.username);
@@ -599,13 +599,13 @@ test "load config ignores unrelated rust settings" {
 test "redacted config masks secrets only when present" {
     const redacted = redactedForLog(.{
         .afraid = .{ .token = "afraid-secret" },
-        .dyny = .{ .password = "dynu-secret" },
+        .dynu = .{ .password = "dynu-secret" },
         .noip = .{ .password = "noip-secret" },
         .ddns = .{ .redis = .{ .password = "redis-secret" } },
     });
 
     try std.testing.expectEqualStrings(masked_secret, redacted.afraid.token);
-    try std.testing.expectEqualStrings(masked_secret, redacted.dyny.password);
+    try std.testing.expectEqualStrings(masked_secret, redacted.dynu.password);
     try std.testing.expectEqualStrings(masked_secret, redacted.noip.password);
     try std.testing.expectEqualStrings(masked_secret, redacted.ddns.redis.password);
 }
@@ -672,9 +672,9 @@ test "dotenv text overrides config values" {
     // 最後逐項確認：每個 key 都有落到正確欄位。
     try std.testing.expect(!config.afraid.enabled);
     try std.testing.expectEqualStrings("example-afraid-token", config.afraid.token);
-    try std.testing.expect(config.dyny.enabled);
-    try std.testing.expectEqualStrings("https://dynu.example.com/nic/update", config.dyny.url);
-    try std.testing.expectEqualStrings("example-dynu-user", config.dyny.username);
+    try std.testing.expect(config.dynu.enabled);
+    try std.testing.expectEqualStrings("https://dynu.example.com/nic/update", config.dynu.url);
+    try std.testing.expectEqualStrings("example-dynu-user", config.dynu.username);
     try std.testing.expect(!config.noip.enabled);
     try std.testing.expectEqualStrings("https://noip.example.com/nic/update", config.noip.url);
     try std.testing.expectEqualStrings("example-noip-user", config.noip.username);

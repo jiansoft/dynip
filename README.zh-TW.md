@@ -119,7 +119,7 @@ No-IP  current_ip = 5.6.7.8  -> 更新或重試
     "path": "/dynamic/update.php?",
     "token": ""
   },
-  "dyny": {
+  "dynu": {
     "enabled": true,
     "url": "https://api.dynu.com/nic/update",
     "username": "",
@@ -167,7 +167,7 @@ No-IP  current_ip = 5.6.7.8  -> 更新或重試
 各供應商特有欄位如下：
 
 - `afraid`: `path`, `token`
-- `dyny`: `username`, `password`
+- `dynu`: `username`, `password`
 - `noip`: `username`, `password`, `hostnames`
 
 ### Redis 狀態與重試行為
@@ -317,6 +317,29 @@ zig build run -- --help
 ```bash
 dynip service --config app.json
 ```
+
+## Web Dashboard
+
+此服務內建 Web Dashboard 以便視覺化監控 DDNS 狀態。預設為啟用，並監聽在 `9003` 連接埠。
+
+### 設定
+
+您可以在 `app.json` 的 `"dashboard"` 區塊進行設定：
+
+```json
+  "dashboard": {
+    "enabled": true,
+    "host": "0.0.0.0",
+    "port": 9003
+  }
+```
+
+或使用環境變數覆寫：
+- `DASHBOARD_ENABLED=true`
+- `DASHBOARD_HOST=0.0.0.0`
+- `DASHBOARD_PORT=9003`
+
+如果停用（`"enabled": false`），服務將不會開啟任何 Web 連接埠，僅執行背景 DDNS 排程器。
 
 ## 維運與排查
 

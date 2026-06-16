@@ -119,7 +119,7 @@ Later sources override earlier ones.
     "path": "/dynamic/update.php?",
     "token": ""
   },
-  "dyny": {
+  "dynu": {
     "enabled": true,
     "url": "https://api.dynu.com/nic/update",
     "username": "",
@@ -167,7 +167,7 @@ All three DDNS providers use the same top-level structure:
 Provider-specific fields:
 
 - `afraid`: `path`, `token`
-- `dyny`: `username`, `password`
+- `dynu`: `username`, `password`
 - `noip`: `username`, `password`, `hostnames`
 
 ### Redis State And Retry Behavior
@@ -317,6 +317,29 @@ Run the compiled binary directly:
 ```bash
 dynip service --config app.json
 ```
+
+## Web Dashboard
+
+The service includes an integrated Web Dashboard to monitor DDNS status. By default, it is enabled and listens on port `9003`.
+
+### Configuration
+
+You can configure the Dashboard under the `"dashboard"` section in `app.json`:
+
+```json
+  "dashboard": {
+    "enabled": true,
+    "host": "0.0.0.0",
+    "port": 9003
+  }
+```
+
+Or override using environment variables:
+- `DASHBOARD_ENABLED=true`
+- `DASHBOARD_HOST=0.0.0.0`
+- `DASHBOARD_PORT=9003`
+
+If disabled (`"enabled": false`), no Web ports will be opened, and the service will only run the background scheduler.
 
 ## Operations
 

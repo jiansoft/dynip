@@ -173,6 +173,21 @@ const ProcessPublicIpState = struct {
     buffer: [64]u8 = undefined,
 };
 
+/// 對外公開的 public IP 狀態快照（值語意，複製自 process-level 記憶體）。
+pub const PublicIpSnapshot = struct {
+    /// 是否已經取得並記錄過 IP。
+    initialized: bool = false,
+    /// 記錄的 IP 長度。
+    len: usize = 0,
+    /// public IP 值的固定 buffer。
+    buffer: [64]u8 = undefined,
+
+    /// 將固定 buffer 轉成正常 slice。
+    pub fn ipSlice(self: *const PublicIpSnapshot) []const u8 {
+        return self.buffer[0..self.len];
+    }
+};
+
 /// 對外公開的 provider 狀態快照（值語意，複製自 process-level 記憶體）。
 ///
 /// 給 Zig 新手：
@@ -614,6 +629,24 @@ pub fn getProviderSnapshots() [3]ProviderSnapshot {
     };
 }
 
+/// 取得目前行程內最近一次成功處理的公開 IP 快照。
+///
+/// - 只讀取 process-level 記憶體，不連 Redis，無 I/O。
+/// - 回傳值語意的 PublicIpSnapshot，呼叫端不需釋放。
+pub fn getPublicIpSnapshot() PublicIpSnapshot {
+    lockProcessPublicIpState();
+    defer process_public_ip_state.mutex.unlock();
+
+    if (!process_public_ip_state.initialized) return .{};
+
+    var snapshot = PublicIpSnapshot{
+        .initialized = true,
+        .len = process_public_ip_state.len,
+    };
+    @memcpy(snapshot.buffer[0..process_public_ip_state.len], process_public_ip_state.buffer[0..process_public_ip_state.len]);
+    return snapshot;
+}
+
 /// 從鎖內 provider state 建立公開 snapshot。
 fn providerSnapshotFromState(provider: DdnsProvider, state: ProcessProviderState) ProviderSnapshot {
     // 大部分欄位可以直接值複製；固定 buffer 陣列也是值複製。
@@ -717,10 +750,8 @@ fn resetProcessProviderStates() void {
 
 /// 取得 process-level provider 狀態 mutex。
 fn lockProcessProviderStates() void {
-    // std.atomic.Mutex 的 tryLock 失敗時回 false。
-    // 這裡使用簡單 spin lock，因為保護區很短，只是複製幾個固定 buffer。
     while (!process_provider_mutex.tryLock()) {
-        std.atomic.spinLoopHint();
+        std.Thread.yield() catch {};
     }
 }
 
@@ -770,7 +801,7 @@ fn resetProcessPublicIpState() void {
 /// 用和本模組其他 shared state 一致的方式取得 process IP mutex。
 fn lockProcessPublicIpState() void {
     while (!process_public_ip_state.mutex.tryLock()) {
-        std.atomic.spinLoopHint();
+        std.Thread.yield() catch {};
     }
 }
 
@@ -885,7 +916,7 @@ fn providerCurrentIpMatches(
 fn isProviderConfigured(app_config: config_mod.AppConfig, provider: DdnsProvider) bool {
     return switch (provider) {
         .afraid => app_config.afraid.enabled and app_config.afraid.token.len != 0,
-        .dynu => app_config.dyny.enabled and app_config.dyny.username.len != 0 and app_config.dyny.password.len != 0,
+        .dynu => app_config.dynu.enabled and app_config.dynu.username.len != 0 and app_config.dynu.password.len != 0,
         .noip => app_config.noip.enabled and app_config.noip.username.len != 0 and app_config.noip.password.len != 0 and app_config.noip.hostnames.len != 0,
     };
 }
@@ -1320,7 +1351,7 @@ fn updateProvider(
 ) !void {
     return switch (provider) {
         .afraid => updateAfraid(allocator, client, config.afraid),
-        .dynu => updateDynu(allocator, client, config.dyny, ip),
+        .dynu => updateDynu(allocator, client, config.dynu, ip),
         .noip => updateNoIp(allocator, client, config.noip, ip),
     };
 }
@@ -1552,10 +1583,10 @@ fn updateDdnsServices(
     // 1. `enabled = true`
     // 2. username 有值
     // 3. password 有值
-    if (config.dyny.enabled and config.dyny.username.len != 0 and config.dyny.password.len != 0) {
+    if (config.dynu.enabled and config.dynu.username.len != 0 and config.dynu.password.len != 0) {
         // 因為設定完整，所以這次也把 Dynu 算進「有嘗試」。
         summary.attempted += 1;
-        if (updateDynu(allocator, client, config.dyny, ip)) {
+        if (updateDynu(allocator, client, config.dynu, ip)) {
             // Dynu 成功就累計成功數。
             summary.succeeded += 1;
             summary.successes.mark(.dynu);
@@ -2248,7 +2279,7 @@ test "provider success state tracks successful ddns providers" {
 test "provider configured helper follows provider credentials" {
     const app_config: config_mod.AppConfig = .{
         .afraid = .{ .enabled = true, .token = "token" },
-        .dyny = .{ .enabled = true, .username = "dynu-user", .password = "dynu-pass" },
+        .dynu = .{ .enabled = true, .username = "dynu-user", .password = "dynu-pass" },
         .noip = .{
             .enabled = true,
             .username = "noip-user",
