@@ -51,11 +51,31 @@ function Build-Target {
     # 在主控台印出目前進度與 target 名稱。
     Write-Host "[$Step] Building $Target..."
 
-    # `&` 是 PowerShell 的呼叫運算子。
-    # 這裡代表「執行 `$ZigCmd` 這個外部程式」，後面接它的參數。
-    # `-Dstrip=true` 代表 release 產物要移除 debug symbols，
-    # 讓正式部署用的檔案體積更小。
-    & $ZigCmd 'build' "-Dtarget=$Target" "-Doptimize=$Optimize" '-Dstrip=true'
+    # Windows + Zig 0.17-dev 在某些 locale 下會先碰到 Perl / libc 偵測問題。
+    #
+    # build.zig 裡有一層 locale-normalized wrapper，給一般 `zig build run/test` 使用。
+    # 但這支發版腳本已經明確知道 target / optimize / strip，最好直接用安全 locale
+    # 執行真正的 build，避免 wrapper 重新呼叫 `zig build install` 時漏掉這些 -D 參數。
+    $oldLcAll = [Environment]::GetEnvironmentVariable('LC_ALL', 'Process')
+    $oldLcCtype = [Environment]::GetEnvironmentVariable('LC_CTYPE', 'Process')
+    $oldLang = [Environment]::GetEnvironmentVariable('LANG', 'Process')
+    [Environment]::SetEnvironmentVariable('LC_ALL', 'C', 'Process')
+    [Environment]::SetEnvironmentVariable('LC_CTYPE', 'C', 'Process')
+    [Environment]::SetEnvironmentVariable('LANG', 'C', 'Process')
+    try {
+        # `&` 是 PowerShell 的呼叫運算子。
+        # 這裡代表「執行 `$ZigCmd` 這個外部程式」，後面接它的參數。
+        # `-Dlocale-normalized=true` 告訴 build.zig：
+        # 「這次已經是安全 locale，不要再包一層 zig build」。
+        # `-Dstrip=true` 代表 release 產物要移除 debug symbols，
+        # 讓正式部署用的檔案體積更小。
+        & $ZigCmd 'build' '-Dlocale-normalized=true' "-Dtarget=$Target" "-Doptimize=$Optimize" '-Dstrip=true'
+    }
+    finally {
+        [Environment]::SetEnvironmentVariable('LC_ALL', $oldLcAll, 'Process')
+        [Environment]::SetEnvironmentVariable('LC_CTYPE', $oldLcCtype, 'Process')
+        [Environment]::SetEnvironmentVariable('LANG', $oldLang, 'Process')
+    }
 
     # 外部程式執行完後，可用 `$LASTEXITCODE` 取得上一個 process 的結束碼。
     # 非 0 一般代表失敗。
