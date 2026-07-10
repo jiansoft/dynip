@@ -7,8 +7,11 @@
 //! - 本地時間維護時段判斷 (02:00 - 02:04 跳過更新邏輯)。
 //! - HTTP 請求 URL 編碼與 Basic Auth 認證標頭生成。
 
+/// Zig 標準函式庫。本檔案透過它使用記憶體配置、字串、網路與 POSIX 型別。
 const std = @import("std");
+/// 編譯目標的資訊；`builtin.os.tag` 可在編譯期決定 Windows/POSIX 分支。
 const builtin = @import("builtin");
+/// 專案的 C 匯入模組，提供 `time`、`localtime_r` 與 C 相容的型別。
 const c = @import("c");
 
 /// Windows 專用的 Winsock 系統初始化資訊結構體 (WSADATA)。
@@ -68,7 +71,10 @@ pub var windows_sockets_started = false;
 /// 則調用 `WSAStartup` 載入網路 DLL (版本 2.2)。
 /// 若為 Linux/WSL 等 POSIX 環境，則無須執行任何動作直接回傳。
 pub fn ensureWindowsSocketsStarted() !void {
+    // `comptime` 表示此判斷在「編譯時」完成：非 Windows 版本不會產生
+    // Winsock 初始化的執行碼，也不會嘗試引用 Windows DLL。
     if (comptime builtin.os.tag != .windows) return;
+    // WSAStartup 對整個行程只需要做一次；此旗標避免重複初始化。
     if (windows_sockets_started) return;
 
     var data: WSADATA = undefined;
@@ -84,6 +90,8 @@ pub fn ensureWindowsSocketsStarted() !void {
 /// 而在 Linux/Unix 上，Socket 則是一個帶正負號的 32 位元整數描述符。
 /// 透過編譯期 (comptime) 判定，使用 `@ptrFromInt` 與 `@bitCast` 進行無開銷的位元級安全轉型。
 pub fn castSocket(rc: anytype) std.posix.socket_t {
+    // 系統呼叫的原始回傳型別在兩個平台不同。此函式將差異集中在此處，
+    // 讓其他呼叫端一律只處理 Zig 的 `std.posix.socket_t`。
     if (comptime builtin.os.tag == .windows) {
         return @ptrFromInt(@as(usize, @bitCast(@as(isize, rc))));
     } else {
@@ -97,6 +105,7 @@ pub fn castSocket(rc: anytype) std.posix.socket_t {
 /// - 針對 Windows 與 POSIX 系統，自動附加 `SOCK.CLOEXEC` 旗標以防止子行程洩漏描述符。
 /// - 回傳值: 建立成功的 Socket 描述符，或回傳 `SocketCreationFailed` 錯誤。
 pub fn createUdpSocket(family: std.posix.sa_family_t) !std.posix.socket_t {
+    // 在 Windows 上，任何 socket 系統呼叫前都必須完成 WSAStartup。
     try ensureWindowsSocketsStarted();
 
     const cloexec: u32 = if (comptime builtin.os.tag == .windows)
@@ -105,6 +114,7 @@ pub fn createUdpSocket(family: std.posix.sa_family_t) !std.posix.socket_t {
         std.posix.SOCK.CLOEXEC
     else
         0;
+    // DGRAM = UDP；CLOEXEC 讓 exec 後的子行程不會意外繼承此 socket。
     const flags: u32 = std.posix.SOCK.DGRAM | cloexec;
     const rc = std.posix.system.socket(family, flags, std.posix.IPPROTO.UDP);
     if (rc == -1) return error.SocketCreationFailed;
@@ -125,6 +135,7 @@ pub fn createTcpSocket(family: std.posix.sa_family_t) !std.posix.socket_t {
         std.posix.SOCK.CLOEXEC
     else
         0;
+    // STREAM = TCP 的位元組串流 socket。
     const flags: u32 = std.posix.SOCK.STREAM | cloexec;
     const rc = std.posix.system.socket(family, flags, std.posix.IPPROTO.TCP);
     if (rc == -1) return error.SocketCreationFailed;
@@ -163,6 +174,8 @@ pub fn connectSocket(fd: std.posix.socket_t, addr: anytype, len: std.posix.sockl
 /// - `fd`: 目標 Socket 描述符。
 /// - `timeout_val`: 包含秒數與微秒數的 timeval 結構體。
 pub fn setSocketTimeout(fd: std.posix.socket_t, timeout_val: std.posix.timeval) !void {
+    // 系統 API 接受的是位元組指標與長度，而非 Zig 結構本身；`asBytes`
+    // 取得 timeout_val 在記憶體中的位元組視圖，且其生命週期涵蓋本次呼叫。
     const opt_bytes = std.mem.asBytes(&timeout_val);
     const rc = std.posix.system.setsockopt(
         fd,
@@ -245,6 +258,8 @@ pub fn ipAddressToPosix(a: std.Io.net.IpAddress) union(enum) {
     /// 包含 C ABI 相容的 IPv6 網路位址結構。
     ip6: std.posix.sockaddr.in6,
 } {
+    // tagged union 的好處是呼叫端必須用 switch 區分 IPv4 / IPv6，
+    // 因而不會把 sockaddr_in 的大小誤當成 sockaddr_in6。
     return switch (a) {
         .ip4 => |ip4| .{
             .ip4 = .{
@@ -274,17 +289,22 @@ pub fn ipAddressToPosix(a: std.Io.net.IpAddress) union(enum) {
 /// - `addr`: 待解析的字串 slice。
 /// - 回傳值: 解析成功後回傳含有 `host` 與 `port` 的結構體，若字串不合規範則拋出 `InvalidRedisAddress`。
 pub fn parseHostPort(addr: []const u8) !struct { host: []const u8, port: u16 } {
+    // 回傳的 `host` 是 addr 的 slice，沒有複製字串或配置記憶體；因此呼叫端
+    // 必須確保原本的 addr 在使用結果期間仍然有效。
     if (addr.len == 0) return error.InvalidRedisAddress;
     // 檢查是否為 IPv6 的中括號寫法
     if (addr[0] == '[') {
         const end_index = std.mem.indexOfScalar(u8, addr, ']') orelse return error.InvalidRedisAddress;
         if (end_index + 2 > addr.len or addr[end_index + 1] != ':') return error.InvalidRedisAddress;
+        // 去掉 IPv6 專用的 `[`、`]`，只留下可交給 DNS/IP parser 的主機部分。
         const host = addr[1..end_index];
         const port = try std.fmt.parseUnsigned(u16, addr[end_index + 2 ..], 10);
         return .{ .host = host, .port = port };
     } else {
         // 標準主機位址:連接埠號格式
         const colon_index = std.mem.indexOfScalar(u8, addr, ':') orelse return error.InvalidRedisAddress;
+        // 這個分支只取第一個冒號；未加中括號的 IPv6 含多個冒號，
+        // 不屬於支援格式，使用者應寫成 `[::1]:6379`。
         const host = addr[0..colon_index];
         const port = try std.fmt.parseUnsigned(u16, addr[colon_index + 1 ..], 10);
         return .{ .host = host, .port = port };
@@ -302,10 +322,15 @@ pub fn parseHostPort(addr: []const u8) !struct { host: []const u8, port: u16 } {
 /// - `host`: 伺服器主機名或 IP 地址。
 /// - `port`: 目標 TCP 連接埠。
 pub fn checkTcpPortReachable(allocator: std.mem.Allocator, io: std.Io, host: []const u8, port: u16) !void {
+    // 目前 API 保留 allocator，以便日後 DNS 流程需要配置時不必改動呼叫端。
+    // `_ = allocator` 明確告訴 Zig：此版本刻意尚未使用該參數。
     _ = allocator;
     try ensureWindowsSocketsStarted();
 
     // 優先嘗試解析成 IP，若解析失敗則代表是域名，進入 DNS Lookup
+    // 先直接解析數字 IP，可避免不必要的 DNS 查詢。`catch blk` 是一個
+    // block expression：解析失敗時執行 block，最後用 `break :blk value`
+    // 產生與成功路徑相同型別的 IpAddress。
     const ip_addr = std.Io.net.IpAddress.parse(host, port) catch blk: {
         const host_name = try std.Io.net.HostName.init(host);
 
@@ -313,10 +338,12 @@ pub fn checkTcpPortReachable(allocator: std.mem.Allocator, io: std.Io, host: []c
         var lookup_buffer: [1]std.Io.net.HostName.LookupResult = undefined;
         var lookup_queue: std.Io.Queue(std.Io.net.HostName.LookupResult) = .init(&lookup_buffer);
         // 送出 DNS 背景查詢工作
+        // DNS lookup 會非同步執行；queue 收集過程中的 address/canonical_name 結果。
         var lookup_future = io.async(std.Io.net.HostName.lookup, .{ host_name, io, &lookup_queue, .{
             .port = port,
             .canonical_name_buffer = &canonical_name_buffer,
         } });
+        // 不論後續成功或提早以錯誤返回，都取消/回收未完成的工作。
         defer lookup_future.cancel(io) catch {};
 
         var resolved_addr: ?std.Io.net.IpAddress = null;
@@ -334,8 +361,9 @@ pub fn checkTcpPortReachable(allocator: std.mem.Allocator, io: std.Io, host: []c
 
         try lookup_future.await(io);
 
-        const stun_addr = resolved_addr orelse return error.DnsResolutionFailed;
-        break :blk stun_addr;
+        // 主機名可能只回傳 canonical name 而沒有可用位址，因此要檢查 optional。
+        const resolved_ip = resolved_addr orelse return error.DnsResolutionFailed;
+        break :blk resolved_ip;
     };
 
     const posix_addr = ipAddressToPosix(ip_addr);
@@ -361,14 +389,23 @@ pub fn checkTcpPortReachable(allocator: std.mem.Allocator, io: std.Io, host: []c
 pub fn shouldSkipMaintenanceWindow() bool {
     if (builtin.os.tag == .windows) {
         // Win32 SYSTEMTIME 結構體佈局。
+        // `extern struct` 依照 C/Win32 ABI 排列欄位，才能安全傳給 GetLocalTime。
         const SYSTEMTIME = extern struct {
+            /// 西元年，例如 2026。
             wYear: u16,
+            /// 月，範圍為 1 至 12。
             wMonth: u16,
+            /// 星期日為 0、星期一為 1，依此類推。
             wDayOfWeek: u16,
+            /// 月中的日期，範圍為 1 至 31。
             wDay: u16,
+            /// 小時，24 小時制，範圍為 0 至 23。
             wHour: u16,
+            /// 分鐘，範圍為 0 至 59。
             wMinute: u16,
+            /// 秒，範圍為 0 至 59。
             wSecond: u16,
+            /// 毫秒，範圍為 0 至 999。
             wMilliseconds: u16,
         };
         const kernel32 = struct {
@@ -420,6 +457,8 @@ pub fn appendUrlEncoded(
             continue;
         }
 
+        // `%` 加上兩個固定寬度的十六進位數字剛好是三個位元組，
+        // 例如空白 (0x20) 會寫成 `%20`。
         var escaped: [3]u8 = undefined;
         _ = try std.fmt.bufPrint(&escaped, "%{X:0>2}", .{char});
         try buffer.appendSlice(allocator, &escaped);
@@ -438,6 +477,8 @@ pub fn appendQueryParam(
     key: []const u8,
     value: []const u8,
 ) !void {
+    // key 通常是程式寫死的合法名稱，這裡依目前呼叫約定不編碼它；
+    // value 則一定經過 encode，避免 `&`、`=`、空白改變 query 語意。
     try buffer.appendSlice(allocator, key);
     try buffer.append(allocator, '=');
     try appendUrlEncoded(buffer, allocator, value);
@@ -459,6 +500,8 @@ pub fn buildBasicAuthorization(
     username: []const u8,
     password: []const u8,
 ) ![]u8 {
+    // raw 與 encoded 僅是中間值，函式離開前釋放；最後一行配置的回傳字串
+    // 則交由呼叫端持有與 free，這是 Zig allocator API 常見的所有權約定。
     const raw = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ username, password });
     defer allocator.free(raw);
 

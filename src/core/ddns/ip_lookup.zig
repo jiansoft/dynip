@@ -1,3 +1,5 @@
+//! 查詢目前對外 public IP。依序嘗試 UDP STUN 與 Cloudflare trace，
+//! 並把第一個成功結果交給上層；兩者都失敗時才回傳錯誤。
 const std = @import("std");
 const types = @import("types.zig");
 const utils = @import("utils.zig");
@@ -6,20 +8,28 @@ const http = @import("../../io/http.zig");
 const PublicIpService = types.PublicIpService;
 const PublicIpLookup = types.PublicIpLookup;
 
+/// Cloudflare HTTP 連線逾時。STUN 使用 socket 層的接收逾時，兩者不是同一機制。
 const public_ip_connect_timeout: std.Io.Timeout = .{ .duration = .{
     .raw = .fromSeconds(3),
     .clock = .awake,
 } };
 
+/// 每次查詢遞增，以輪替第一優先來源，避免所有請求永久集中於同一個服務。
+/// 此變數沒有鎖；目前排程使用方式假設查詢不會同時執行。
 pub var primary_source_counter: usize = 0;
 
+/// 集中管理服務端點，避免散落的 URL 字串難以修改或測試。
 const Endpoint = struct {
+    /// public IP 服務的端點集合。
     const PublicIp = struct {
+        /// Google 公開 STUN 端點，格式為 host:port 而非 URL。
         const stun = "stun.l.google.com:19302";
+        /// Cloudflare trace 端點，回應含有 `ip=` 行。
         const cloudflare_trace = "https://one.one.one.one/cdn-cgi/trace";
     };
 };
 
+/// 將來源 enum 轉成供 log、snapshot 與 dashboard 使用的固定文字。
 pub fn serviceName(service: PublicIpService) []const u8 {
     return switch (service) {
         .stun => "stun",
@@ -27,6 +37,7 @@ pub fn serviceName(service: PublicIpService) []const u8 {
     };
 }
 
+/// 取得指定來源的端點字串。回傳 static slice，不需釋放。
 pub fn publicIpServiceUrl(service: PublicIpService) []const u8 {
     return switch (service) {
         .stun => Endpoint.PublicIp.stun,
@@ -34,6 +45,9 @@ pub fn publicIpServiceUrl(service: PublicIpService) []const u8 {
     };
 }
 
+/// 查詢 public IP 的主要入口。兩個來源的優先順序會在每次呼叫輪替；
+/// error_writer 收集每個失敗原因，以便兩者皆失敗時輸出單一診斷訊息。
+/// 成功的 ip 是以傳入 allocator 配置，呼叫端必須負責釋放。
 pub fn getPublicIp(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
@@ -46,6 +60,7 @@ pub fn getPublicIp(
     else
         .{ .cloudflare_trace, .stun };
 
+    // fixed writer 的 `end` 是有效內容長度；buffer 剩餘部分為 undefined，不能直接列印。
     var error_buffer: [512]u8 = undefined;
     var error_writer: std.Io.Writer = .fixed(&error_buffer);
     var stun_error: ?[]const u8 = null;
@@ -56,10 +71,12 @@ pub fn getPublicIp(
         }
     }
 
-    std.log.err("failed to get public ip from all services: {s}", .{error_buffer[0..error_writer.bytes_written]});
+    std.log.err("failed to get public ip from all services: {s}", .{error_buffer[0..error_writer.end]});
     return error.PublicIpLookupFailed;
 }
 
+/// 嘗試單一服務。失敗時不向上傳遞錯誤，而是附加錯誤文字後回傳 null，
+/// 讓 getPublicIp 可以繼續嘗試 fallback；成功時回傳 optional 的有效值。
 fn tryFetchFromService(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
@@ -95,17 +112,20 @@ fn tryFetchFromService(
     };
 }
 
+/// 以 `服務名: 錯誤` 格式追加到 fixed writer。writer 容量用盡時忽略額外文字，
+/// 因為錯誤訊息不得再遮蔽原本的查詢失敗。
 fn appendPublicIpLookupError(
     writer: *std.Io.Writer,
     service: PublicIpService,
     err: anyerror,
 ) void {
-    if (writer.bytes_written != 0) {
+    if (writer.end != 0) {
         writer.writeAll(" | ") catch return;
     }
     writer.print("{s}: {}", .{ serviceName(service), err }) catch {};
 }
 
+/// 依 service enum 分派至 STUN 或 HTTP 實作。anyerror 讓兩條底層錯誤集合可統一回傳。
 pub fn fetchPublicIpFromService(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
@@ -118,6 +138,8 @@ pub fn fetchPublicIpFromService(
     };
 }
 
+/// 下載 Cloudflare trace 純文字回應，逐行尋找 `ip=`，再用標準庫驗證 IPv4/IPv6 格式。
+/// response.body 由 HTTP helper 配置，因此 defer 在函式結束時釋放它。
 fn fetchCloudflareTraceIp(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
@@ -144,6 +166,8 @@ fn fetchCloudflareTraceIp(
     return error.CloudflareTraceIpNotFound;
 }
 
+/// 解析 STUN Binding Success Response 的 XOR-MAPPED-ADDRESS attribute。
+/// response 和 transaction_id 都是借用 slice；成功時回傳格式化後、由 allocator 擁有的 IP 字串。
 pub fn parseStunResponse(
     allocator: std.mem.Allocator,
     response: []const u8,
@@ -153,6 +177,7 @@ pub fn parseStunResponse(
     if (response[0] != 0x01 or response[1] != 0x01) return error.InvalidStunMessageType;
     if (!std.mem.eql(u8, response[8..20], transaction_id)) return error.StunTransactionIdMismatch;
 
+    // STUN header 中的長度與 attribute 數字皆採網路位元組序（big endian）。
     const msg_len = std.mem.readInt(u16, response[2..][0..2], .big);
     if (20 + msg_len > response.len) return error.InvalidStunMessageLength;
 
@@ -165,6 +190,8 @@ pub fn parseStunResponse(
 
         if (offset + attr_len > end) return error.InvalidStunAttributeLength;
 
+        // 0x0020 是 XOR-MAPPED-ADDRESS；它以 magic cookie / transaction ID XOR，
+        // 可避免 NAT 對封包內看似 IP 的內容做錯誤改寫。
         if (attr_type == 0x0020) {
             if (attr_len < 8) return error.InvalidXorMappedAddressLength;
             const family = response[offset + 1];
@@ -201,6 +228,8 @@ pub fn parseStunResponse(
     return error.XorMappedAddressNotFound;
 }
 
+/// 向 STUN server 發送 20-byte Binding Request，接收回應並交由 parseStunResponse 解碼。
+/// DNS 使用 Zig I/O queue 非同步取得位址，UDP send/receive 仍以 socket 系統呼叫完成。
 pub fn fetchStunIp(allocator: std.mem.Allocator, io: std.Io, stun_endpoint: []const u8) ![]const u8 {
     const colon_idx = std.mem.indexOfScalar(u8, stun_endpoint, ':') orelse return error.InvalidStunEndpoint;
     const host = stun_endpoint[0..colon_idx];
@@ -257,6 +286,7 @@ pub fn fetchStunIp(allocator: std.mem.Allocator, io: std.Io, stun_endpoint: []co
     request[5] = 0x12;
     request[6] = 0xA4;
     request[7] = 0x42;
+    // STUN transaction ID 必須剛好 12 bytes；回應必須帶著相同 ID 才是本請求的回覆。
     const transaction_id = "antigravity1";
     @memcpy(request[8..20], transaction_id);
 
@@ -273,6 +303,8 @@ pub fn fetchStunIp(allocator: std.mem.Allocator, io: std.Io, stun_endpoint: []co
     return try parseStunResponse(allocator, response[0..recv_len], transaction_id);
 }
 
+/// 去除空白後用 std.Io.net.IpAddress.parse 驗證輸入，並回傳借用原始 text 的 trimmed slice。
+/// 注意：本函式不配置記憶體，呼叫端仍需維持 text 的生命週期。
 pub fn normalizePublicIp(text: []const u8) ![]const u8 {
     const trimmed = std.mem.trim(u8, text, " \t\r\n");
     if (trimmed.len == 0) return error.EmptyPublicIpResponse;

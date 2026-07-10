@@ -1,14 +1,26 @@
 //! DDNS 更新流程的主要入口與協調器 (Facade / Orchestrator)。
 //!
 //! 負責統合對外 IP 查詢、各 DDNS 供應商的 API 呼叫、本機與 Redis 狀態比對、及維護時段判斷。
+//!
+//! # 一輪 refresh 的閱讀地圖
+//! 1. 維護時段直接略過；2. 找出 public IP；3. 先查行程內記憶；
+//! 4. Redis 可用時走「每家 provider 各自收斂」的 reconcile 流程；
+//! 5. 否則用 Redis/local TTL cache 做較簡單的整體去重；6. 呼叫供應商並寫回狀態。
+//!
+//! 本檔只負責協調。實際 HTTP、Redis protocol、STUN 與共享記憶體細節分別位於子模組。
 
+/// Zig 標準函式庫：allocator、時間、字串比對、HTTP 型別等。
 const std = @import("std");
+/// 設定檔對應的型別，如 AppConfig 與 Redis。
 const config_mod = @import("../base/config.zig");
+/// Redis 呼叫與可重用連線 Session 的封裝。
 const redis = @import("../io/redis.zig");
+/// HTTP client 型別的來源；供 provider 子模組共用同一 client。
 const http = @import("../io/http.zig");
+/// C time()，用於產生 Unix 秒 timestamp。
 const c = @import("c");
 
-// 子模組匯入
+// 子模組匯入；`pub const` 讓其他檔案可經由 `ddns.xxx` 存取它們。
 pub const types = @import("ddns/types.zig");
 pub const shared_state = @import("ddns/shared_state.zig");
 pub const local_cache = @import("ddns/local_cache.zig");
@@ -16,7 +28,7 @@ pub const ip_lookup = @import("ddns/ip_lookup.zig");
 pub const providers = @import("ddns/providers.zig");
 pub const utils = @import("ddns/utils.zig");
 
-// 公開型別重新導出 (Public Types Re-exports)
+// 公開型別重新導出 (Public Types Re-exports)：使用者不必知道型別實際放在 ddns/types.zig。
 pub const RefreshStatus = types.RefreshStatus;
 pub const PublicIpSnapshot = types.PublicIpSnapshot;
 pub const ProviderSnapshot = types.ProviderSnapshot;
@@ -26,14 +38,16 @@ pub const ProviderState = types.ProviderState;
 pub const ProviderAttemptDecision = types.ProviderAttemptDecision;
 pub const ServiceSummary = types.ServiceSummary;
 
-// 公開函式重新導出 (Public Functions Re-exports)
+// 公開函式重新導出 (Public Functions Re-exports)：snapshot 是值複製，讀取者不會碰到內部鎖。
 pub const getProviderSnapshots = shared_state.getProviderSnapshots;
 pub const getPublicIpSnapshot = shared_state.getPublicIpSnapshot;
 
-// 全域變數
+/// 啟動檢查或 Redis 操作失敗後設為 false；refresh 會改用 local_cache 作為降級方案。
 pub var redis_available: bool = true;
 
+/// Redis hash 的成功狀態文字；必須和 shared_state 的顯示語意一致。
 const provider_status_success = "success";
+/// Redis hash 的失敗狀態文字；與 success 配對供 retry 決策使用。
 const provider_status_failed = "failed";
 
 /// 啟動時檢查 Redis 連線狀況。
@@ -42,8 +56,10 @@ pub fn checkRedisAvailability(
     io: std.Io,
     redis_config: config_mod.Redis,
 ) void {
+    // Redis 沒有啟用時，刻意不連線也不改寫 redis_available；此模式本來就使用 local cache。
     if (!redis_config.enabled) return;
 
+    // addr 可為 host:port 或 [IPv6]:port。先解析而不是直接連線，能產生較清楚的設定錯誤。
     const host_port = utils.parseHostPort(redis_config.addr) catch |err| {
         redis_available = false;
         std.log.warn(
@@ -53,6 +69,7 @@ pub fn checkRedisAvailability(
         return;
     };
 
+    // 這只是啟動期 TCP 可達性探測，不會驗證 Redis 帳密或執行 Redis 命令。
     utils.checkTcpPortReachable(allocator, io, host_port.host, host_port.port) catch |err| {
         redis_available = false;
         std.log.warn(
@@ -80,19 +97,25 @@ pub fn refresh(
     client: *std.http.Client,
     config: config_mod.AppConfig,
 ) !RefreshStatus {
+    // 此保護在任何網路 I/O 前完成；避免維護時段仍造成 STUN/HTTP/Redis 請求。
     if (utils.shouldSkipMaintenanceWindow()) {
         std.log.info("skip ddns refresh during 02:00-02:04 local maintenance window", .{});
         return .skipped_maintenance_window;
     }
 
+    // 本輪有許多短命字串（IP、URL、Redis 回應）。Arena 讓它們可統一在函式結束時
+    // deinit，不需為每一個成功/錯誤分支手動 free。不可把 scratch 配置的 slice 存到本輪外。
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const scratch = arena.allocator();
 
+    // 取得的 IP 已經過格式驗證。try 代表兩個 public-IP 來源皆失敗時立即向呼叫端傳遞錯誤。
     const public_ip_lookup = try ip_lookup.getPublicIp(scratch, client);
     const ip_now = public_ip_lookup.ip;
     const ip_source = ip_lookup.serviceName(public_ip_lookup.service);
 
+    // 這層是最快的 process-local 短路；即使 Redis TTL 已失效，只要此行程剛剛
+    // 成功處理同一 IP 仍不重複更新。仍更新來源診斷資訊，因本次來源可能不同。
     if (shared_state.isSameAsLastProcessedIp(ip_now)) {
         shared_state.rememberLastProcessedIp(ip_now, ip_source, public_ip_lookup.stun_error);
         std.log.info(
@@ -102,11 +125,13 @@ pub fn refresh(
         return .skipped_cached_ip;
     }
 
+    // 0 是設定上的「使用預設值」，不是立即過期；預設為一天。
     const ttl_seconds = if (config.ddns.dedupe_ttl_seconds == 0)
         @as(u64, 60 * 60 * 24)
     else
         config.ddns.dedupe_ttl_seconds;
 
+    // Redis reconciliation 為較精細模式：每個 provider 都有自己的成功/失敗/退避狀態。
     if (config.ddns.redis.enabled and redis_available) {
         const now_seconds = c.time(null);
         return refreshWithRedisProviderState(
@@ -122,17 +147,22 @@ pub fn refresh(
         );
     }
 
+    // 降級路徑仍可在設定啟用 Redis、但 Redis 已標記不可用時使用 local cache；
+    // effective_redis 將 enabled 改為 false，確保後續函式不會再嘗試 Redis I/O。
     const cache_key = try buildPublicIpCacheKey(scratch, ip_now);
     const effective_redis = redisConfigForCurrentState(config.ddns.redis);
     if (try isDedupeHit(scratch, io, effective_redis, config, cache_key, ip_now)) {
         return .skipped_cached_ip;
     }
 
+    // 簡單模式不會因單一 provider 出錯而提前中止；summary 統計全部嘗試結果。
     const summary = try updateDdnsServices(scratch, client, config, ip_now, c.time(null));
     if (summary.attempted == 0) return error.NoEnabledDdnsService;
     if (summary.succeeded == 0) return error.AllDdnsUpdatesFailed;
 
     try rememberDedupe(scratch, io, effective_redis, cache_key, ip_now, ttl_seconds, summary.successes);
+    // 只有每個已嘗試 provider 都成功，才把 IP 標為此行程「完整處理」；
+    // 若部分失敗，下輪仍應有機會補上失敗者。
     if (summary.succeeded == summary.attempted) {
         shared_state.rememberLastProcessedIp(ip_now, ip_source, public_ip_lookup.stun_error);
     }
@@ -144,6 +174,8 @@ pub fn refresh(
     return .updated;
 }
 
+/// Redis 可用時的 reconcile 流程：先寫 desired IP，依各 provider 的 hash state 決定
+/// 要更新、略過或等待 retry，最後只記錄實際成功的 provider。
 fn refreshWithRedisProviderState(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -155,10 +187,13 @@ fn refreshWithRedisProviderState(
     ttl_seconds: u64,
     now_seconds: i64,
 ) !RefreshStatus {
+    // Session 將同一輪 Redis 往來放在單一已初始化連線；defer 保證所有 return 路徑都釋放它。
     var redis_session: redis.Session = undefined;
     try redis_session.init(io, config.ddns.redis);
     defer redis_session.deinit();
 
+    // desired IP 與各 provider 的 current IP 分開：前者表示「希望收斂到哪」，
+    // 後者只在該 provider 成功時才更新。
     try rememberDesiredIpWithSession(&redis_session, ip, ttl_seconds);
 
     const summary = try updateDdnsServicesReconciled(
@@ -173,6 +208,8 @@ fn refreshWithRedisProviderState(
     if (summary.configured == 0) return error.NoEnabledDdnsService;
 
     const cache_key = try buildPublicIpCacheKey(allocator, ip);
+    // 即使其他 provider 失敗，也會保存已成功者的 legacy current-IP key，
+    // 以便下輪只需修復未成功的服務。
     if (summary.succeeded != 0) {
         try rememberDedupeWithSession(&redis_session, cache_key, ip, ttl_seconds, summary.successes);
     }
@@ -181,6 +218,7 @@ fn refreshWithRedisProviderState(
         return error.AllDdnsUpdatesFailed;
     }
 
+    // configured 是所有已設定服務數；全部「已正確或本輪成功」才可更新 process-local 去重狀態。
     if (summary.already_current + summary.succeeded == summary.configured) {
         shared_state.rememberLastProcessedIp(ip, ip_source, stun_error);
     }
@@ -213,21 +251,26 @@ fn refreshWithRedisProviderState(
         );
     }
 
+    // 沒有真正 HTTP 更新通常代表全部已正確；對 scheduler 表示這是一輪 cache skip。
     return if (summary.attempted == 0) .skipped_cached_ip else .updated;
 }
 
+/// 建立單次 public IP 去重 key；回傳配置的字串，需由同一 allocator 釋放。
 fn buildPublicIpCacheKey(allocator: std.mem.Allocator, ip: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "MyPublicIP:{s}", .{ip});
 }
 
+/// Redis 中保存最近 public IP 的固定 key，不含 TTL 範圍外的額外資訊。
 fn currentPublicIpRedisKey() []const u8 {
     return "MyPublicIP";
 }
 
+/// Redis 中保存本輪所有 provider 共同目標 IP 的固定 key。
 fn desiredPublicIpRedisKey() []const u8 {
     return "DDNS:DesiredIP";
 }
 
+/// 取得 provider hash state 的 Redis key；hash 包含 retry、error 與最後成功 IP 等欄位。
 fn providerStateRedisKey(provider: DdnsProvider) []const u8 {
     return switch (provider) {
         .afraid => "DDNS:Provider:afraid",
@@ -236,6 +279,7 @@ fn providerStateRedisKey(provider: DdnsProvider) []const u8 {
     };
 }
 
+/// 取得舊版相容的 provider-current-IP key，用於快速 dedupe 判斷。
 fn providerCurrentIpRedisKey(provider: DdnsProvider) []const u8 {
     return switch (provider) {
         .afraid => "MyPublicIP:afraid",
@@ -244,6 +288,7 @@ fn providerCurrentIpRedisKey(provider: DdnsProvider) []const u8 {
     };
 }
 
+/// 將 enum 轉成適合 log 顯示的穩定名稱。
 fn providerName(provider: DdnsProvider) []const u8 {
     return switch (provider) {
         .afraid => "afraid",
@@ -252,6 +297,7 @@ fn providerName(provider: DdnsProvider) []const u8 {
     };
 }
 
+/// 將 enum 映射到固定順序的陣列 slot；目前保留給需要批次索引的呼叫端。
 fn providerSlot(provider: DdnsProvider) usize {
     return switch (provider) {
         .afraid => 0,
@@ -260,6 +306,8 @@ fn providerSlot(provider: DdnsProvider) usize {
     };
 }
 
+/// 判斷此 IP 是否可跳過更新。無 Redis 時查本機 TTL 快取；有 Redis 時還要確認
+/// 每個已啟用 provider 的 current-IP key 都正確，避免一個 provider 漏更新。
 fn isDedupeHit(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -268,6 +316,7 @@ fn isDedupeHit(
     cache_key: []const u8,
     ip: []const u8,
 ) !bool {
+    // Local cache 的 key 會隨 TTL 自動失效；此分支完全沒有 I/O。
     if (!redis_config.enabled) {
         if (local_cache.localDedupeContains(cache_key)) {
             std.log.info(
@@ -279,6 +328,8 @@ fn isDedupeHit(
         return false;
     }
 
+    // Redis 去重檢查讀取失敗時採「視為未命中」的安全策略：寧可多做一次 DDNS 更新，
+    // 也不因暫時的 Redis 問題而錯過 IP 變更。
     const cache_hit = redis.containsKey(allocator, io, redis_config, cache_key) catch |err| blk: {
         std.log.warn(
             "failed to check redis key before ddns refresh: key={s}, error={}",
@@ -303,6 +354,7 @@ fn isDedupeHit(
     return false;
 }
 
+/// 確認所有「已設定」provider 都已在 Redis 記錄為指定 IP；沒有任何 provider 時回傳 false。
 fn allEnabledProvidersAlreadyRecorded(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -328,6 +380,7 @@ fn allEnabledProvidersAlreadyRecorded(
     return checked != 0;
 }
 
+/// 讀取單一 provider 的 legacy current-IP key，並與本輪 IP 做精確位元組比較。
 fn providerCurrentIpMatches(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -343,6 +396,7 @@ fn providerCurrentIpMatches(
         );
         return false;
     };
+    // redis.get 成功取得的 value 是 allocator 配置；optional 為 null 時不做任何釋放。
     defer if (stored_ip) |value| allocator.free(value);
 
     if (stored_ip) |value| {
@@ -351,6 +405,7 @@ fn providerCurrentIpMatches(
     return false;
 }
 
+/// 檢查 provider 是否啟用且具備足以發出請求的必要憑證/hostname。
 fn isProviderConfigured(app_config: config_mod.AppConfig, provider: DdnsProvider) bool {
     return switch (provider) {
         .afraid => app_config.afraid.enabled and app_config.afraid.token.len != 0,
@@ -359,6 +414,8 @@ fn isProviderConfigured(app_config: config_mod.AppConfig, provider: DdnsProvider
     };
 }
 
+/// 在更新成功後寫入去重資訊；依 Redis 是否啟用選擇遠端 TTL key 或本機快取。
+/// successes 確保 provider-current-IP 只寫給本輪真正成功的 provider。
 fn rememberDedupe(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -368,6 +425,7 @@ fn rememberDedupe(
     ttl_seconds: u64,
     successes: ProviderSuccesses,
 ) !void {
+    // SETEX 將值與 TTL 一次寫入；這些 key 到期後會自然允許下一輪完整更新。
     if (!redis_config.enabled) {
         try local_cache.localDedupeSet(cache_key, ttl_seconds);
         std.log.info("ddns local cache updated: key={s}, ttl={d}s", .{ cache_key, ttl_seconds });
@@ -398,6 +456,7 @@ fn rememberDedupe(
     );
 }
 
+/// 將成功 provider 的 current-IP key 寫入 Redis，供下輪 dedupe 做完整性檢查。
 fn rememberProviderCurrentIps(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -408,6 +467,7 @@ fn rememberProviderCurrentIps(
 ) !void {
     const providers_list = [_]DdnsProvider{ .afraid, .dynu, .noip };
     for (providers_list) |provider| {
+        // `continue` 是關鍵：不為本輪失敗 provider 假裝寫入成功 IP。
         if (!successes.includes(provider)) continue;
 
         const key = providerCurrentIpRedisKey(provider);
@@ -419,6 +479,7 @@ fn rememberProviderCurrentIps(
     }
 }
 
+/// 與 rememberDedupe 相同，但重用已開啟的 Redis Session，避免重複建立連線。
 fn rememberDedupeWithSession(
     redis_session: *redis.Session,
     cache_key: []const u8,
@@ -436,6 +497,7 @@ fn rememberDedupeWithSession(
     );
 }
 
+/// Session 版本的 provider current-IP 寫入工具。
 fn rememberProviderCurrentIpsWithSession(
     redis_session: *redis.Session,
     successes: ProviderSuccesses,
@@ -455,6 +517,7 @@ fn rememberProviderCurrentIpsWithSession(
     }
 }
 
+/// 在 reconcile 前先記錄 desired IP，讓外部觀察者知道系統正在收斂到哪個目標。
 fn rememberDesiredIpWithSession(
     redis_session: *redis.Session,
     ip: []const u8,
@@ -463,6 +526,7 @@ fn rememberDesiredIpWithSession(
     try redis_session.setEx(desiredPublicIpRedisKey(), ip, ttl_seconds);
 }
 
+/// 依固定順序 reconcile 全部 provider，並累積統計；ttl 目前由呼叫鏈保留作 API 穩定性。
 fn updateDdnsServicesReconciled(
     allocator: std.mem.Allocator,
     redis_session: *redis.Session,
@@ -473,6 +537,8 @@ fn updateDdnsServicesReconciled(
     now_seconds: i64,
 ) !ServiceSummary {
     var summary = ServiceSummary{};
+    // 此參數暫未在 provider state hash 使用，但先保留在介面中，讓未來 state TTL
+    // 與 caller 的 dedupe TTL 能同步擴充而不破壞呼叫端。
     _ = ttl_seconds;
 
     try reconcileProvider(&summary, allocator, redis_session, client, config, .afraid, ip, now_seconds);
@@ -482,6 +548,8 @@ fn updateDdnsServicesReconciled(
     return summary;
 }
 
+/// 針對一個 provider 執行狀態機：未設定→略過、已正確→略過、退避中→延後、其餘→更新。
+/// 成功或失敗都會盡力同步 Redis 與行程內 snapshot。
 fn reconcileProvider(
     summary: *ServiceSummary,
     allocator: std.mem.Allocator,
@@ -492,9 +560,12 @@ fn reconcileProvider(
     desired_ip: []const u8,
     now_seconds: i64,
 ) !void {
+    // 未設定的服務不算 configured，也不會寫入任何 Redis 狀態。
     if (!isProviderConfigured(config, provider)) return;
     summary.configured += 1;
 
+    // 讀取舊狀態失敗時採 fail-open：仍嘗試更新 DDNS，避免 Redis 的短暫讀取錯誤
+    // 阻止實際 DNS 修正。空 ProviderState 會導向 .attempt。
     const state = loadProviderState(allocator, redis_session, provider) catch |err| blk: {
         std.log.warn(
             "failed to load ddns provider state, will attempt update: provider={s}, error={}",
@@ -505,6 +576,7 @@ fn reconcileProvider(
 
     switch (providerAttemptDecision(state, desired_ip, now_seconds)) {
         .already_current => {
+            // 也同步行程 snapshot，讓本次啟動的 dashboard 立即顯示已確認成功。
             summary.already_current += 1;
             shared_state.memoryWriteProviderSuccess(provider, desired_ip, now_seconds);
             std.log.debug("skip ddns provider because it is already current: provider={s}, ip={s}", .{
@@ -514,6 +586,7 @@ fn reconcileProvider(
             return;
         },
         .retry_deferred => {
+            // 不遞增 attempted/failed；這不是 HTTP 失敗，而是先前失敗所設定的冷卻時間。
             summary.retry_deferred += 1;
             std.log.debug(
                 "defer ddns provider retry: provider={s}, desired_ip={s}, next_retry_at={d}, now={d}",
@@ -525,9 +598,12 @@ fn reconcileProvider(
     }
 
     summary.attempted += 1;
+    // catch 區塊把 HTTP/協定錯誤轉換成可持久化的 retry state，而非讓一個 provider
+    // 的失敗中止其他 provider 的 reconcile。
     updateProvider(allocator, client, config, provider, desired_ip) catch |err| {
         summary.failed += 1;
         const next_retry_at = now_seconds + shared_state.retryDelaySeconds(state.retry_count + 1);
+        // 儲存失敗本身也可能出錯；原始更新錯誤已在 log 留下，故只警告，不覆蓋它。
         saveProviderFailure(
             allocator,
             redis_session,
@@ -550,11 +626,14 @@ fn reconcileProvider(
         return;
     };
 
+    // 先標記統計，再持久化成功。saveProviderSuccess 失敗會向上傳遞，讓上層知道
+    // 狀態無法可靠保存，即使 HTTP 更新本身已成功。
     summary.succeeded += 1;
     summary.successes.mark(provider);
     try saveProviderSuccess(allocator, redis_session, provider, desired_ip, now_seconds);
 }
 
+/// 依 provider enum 分派到對應 HTTP 實作。呼叫前已由 isProviderConfigured 驗證必要設定。
 fn updateProvider(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
@@ -569,7 +648,9 @@ fn updateProvider(
     };
 }
 
+/// 純函式形式的重試決策：成功且 current IP 相同才可略過；目標 IP 變更時忽略舊 retry。
 fn providerAttemptDecision(state: ProviderState, desired_ip: []const u8, now_seconds: i64) ProviderAttemptDecision {
+    // 只有 status=success 且 current_ip 相等時才略過；單純 IP 相等但上次失敗不能略過。
     if (state.current_ip) |current_ip| {
         if (std.mem.eql(u8, current_ip, desired_ip) and providerStateStatusEquals(state, provider_status_success)) {
             return .already_current;
@@ -584,21 +665,26 @@ fn providerAttemptDecision(state: ProviderState, desired_ip: []const u8, now_sec
         return .attempt;
     }
 
+    // `>` 使「剛好等於」到期時間可立即再試，避免多等一個 scheduler interval。
     if (state.next_retry_at > now_seconds) return .retry_deferred;
     return .attempt;
 }
 
+/// optional status 有值且與 expected 完全相同時回傳 true。
 fn providerStateStatusEquals(state: ProviderState, expected: []const u8) bool {
     if (state.status) |status| return std.mem.eql(u8, status, expected);
     return false;
 }
 
+/// 從 Redis hash 讀出 provider 狀態。hGet 回傳的 optional slice 由 redis Session/allocator 規則管理。
 fn loadProviderState(
     allocator: std.mem.Allocator,
     redis_session: *redis.Session,
     provider: DdnsProvider,
 ) !ProviderState {
     const key = providerStateRedisKey(provider);
+    // 每個 hGet 都可能回傳 null，表示舊版/全新 Redis 尚未有該欄位；optional 正是
+    // 用來表達這種「值不存在」的 Zig 型別，而不是空字串。
     return .{
         .current_ip = try redis_session.hGet(allocator, key, "current_ip"),
         .desired_ip = try redis_session.hGet(allocator, key, "desired_ip"),
@@ -608,6 +694,7 @@ fn loadProviderState(
     };
 }
 
+/// 讀取並解析無號整數 hash 欄位；缺值或格式錯誤採用安全預設值 0。
 fn loadProviderStateU32(
     allocator: std.mem.Allocator,
     redis_session: *redis.Session,
@@ -616,11 +703,13 @@ fn loadProviderStateU32(
 ) !u32 {
     const value = try redis_session.hGet(allocator, key, field);
     if (value) |text| {
+        // 對手動修改或舊格式資料採容錯 0，讓 retry 能自行恢復，而非讓整輪 refresh 失敗。
         return std.fmt.parseUnsigned(u32, text, 10) catch 0;
     }
     return 0;
 }
 
+/// 讀取並解析 Unix 秒用的有號整數 hash 欄位；缺值或格式錯誤採用 0。
 fn loadProviderStateI64(
     allocator: std.mem.Allocator,
     redis_session: *redis.Session,
@@ -634,6 +723,7 @@ fn loadProviderStateI64(
     return 0;
 }
 
+/// 原子批次（在同一 hSetFields 命令）保存成功狀態，並同步更新行程內 snapshot。
 fn saveProviderSuccess(
     allocator: std.mem.Allocator,
     redis_session: *redis.Session,
@@ -641,6 +731,8 @@ fn saveProviderSuccess(
     ip: []const u8,
     now_seconds: i64,
 ) !void {
+    // bufPrint 寫入 stack buffer；fields 只在本函式的 hSetFields 呼叫期間使用這些 slices，
+    // 所以 stack 生命週期完全足夠，不需要配置字串。
     var now_buffer: [32]u8 = undefined;
     const now_text = try std.fmt.bufPrint(&now_buffer, "{d}", .{now_seconds});
     const key = providerStateRedisKey(provider);
@@ -654,11 +746,13 @@ fn saveProviderSuccess(
         .{ .key = key, .field = "last_error", .value = "" },
         .{ .key = key, .field = "updated_at", .value = now_text },
     };
+    // allocator 屬於統一的儲存函式簽名，目前成功寫入只需 stack buffer。
     _ = allocator;
     shared_state.memoryWriteProviderSuccess(provider, ip, now_seconds);
     try redis_session.hSetFields(&fields);
 }
 
+/// 保存失敗狀態、錯誤名稱與下一次重試時間；刻意不覆蓋 current_ip，保留最後成功值。
 fn saveProviderFailure(
     allocator: std.mem.Allocator,
     redis_session: *redis.Session,
@@ -669,6 +763,7 @@ fn saveProviderFailure(
     last_error: []const u8,
     now_seconds: i64,
 ) !void {
+    // 與成功流程相同，數字先格式化到 stack buffer，再作為 Redis hash 欄位值。
     var retry_buffer: [32]u8 = undefined;
     var next_retry_buffer: [32]u8 = undefined;
     var now_buffer: [32]u8 = undefined;
@@ -690,6 +785,7 @@ fn saveProviderFailure(
     try redis_session.hSetFields(&fields);
 }
 
+/// 不使用 Redis 時的直接更新流程。各 provider 獨立嘗試，單一失敗不阻止其餘 provider。
 fn updateDdnsServices(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
@@ -697,21 +793,27 @@ fn updateDdnsServices(
     ip: []const u8,
     now_seconds: i64,
 ) !ServiceSummary {
+    // 預設值全部是 0/false；每個 provider 分支只改動自己對應的統計數與成功旗標。
     var summary = ServiceSummary{};
 
+    // Afraid 的最小有效設定只有 token。沒有 token 視為未設定，不計入 attempted。
     if (config.afraid.enabled and config.afraid.token.len != 0) {
         summary.attempted += 1;
+        // Zig 的 if 可以接收 error union：成功時執行第一個 block，失敗時將 error 綁定為 err。
         if (providers.updateAfraid(allocator, client, config.afraid)) {
             summary.succeeded += 1;
             summary.successes.mark(.afraid);
             shared_state.memoryWriteProviderSuccess(.afraid, ip, now_seconds);
         } else |err| {
+            // local 模式仍寫入 shared_state，讓 dashboard 能顯示失敗與下一次退避時間；
+            // 但不寫 Redis，因為本路徑代表 Redis 未啟用或不可用。
             summary.failed += 1;
             shared_state.memoryWriteProviderAttemptFailure(.afraid, ip, err, now_seconds);
             std.log.err("afraid update failed: {}", .{err});
         }
     }
 
+    // Dynu 需要 username 與 password 兩者；provider 函式自行將密碼雜湊後放進 URL。
     if (config.dynu.enabled and config.dynu.username.len != 0 and config.dynu.password.len != 0) {
         summary.attempted += 1;
         if (providers.updateDynu(allocator, client, config.dynu, ip)) {
@@ -725,6 +827,7 @@ fn updateDdnsServices(
         }
     }
 
+    // No-IP 除帳密外還至少要有一個 hostname；provider 函式會逐一更新全部 hostname。
     if (config.noip.enabled and config.noip.username.len != 0 and config.noip.password.len != 0 and config.noip.hostnames.len != 0) {
         summary.attempted += 1;
         if (providers.updateNoIp(allocator, client, config.noip, ip)) {
@@ -738,12 +841,15 @@ fn updateDdnsServices(
         }
     }
 
+    // 回傳 summary 而非立即決定 RefreshStatus，讓 refresh 可以統一處理「全未啟用」與「全失敗」。
     return summary;
 }
 
 // ============================================================================
 // 單元測試（Unit Tests）
 // ============================================================================
+// 測試和實作放在同一檔，能直接覆蓋 private helper；std.testing.allocator 也會偵測
+// 測試中遺漏的 free。網路測試的錯誤分支則刻意容許沒有外網的 CI 環境。
 
 test "normalize public ip trims and validates ipv4" {
     const normalized = try ip_lookup.normalizePublicIp(" 1.2.3.4\r\n");
