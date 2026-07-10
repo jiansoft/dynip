@@ -1,6 +1,5 @@
-//! 單一 process 內的 Dashboard HTTP server。
+﻿//! 單一 process 內的 Dashboard HTTP server。
 //!
-//! 給 Zig 新手的閱讀方向：
 //! - 這個檔案不負責 DDNS 更新，只負責「把記憶體狀態變成 HTTP 回應」。
 //! - 真正的 provider 狀態來自 `dashboard/service.zig`，再往下讀
 //!   `core/ddns.zig` 的 `getProviderSnapshots()`。
@@ -615,7 +614,6 @@ fn displayStatusLabel(status: service.DisplayStatus) []const u8 {
 
 /// 將 public IP 快照中的 STUN 結果轉成 dashboard 顯示字串。
 ///
-/// 給 Zig 新手：
 /// - `PublicIpSnapshot` 只保存「最後一輪 public IP lookup」的結果。
 /// - STUN 成功時，public IP 的來源就是 "stun"，錯誤欄位為空。
 /// - STUN 失敗但 HTTP fallback 成功時，來源會是 "ipify" 等 HTTP 服務，

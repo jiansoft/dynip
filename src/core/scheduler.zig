@@ -1,4 +1,4 @@
-//! DDNS 排程器。
+﻿//! DDNS 排程器。
 
 /// 匯入 Zig 標準函式庫。
 ///
@@ -61,6 +61,14 @@ pub fn runForever(
             config.ddns.redis.db,
         },
     );
+
+    // 啟動時檢查 Redis 是否可連線。
+    //
+    // - 這個函式會嘗試 PING Redis，如果失敗就設內部旗標，
+    //   後續所有 Redis 操作都會被跳過，改走本機記憶體快取。
+    // - 這樣 Redis 掛掉時，DDNS 更新仍然可以正常運作，
+    //   只是失去了跨行程防重複更新的能力。
+    ddns.checkRedisAvailability(allocator, io, config.ddns.redis);
 
     // 建立一個 HTTP 客戶端，整個服務生命週期重複使用它。
     // 這可以避免每一輪 refresh 都重新初始化 TLS 狀態（rescanning CA certificates）。

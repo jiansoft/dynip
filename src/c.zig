@@ -1,6 +1,5 @@
-//! 專案自用的 C / platform shim。
+﻿//! 專案自用的 C / platform shim。
 //!
-//! 給 Zig 新手：
 //! - `shim` 可以理解成「薄薄一層轉接器」。
 //! - 原本可以用 `translate-c` 把 C header 自動翻成 Zig declarations。
 //! - 但本專案只需要少數 C / Win32 API，自動翻譯整包 header 反而會讓
