@@ -43,27 +43,12 @@ pub const RefreshStatus = enum {
 /// 取得對外 IP 時，可能依序嘗試的來源站。
 ///
 /// - `enum` 就像其他語言的列舉型別，每個值代表一種 IP 查詢來源。
-/// - 目前有三大類：
-///   1. **純文字 HTTP**：ipify、ipconfig、ipinfo、seeip — 直接回傳 IP 字串。
-///   2. **JSON HTTP**：myip、bigdatacloud — 回傳 JSON，IP 藏在某個欄位裡。
-///   3. **非 HTTP 協定**：stun — 用 UDP 封包直接問 Google STUN 伺服器。
-///   4. **Cloudflare Trace**：cloudflare_trace — 走 HTTPS，但回傳格式是多行
+/// - 目前有兩大類：
+///   1. **非 HTTP 協定**：stun — 用 UDP 封包直接問 Google STUN 伺服器。
+///   2. **Cloudflare Trace**：cloudflare_trace — 走 HTTPS，但回傳格式是多行
 ///      `key=value` 純文字，需要逐行找 `ip=` 這一行。
 /// - STUN 和 Cloudflare Trace 是主要來源，每次 refresh 會輪流優先嘗試。
-///   其餘 HTTP 站是備用，只在兩個主要來源都失敗時才會用到。
 const PublicIpService = enum {
-    /// `https://api.ipify.org`
-    ipify,
-    /// `https://ipconfig.io/ip`
-    ipconfig,
-    /// `https://ipinfo.io/ip`
-    ipinfo,
-    /// `https://ipv4.seeip.org`
-    seeip,
-    /// `https://api.myip.com`
-    myip,
-    /// `https://api.bigdatacloud.net/data/client-ip`
-    bigdatacloud,
     /// `stun.l.google.com:19302`
     stun,
     /// `https://one.one.one.one/cdn-cgi/trace`
@@ -404,18 +389,6 @@ var process_provider_states: [3]ProcessProviderState = .{ .{}, .{}, .{} };
 const Endpoint = struct {
     /// 所有對外 IP 來源站的網址。
     const PublicIp = struct {
-        /// 直接回傳純文字 IP。
-        const ipify = "https://api.ipify.org";
-        /// 直接回傳純文字 IP。
-        const ipconfig = "https://ipconfig.io/ip";
-        /// 直接回傳純文字 IP。
-        const ipinfo = "https://ipinfo.io/ip";
-        /// 直接回傳純文字 IP。
-        const seeip = "https://ipv4.seeip.org";
-        /// 回傳 JSON，IP 欄位名稱是 `ip`。
-        const myip = "https://api.myip.com";
-        /// 回傳 JSON，IP 欄位名稱是 `ipString`。
-        const bigdatacloud = "https://api.bigdatacloud.net/data/client-ip";
         /// STUN 伺服器，格式為 `host:port`。
         ///
         /// 注意：STUN 不是 HTTP 協定，所以這裡沒有 `https://` 前綴，
@@ -441,29 +414,30 @@ const Endpoint = struct {
     const noip_update = "https://dynupdate.no-ip.com/nic/update";
 };
 
-/// 啟動時檢查 Redis 是否可以連線。
+/// 解析主機位址字串中的 Host 與 Port（支援 IPv4/IPv6 與主機名稱格式）。
 ///
-/// 如果設定裡 `redis.enabled = true` 但實際連不上，
-/// 就把 `redis_available` 設成 `false`，
-/// 並寫一筆 warning 日誌提醒維運。
-///
-/// 後續所有 Redis 操作都會先檢查 `redis_available`，
-/// 不可用時直接跳過，改走本機記憶體防重複更新。
-///
-/// - 這個函式是 `pub`（公開），讓 `scheduler.zig` 可以在啟動時呼叫。
-/// - `allocator` 和 `io` 是 `redis.ping()` 需要的參數。
-/// - `redis.ping()` 會嘗試建立 TCP 連線、送 PING 命令、等 PONG 回應。
-///   任何一步失敗都會回傳 error。
-/// - `catch |err|` 攔截所有錯誤，寫 log 後把旗標設成 false，不讓錯誤繼續往上傳。
+/// 語法說明與重點：
+/// 1. 回傳型別前的 `!` 代表「錯誤聯集（Error Union）」。這表示函式成功時會回傳後面定義的 struct，
+///    失敗時則會回傳一個錯誤值（例如 `error.InvalidRedisAddress`）。
+/// 2. `struct { host: []const u8, port: u16 }` 是一個「匿名結構體（Anonymous Struct）」。
+///    在 Zig 中，我們可以直接宣告並回傳一個結構體，不需要事先命名。
+/// 3. `orelse` 關鍵字用於處理「型別為 Optional（例如 `?usize`）的變數」。
+///    如果 `indexOfScalar` 找到字元，會回傳索引值；如果沒找到，會回傳 `null`。
+///    `orelse` 會在左側為 `null` 時執行右側的運算式（在此為直接 return 錯誤）。
+/// 4. `try` 關鍵字代表「如果右側的運算回傳錯誤，就立刻將該錯誤向上拋出給呼叫端」。
+///    在這裡，如果 `parseUnsigned` 解析埠號數字失敗，整個函式就會立刻中斷並回傳解析失敗的錯誤。
 fn parseHostPort(addr: []const u8) !struct { host: []const u8, port: u16 } {
     if (addr.len == 0) return error.InvalidRedisAddress;
+    // 處理 IPv6 字面值格式，例如 [::1]:6379
     if (addr[0] == '[') {
         const end_index = std.mem.indexOfScalar(u8, addr, ']') orelse return error.InvalidRedisAddress;
         if (end_index + 2 > addr.len or addr[end_index + 1] != ':') return error.InvalidRedisAddress;
+        // 切片（Slice）語法：`addr[1..end_index]` 取得中括號內部的子字串。
         const host = addr[1..end_index];
         const port = try std.fmt.parseUnsigned(u16, addr[end_index + 2 ..], 10);
         return .{ .host = host, .port = port };
     } else {
+        // 處理標準格式，例如 127.0.0.1:6379 或 localhost:6379
         const colon_index = std.mem.indexOfScalar(u8, addr, ':') orelse return error.InvalidRedisAddress;
         const host = addr[0..colon_index];
         const port = try std.fmt.parseUnsigned(u16, addr[colon_index + 1 ..], 10);
@@ -471,6 +445,20 @@ fn parseHostPort(addr: []const u8) !struct { host: []const u8, port: u16 } {
     }
 }
 
+/// 測試指定的 TCP 主機與連接埠是否可以連線。
+///
+/// 語法說明與重點：
+/// 1. `_ = allocator;` 這是 Zig 的一項嚴格限制：宣告但未使用的變數會導致編譯錯誤。
+///    如果某個參數是為了符合介面規範而存在但不會用到，必須以 `_ = 變數名;` 的方式明確告訴編譯器要忽略它。
+/// 2. `catch blk: { ... }` 是一個「區塊表達式（Block Expression）」。
+///    In Zig 中，大括號 `{}` 也是一個表達式，可以給它一個標籤（此處為 `blk:`）。
+///    當左側的 `IpAddress.parse` 發生錯誤被 `catch` 攔截時，會執行區塊內的程式碼，
+///    並以 `break :blk 值;` 將區塊最後的運算結果作為整個表達式的回傳值。
+/// 3. `defer` 關鍵字用於「延遲執行」。
+///    不論此函式是正常 return 還是中途因為錯誤中斷跳出，在離開當前大括號範圍之前，
+///    都保證會執行 `defer` 後面的陳述式（例如關閉 Socket 釋放資源）。
+/// 4. 這裡使用 `ws2_32.connect` (Windows) 和 `system.connect` (POSIX) 進行標準阻塞連線。
+///    這是為了避開 Zig 異步 I/O 底層（IOCP/Threaded）在連線超時時，會強行向 stderr 印出 debug 堆疊軌跡的行為。
 fn checkTcpPortReachable(allocator: std.mem.Allocator, io: std.Io, host: []const u8, port: u16) !void {
     _ = allocator;
     try ensureWindowsSocketsStarted();
@@ -483,6 +471,7 @@ fn checkTcpPortReachable(allocator: std.mem.Allocator, io: std.Io, host: []const
         var canonical_name_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
         var lookup_buffer: [1]std.Io.net.HostName.LookupResult = undefined;
         var lookup_queue: std.Io.Queue(std.Io.net.HostName.LookupResult) = .init(&lookup_buffer);
+        // 在背景執行緒解析 DNS
         var lookup_future = io.async(std.Io.net.HostName.lookup, .{ host_name, io, &lookup_queue, .{
             .port = port,
             .canonical_name_buffer = &canonical_name_buffer,
@@ -517,11 +506,23 @@ fn checkTcpPortReachable(allocator: std.mem.Allocator, io: std.Io, host: []const
     defer closeSocket(socket);
 
     switch (posix_addr) {
+        // 指標與強制轉型：
+        // `*addr` 取得變數的指標。在呼叫外部 C 語言/系統 API 時，需要傳送指標。
+        // `@ptrCast(addr)` 將指標型別轉為通用指標類型，以適應系統 API 參數。
         .ip4 => |*addr| try connectSocket(socket, addr, @sizeOf(std.posix.sockaddr.in)),
         .ip6 => |*addr| try connectSocket(socket, addr, @sizeOf(std.posix.sockaddr.in6)),
     }
 }
 
+/// 啟動時檢查 Redis 是否可以連線。
+///
+/// 語法說明與重點：
+/// 1. `pub` 關鍵字：代表此函式是「公開的（Public）」。這樣一來，其他檔案（如 `scheduler.zig`）
+///    在 `@import` 這個模組後，才有權限呼叫這個函式。
+/// 2. `catch |err|` 錯誤捕獲：
+///    `checkTcpPortReachable` 可能回傳網路錯誤。我們使用 `catch |err|` 攔截該錯誤，
+///    將其轉為警告日誌並設 `redis_available = false` 後就直接 `return` 結束。
+///    這樣可以確保連線失敗時「不會拋出錯誤給呼叫端」，讓排程器主流程不會因為 Redis 暫時斷線而整個崩潰停止。
 pub fn checkRedisAvailability(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -553,18 +554,14 @@ pub fn checkRedisAvailability(
 
 /// 根據 Redis 實際可用狀態，回傳有效的 Redis 設定。
 ///
-/// - 如果 Redis 可用，直接回傳原始設定（enabled = true）。
-/// - 如果 Redis 不可用，回傳一份 `enabled = false` 的複本。
-///   這樣 `isDedupeHit()` 和 `rememberDedupe()` 裡面原本的
-///   `if (!redis_config.enabled)` 判斷就會走本機快取路徑，
-///   不需要修改那些函式的內部邏輯。
+/// 語法說明與重點：
+/// 1. 參數與回傳值：接收一份原始設定，並回傳一份新的設定。
+/// 2. 結構體的值語意（Value Semantics）：
+///    在 Zig 中，結構體變數的指派與傳遞預設是「複製值」。
+///    `var copy = original;` 會在記憶體中建立一份完整的複本。
+///    我們修改 `copy.enabled = false` 只有改變這份複本的值，完全不會影響原始的設定。
 fn redisConfigForCurrentState(original: config_mod.Redis) config_mod.Redis {
     if (redis_available) return original;
-    // 複製一份設定，只改 `enabled` 為 false。
-    //
-    // - Zig 的 struct 是值語意（value semantics），賦值就是複製。
-    //   `var copy = original;` 會把整個 struct 內容複製一份。
-    //   修改 `copy.enabled` 不會影響原本的 `original`。
     var copy = original;
     copy.enabled = false;
     return copy;
@@ -2062,18 +2059,7 @@ fn getPublicIp(
     else
         .{ .cloudflare_trace, .stun };
 
-    // HTTP 來源當 fallback，避免兩個主要來源都被擋時整輪失敗。
-    //
-    // - `[_]` 裡的 `_` 代表「讓編譯器自己算陣列長度」。
-    //   這裡有 6 個元素，所以編譯器會推斷成 `[6]PublicIpService`。
-    const http_fallbacks = [_]PublicIpService{
-        .ipify,
-        .ipconfig,
-        .ipinfo,
-        .seeip,
-        .myip,
-        .bigdatacloud,
-    };
+
 
     // ── 第二步：準備錯誤摘要 buffer ─────────────────────────────────
     //
@@ -2115,12 +2101,7 @@ fn getPublicIp(
             return lookup;
         }
     }
-    // 主要來源都失敗，改試 HTTP fallback。
-    for (http_fallbacks) |service| {
-        if (tryFetchFromService(allocator, client, service, &error_writer, &stun_error)) |lookup| {
-            return lookup;
-        }
-    }
+
 
     // 走到這裡代表全部來源站都失敗。
     std.log.err("failed to get public ip from all services: {s}", .{error_writer.buffered()});
@@ -2223,12 +2204,6 @@ fn fetchPublicIpFromService(
 
     // `switch` 會根據來源站種類，決定要打哪個 API 或怎麼解析回應。
     return switch (service) {
-        // 這四個站都直接回純文字 IP，所以共用同一個輔助函式。
-        .ipify, .ipconfig, .ipinfo, .seeip => fetchTextIp(allocator, client, url),
-        // `myip` 會回 JSON，所以走 JSON 解析輔助函式。
-        .myip => fetchMyIpJson(allocator, client, url),
-        // `bigdatacloud` 也回 JSON，但欄位名稱不同，所以走另一個輔助函式。
-        .bigdatacloud => fetchBigDataCloudJson(allocator, client, url),
         // STUN 協定分支，不使用 HTTP client，改用 UDP socket。
         //
         // - `client.io` 是從 HTTP client 裡拿出 I/O handle。
@@ -2249,38 +2224,12 @@ fn fetchPublicIpFromService(
 ///   這保證新增 enum 值時不會忘記加對應的網址。
 fn publicIpServiceUrl(service: PublicIpService) []const u8 {
     return switch (service) {
-        .ipify => Endpoint.PublicIp.ipify,
-        .ipconfig => Endpoint.PublicIp.ipconfig,
-        .ipinfo => Endpoint.PublicIp.ipinfo,
-        .seeip => Endpoint.PublicIp.seeip,
-        .myip => Endpoint.PublicIp.myip,
-        .bigdatacloud => Endpoint.PublicIp.bigdatacloud,
         .stun => Endpoint.PublicIp.stun,
         .cloudflare_trace => Endpoint.PublicIp.cloudflare_trace,
     };
 }
 
-/// 從「直接回純文字 IP」的來源站抓取對外 IP。
-fn fetchTextIp(
-    allocator: std.mem.Allocator,
-    client: *std.http.Client,
-    url: []const u8,
-) ![]const u8 {
-    // 這類來源站直接回傳純文字 IP，所以只要 GET 之後做基本檢查即可。
-    const response = try http.fetchText(allocator, client, url, &.{}, .{
-        .connect_timeout = public_ip_connect_timeout,
-    });
-    // `response.body` 是動態配置出來的字串，用完一定要釋放。
-    defer allocator.free(response.body);
 
-    // HTTP 不是 2xx 的話，這裡就會直接回錯。
-    try http.ensureSuccessStatus(response.status, response.body);
-    // 把 body 裡可能的空白、換行整理掉，順便驗證這真的是 IP。
-    const normalized = try normalizePublicIp(response.body);
-    // `normalized` 只是指向 `response.body` 裡的一段 slice。
-    // 因為後面會 `free(response.body)`，所以這裡要另外複製一份給呼叫端持有。
-    return allocator.dupe(u8, normalized);
-}
 
 /// 從 Cloudflare Trace 回應中取出對外 IP。
 ///
@@ -2767,74 +2716,7 @@ fn fetchStunIp(allocator: std.mem.Allocator, io: std.Io, stun_endpoint: []const 
     return try parseStunResponse(allocator, response[0..recv_len], transaction_id);
 }
 
-/// 從 `api.myip.com` 的 JSON 回應中取出對外 IP。
-fn fetchMyIpJson(
-    allocator: std.mem.Allocator,
-    client: *std.http.Client,
-    url: []const u8,
-) ![]const u8 {
-    // 這個來源站回的是 JSON，不是純文字 IP。
-    // 真正網址不寫死在這裡，而是由呼叫端從集中管理區塊傳進來。
-    const response = try http.fetchText(allocator, client, url, &.{}, .{
-        .connect_timeout = public_ip_connect_timeout,
-    });
-    defer allocator.free(response.body);
 
-    // 先處理 HTTP 層面的成功 / 失敗。
-    try http.ensureSuccessStatus(response.status, response.body);
-
-    // 這個匿名 struct 只描述我們這次真正要用到的欄位。
-    const Parsed = struct {
-        // `api.myip.com` 的 JSON 會有 `"ip": "1.2.3.4"` 這種欄位。
-        ip: []const u8,
-    };
-    // 用標準庫 JSON 解析器把回應內容反序列化。
-    const parsed = try std.json.parseFromSlice(Parsed, allocator, response.body, .{
-        // 其他欄位像 country / cc 我們目前沒用到，所以忽略它們。
-        .ignore_unknown_fields = true,
-    });
-    // `parsed` 內部也持有記憶體，所以用完要 deinit。
-    defer parsed.deinit();
-
-    // 取出 JSON 裡的 `ip` 欄位，再做一次標準化與驗證。
-    const normalized = try normalizePublicIp(parsed.value.ip);
-    // 同樣複製一份新的字串給呼叫端。
-    return allocator.dupe(u8, normalized);
-}
-
-/// 從 BigDataCloud 的 JSON 回應中取出對外 IP。
-fn fetchBigDataCloudJson(
-    allocator: std.mem.Allocator,
-    client: *std.http.Client,
-    url: []const u8,
-) ![]const u8 {
-    // 這個來源站也回 JSON。
-    // 真正網址同樣由呼叫端從集中管理區塊傳進來。
-    const response = try http.fetchText(allocator, client, url, &.{}, .{
-        .connect_timeout = public_ip_connect_timeout,
-    });
-    defer allocator.free(response.body);
-
-    // 先確認 HTTP 請求本身沒失敗。
-    try http.ensureSuccessStatus(response.status, response.body);
-
-    // BigDataCloud 的欄位名稱是 `ipString`。
-    const Parsed = struct {
-        // 對應 JSON 裡的 `"ipString": "1.2.3.4"`。
-        ipString: []const u8,
-    };
-    // 把 body 反序列化成只含 `ipString` 欄位的 struct。
-    const parsed = try std.json.parseFromSlice(Parsed, allocator, response.body, .{
-        .ignore_unknown_fields = true,
-    });
-    // JSON parser 內部配置的記憶體要記得清掉。
-    defer parsed.deinit();
-
-    // 把欄位值整理成穩定的 IP 格式。
-    const normalized = try normalizePublicIp(parsed.value.ipString);
-    // 再複製一份可長期持有的字串回傳出去。
-    return allocator.dupe(u8, normalized);
-}
 
 /// 將第三方回傳的文字修正成穩定的 IP 格式。
 fn normalizePublicIp(text: []const u8) ![]const u8 {
@@ -2868,12 +2750,6 @@ fn containsGoodOrNochg(text: []const u8) bool {
 ///   新增 enum 值時忘記加這裡就會編譯失敗。
 fn serviceName(service: PublicIpService) []const u8 {
     return switch (service) {
-        .ipify => "ipify",
-        .ipconfig => "ipconfig",
-        .ipinfo => "ipinfo",
-        .seeip => "seeip",
-        .myip => "myip",
-        .bigdatacloud => "bigdatacloud",
         .stun => "stun",
         .cloudflare_trace => "cloudflare",
     };
