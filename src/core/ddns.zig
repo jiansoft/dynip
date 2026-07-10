@@ -10,18 +10,22 @@
 ///
 /// 例如目前是不是 Windows，就會從這裡判斷。
 const builtin = @import("builtin");
+
 /// 匯入 Zig 標準函式庫。
 ///
 /// HTTP 客戶端、字串處理、JSON、記憶體配置等通用能力都從這裡來。
 const std = @import("std");
+
 /// 匯入本專案的設定模組。
 ///
 /// 這樣 DDNS 流程就能讀到 `app.json` / `.env` 載入後的設定值。
 const config_mod = @import("../base/config.zig");
+
 /// 匯入本專案的 Redis 客戶端。
 ///
 /// DDNS 防重複更新現在要真的查 Redis，所以更新流程會呼叫這個模組。
 const redis = @import("../io/redis.zig");
+
 /// 匯入共用 HTTP 文字抓取與日誌輔助。
 const http = @import("../io/http.zig");
 
@@ -40,7 +44,7 @@ pub const RefreshStatus = enum {
     skipped_maintenance_window,
 };
 
-/// 取得對外 IP 時，可能依序嘗試的來源站。
+/// 取得對外 IP時，可能依序嘗試的來源站。
 ///
 /// - `enum` 就像其他語言的列舉型別，每個值代表一種 IP 查詢來源。
 /// - 目前有兩大類：
@@ -74,14 +78,14 @@ const PublicIpLookup = struct {
     /// 成功取得的 public IP 字串。
     ///
     /// 這個 slice 的生命週期跟 `getPublicIp()` 使用的 allocator 相關。
-    /// 目前呼叫端用 arena allocator，所以整輪 refresh 結束前都有效。
+    /// 目前物理上呼叫端用 arena allocator，所以整輪 refresh 結束前都有效。
     ip: []const u8,
-    /// 實際成功的來源服務，例如 `.stun` 或 `.ipify`。
+    /// 實際成功的來源服務，例如 `.stun` 或 `.cloudflare_trace`。
     service: PublicIpService,
     /// 如果 STUN 有被嘗試但失敗，這裡保存錯誤名稱。
     ///
-    /// STUN 固定排第一個，所以 fallback 到 ipify 時，Dashboard 可以顯示
-    /// "STUN: failed (ReceiveFailed)"，而不是只看到最後成功的 ipify。
+    /// STUN 固定排第一個，所以 fallback 到 cloudflare 時，Dashboard 可以顯示
+    /// "STUN: failed (ReceiveFailed)"，而不是只看到最後成功的來源。
     stun_error: ?[]const u8 = null,
 };
 
@@ -108,6 +112,8 @@ const ProviderSuccesses = struct {
     ///
     /// 通常在 DDNS API 回傳成功後立即呼叫，
     /// 讓後續寫 Redis 時知道哪些 provider 要記錄。
+    ///
+    /// 傳入 `self: *ProviderSuccesses` 指針以修改結構體狀態。
     fn mark(self: *ProviderSuccesses, provider: DdnsProvider) void {
         switch (provider) {
             .afraid => self.afraid = true,
@@ -120,6 +126,8 @@ const ProviderSuccesses = struct {
     ///
     /// 用於寫 Redis 前篩選：只對成功的 provider 寫入 IP 記錄，
     /// 避免把失敗 provider 的舊 IP 覆蓋掉成功的那筆。
+    ///
+    /// 傳入 `self: ProviderSuccesses` 值複本以進行唯讀檢查。
     fn includes(self: ProviderSuccesses, provider: DdnsProvider) bool {
         return switch (provider) {
             .afraid => self.afraid,
@@ -191,6 +199,8 @@ const provider_retry_initial_delay_seconds: i64 = 30;
 const provider_retry_max_delay_seconds: i64 = 15 * 60;
 
 /// 同一個行程內最近一次成功處理過的 public IP。
+///
+/// 使用 `std.atomic.Mutex` 保護共享資料，避免背景更新執行緒與 Dashboard API 執行緒讀寫 Race Condition。
 const ProcessPublicIpState = struct {
     /// 保護整份狀態的互斥鎖。
     mutex: std.atomic.Mutex = .unlocked,
@@ -199,10 +209,11 @@ const ProcessPublicIpState = struct {
     /// 最近一次成功處理過的 IP 長度。
     len: usize = 0,
     /// public IPv4 / IPv6 文字都很短，用固定 buffer 就夠。
+    /// 這樣可以避免為了暫存 IP 字串而去配置 heap 記憶體，提升效能並降低零碎記憶體的產生。
     buffer: [64]u8 = undefined,
     /// 最近一次 public IP 是由哪個來源服務取得。
     ///
-    /// 例如 "stun" / "ipify"。Dashboard 會讀這個欄位顯示在 Public IP 旁邊。
+    /// 例如 "stun" / "cloudflare"。Dashboard 會讀這個欄位顯示在 Public IP 旁邊。
     source_len: usize = 0,
     /// 來源服務名稱很短，固定 buffer 可以避免為了 dashboard 狀態配置 heap 記憶體。
     source: [16]u8 = undefined,
@@ -215,6 +226,8 @@ const ProcessPublicIpState = struct {
 };
 
 /// 對外公開的 public IP 狀態快照（值語意，複製自 process-level 記憶體）。
+///
+/// 呼叫端獲取此結構後，因為是獨立的複製資料，所以不需要再持有鎖，也不需要手動釋放記憶體。
 pub const PublicIpSnapshot = struct {
     /// 是否已經取得並記錄過 IP。
     initialized: bool = false,
@@ -259,7 +272,7 @@ pub const ProviderSnapshot = struct {
     name: [8]u8 = undefined,
     /// `name` buffer 中實際有效 byte 數。
     name_len: usize = 0,
-    /// false 代表服務剛啟動，該 provider 尚未寫入任何狀態。
+    /// false 代表服務剛啟動，該 provider 尚未寫入 any 狀態。
     initialized: bool = false,
 
     /// 最後一次成功更新到 provider 的 IP。
@@ -329,7 +342,7 @@ const ProcessProviderState = struct {
 
 /// 寫 HTTP body 預覽時，最多保留的字元數。
 const http_log_body_preview_len = http.body_preview_len;
-/// Public IP lookup 只需要很短的 DNS / TCP connect timeout。
+/// Public IP lookup 只需要很短 of DNS / TCP connect timeout。
 const public_ip_connect_timeout: std.Io.Timeout = .{ .duration = .{
     .raw = .fromSeconds(3),
     .clock = .awake,
@@ -346,8 +359,12 @@ const LocalDedupeEntry = struct {
 };
 /// 本機防重複更新狀態的互斥鎖。
 var local_dedupe_mutex: std.atomic.Mutex = .unlocked;
+
 /// 本機防重複更新用的記憶體快取。
+///
+/// 使用 `ArrayListUnmanaged` 減少結構體大小，調用增減方法時需顯式傳入 `allocator`。
 var local_dedupe_entries: std.ArrayListUnmanaged(LocalDedupeEntry) = .empty;
+
 /// 超過這個容量才考慮回收本機 dedupe 容量。
 const local_dedupe_shrink_min_capacity: usize = 32;
 
@@ -451,7 +468,7 @@ fn parseHostPort(addr: []const u8) !struct { host: []const u8, port: u16 } {
 /// 1. `_ = allocator;` 這是 Zig 的一項嚴格限制：宣告但未使用的變數會導致編譯錯誤。
 ///    如果某個參數是為了符合介面規範而存在但不會用到，必須以 `_ = 變數名;` 的方式明確告訴編譯器要忽略它。
 /// 2. `catch blk: { ... }` 是一個「區塊表達式（Block Expression）」。
-///    In Zig 中，大括號 `{}` 也是一個表達式，可以給它一個標籤（此處為 `blk:`）。
+///    在 Zig 中，大括號 `{}` 也是一個表達式，可以給它一個標籤（此處為 `blk:`）。
 ///    當左側的 `IpAddress.parse` 發生錯誤被 `catch` 攔截時，會執行區塊內的程式碼，
 ///    並以 `break :blk 值;` 將區塊最後的運算結果作為整個表達式的回傳值。
 /// 3. `defer` 關鍵字用於「延遲執行」。
@@ -551,7 +568,6 @@ pub fn checkRedisAvailability(
     std.log.info("redis connectivity check passed: addr={s}", .{redis_config.addr});
 }
 
-
 /// 根據 Redis 實際可用狀態，回傳有效的 Redis 設定。
 ///
 /// 語法說明與重點：
@@ -582,6 +598,8 @@ pub fn refresh(
 
     // 建立一個 arena allocator，讓這一輪更新檢查內的暫時字串與 JSON 解析結果
     // 都集中配置在同一塊記憶體裡。
+    //
+    // 使用 `ArenaAllocator` 管理這一輪 refresh 中的暫時記憶體，結束時一併釋放。
     var arena = std.heap.ArenaAllocator.init(allocator);
     // 這一輪更新檢查結束時，把 arena 一次整包釋放掉。
     defer arena.deinit();
@@ -598,8 +616,8 @@ pub fn refresh(
         // IP 沒變仍然重寫一次來源。
         //
         // 原因：Dashboard 顯示的是「本次成功查詢 public IP 的來源」。
-        // 假設上一輪 STUN 失敗走 ipify，下一輪 STUN 成功但 IP 相同；
-        // 如果這裡直接 return，畫面會繼續顯示 ipify，看起來像 STUN 沒生效。
+        // 假設上一輪 STUN 失敗走 cloudflare，下一輪 STUN 成功但 IP 相同；
+        // 如果這裡直接 return，畫面會繼續顯示 cloudflare，看起來像 STUN 沒生效。
         rememberLastProcessedIp(ip_now, ip_source, public_ip_lookup.stun_error);
         std.log.info(
             "skip ddns refresh because public ip is unchanged in current process: {s}",
@@ -1007,7 +1025,7 @@ fn lockProcessProviderStates() void {
 
 /// 複製 slice 到固定 buffer，超過容量時截斷。
 fn copyToFixedBuffer(buffer: anytype, len: *usize, value: []const u8) void {
-    // @min 確保不會寫超過固定 buffer 容量。
+    // @min 確保不會寫超過固定 buffer容量。
     const copy_len = @min(value.len, buffer.len);
     // Zig 的 @memcpy 要求來源和目的長度一致，所以先切成相同長度 slice。
     if (copy_len != 0) @memcpy(buffer[0..copy_len], value[0..copy_len]);
@@ -1030,7 +1048,7 @@ fn isSameAsLastProcessedIp(ip: []const u8) bool {
 
 /// 把這次已成功處理的 public IP 記到行程內狀態。
 ///
-/// `source` 是 public IP 查詢來源，例如 "stun"。
+/// source 是 public IP 來源，例如 "stun"。
 /// 這個函式會把 IP 和來源都 copy 進固定 buffer，呼叫端之後就算釋放 arena，
 /// Dashboard 仍可安全讀到最後一筆狀態。
 fn rememberLastProcessedIp(ip: []const u8, source: []const u8, stun_error: ?[]const u8) void {
@@ -1480,18 +1498,10 @@ fn updateDdnsServicesReconciled(
     now_seconds: i64,
 ) !ServiceSummary {
     // 這個 summary 是本輪 reconcile 的總帳。
-    //
-    // `configured`：設定完整、應納入管理的 provider 數量。
-    // `attempted`：本輪真的打了 DDNS API 的 provider 數量。
-    // `succeeded`：本輪打 API 且成功的 provider 數量。
-    // `already_current`：原本就已經是 desired IP，所以跳過的 provider 數量。
-    // `retry_deferred`：前次失敗後仍在 backoff 等待中的 provider 數量。
-    // `failed`：本輪實際嘗試但失敗的 provider 數量。
     var summary = ServiceSummary{};
 
     // `ttl_seconds` 目前在上層寫 desired IP 與 legacy key 時使用。
-    // 這裡保留參數形狀，是為了讓呼叫端語意清楚：
-    // 「這整輪 reconcile 是帶著同一組 TTL 執行」。
+    // 這裡保留參數形狀，是為了讓呼叫端語意清楚。
     _ = ttl_seconds;
 
     // 三家 provider 逐一 reconcile。
@@ -1801,9 +1811,9 @@ fn saveProviderFailure(
 /// 根據累計的失敗次數，計算本次應該等待多少秒才能重試（exponential backoff）。
 ///
 /// 計算規則：
-/// - `retry_count == 0`：回傳初始延遲（`provider_retry_initial_delay_seconds` = 30 秒）。
+/// - `retry_count == 0`：回傳初始延遲（30 秒）。
 /// - `retry_count >= 1`：以初始延遲為基底，每次失敗延遲翻倍（2 的次方）。
-/// - 上限為 `provider_retry_max_delay_seconds`（= 15 分鐘）。
+/// - 上限為 15 分鐘。
 ///
 /// 範例（初始延遲 30 秒）：
 /// - retry 1 → 30s
@@ -1961,7 +1971,7 @@ fn updateNoIp(
     config: config_mod.NoIp,
     ip: []const u8,
 ) !void {
-    // No-IP 是用 HTTP Basic Auth，所以先把帳密轉成 header 值。
+    // No-IP 是用 HTTP Basic Auth，所以先把帳密轉成 header值。
     const auth_value = try buildBasicAuthorization(allocator, config.username, config.password);
     // 把 authorization header 放進固定長度陣列。
     const headers = [_]std.http.Header{
@@ -2011,7 +2021,7 @@ fn containsExpectedAfraidResponse(body: []const u8) bool {
 ///   - 偶數輪 (0, 2, 4, ...) → 先試 STUN，再試 Cloudflare Trace。
 ///   - 奇數輪 (1, 3, 5, ...) → 先試 Cloudflare Trace，再試 STUN。
 /// - 不管主要來源成功或失敗，計數器都會 +1，確保下一輪一定切換。
-/// - HTTP 來源（ipify、ipconfig 等）保留當 fallback，不參與輪換。
+/// - HTTP 來源保留當 fallback，不參與輪換。
 ///
 /// 為什麼要輪換？
 /// - STUN 走 UDP，某些公司防火牆會擋 UDP 出站。
@@ -2059,8 +2069,6 @@ fn getPublicIp(
     else
         .{ .cloudflare_trace, .stun };
 
-
-
     // ── 第二步：準備錯誤摘要 buffer ─────────────────────────────────
     //
     // 如果所有來源都失敗，就把每個錯誤接起來，最後一次打出。
@@ -2102,9 +2110,8 @@ fn getPublicIp(
         }
     }
 
-
     // 走到這裡代表全部來源站都失敗。
-    std.log.err("failed to get public ip from all services: {s}", .{error_writer.buffered()});
+    std.log.err("failed to get public ip from all services: {s}", .{error_buffer[0..error_writer.bytes_written]});
     return error.PublicIpLookupFailed;
 }
 
@@ -2114,7 +2121,7 @@ fn getPublicIp(
 ///   寫一模一樣的「嘗試 → 成功回傳 / 失敗記錄」邏輯。
 /// - 回傳型別是 `?PublicIpLookup`（optional）：
 ///   - 成功 → 回傳 `PublicIpLookup` struct。
-///   - 失敗 → 回傳 `null`，讓呼叫端知道要繼續試下一站。
+///   - 失敗 → 回傳 `null`，讓呼叫端 know 要繼續試下一站。
 ///
 /// 參數說明：
 /// - `error_writer`: 指向固定大小 buffer 的 writer，用來累積錯誤摘要。
@@ -2187,7 +2194,7 @@ fn appendPublicIpLookupError(
     service: PublicIpService,
     err: anyerror,
 ) void {
-    if (writer.buffered().len != 0) {
+    if (writer.bytes_written != 0) {
         writer.writeAll(" | ") catch return;
     }
     writer.print("{s}: {}", .{ serviceName(service), err }) catch {};
@@ -2228,8 +2235,6 @@ fn publicIpServiceUrl(service: PublicIpService) []const u8 {
         .cloudflare_trace => Endpoint.PublicIp.cloudflare_trace,
     };
 }
-
-
 
 /// 從 Cloudflare Trace 回應中取出對外 IP。
 ///
@@ -2291,7 +2296,7 @@ fn fetchCloudflareTraceIp(
         const trimmed_line = if (line.len > 0 and line[line.len - 1] == '\r') line[0 .. line.len - 1] else line;
 
         // - `std.mem.startsWith()` 檢查 slice 是不是以指定前綴開頭，回傳 bool。
-        // - `"ip=".len` 是編譯期就知道的常數 3（`i`, `p`, `=` 三個字元）。
+        // - `"ip=".len` 是編譯期 know 的常數 3（`i`, `p`, `=` 三個字元）。
         //   Zig 的字串字面值（string literal）型別是 `*const [N:0]u8`，
         //   `.len` 可以直接拿到長度。
         // - `trimmed_line["ip=".len..]` 是「從第 3 個 byte 開始到結尾」的子 slice。
@@ -2314,17 +2319,9 @@ fn fetchCloudflareTraceIp(
 
 /// 解析 STUN 伺服器回傳的 Binding Response。
 ///
-/// STUN Binding Response 的基本格式：
-/// - 前 20 bytes 是 STUN header。
-/// - header 後面是一串 attributes。
-/// - 我們需要的 attribute 是 XOR-MAPPED-ADDRESS (`0x0020`)。
-///
-/// 這個函式只做「解析封包」：
-/// - 不碰 socket。
-/// - 不碰 DNS。
-/// - 不寫全域狀態。
-///
-/// 這樣測試可以直接餵固定 byte array，驗證 parser 是否正確。
+/// 遵循 RFC 5389 協定格式，尋找 XOR-MAPPED-ADDRESS (0x0020) 屬性。
+/// IP 位址在傳輸時會與 Magic Cookie（IPv4）或 Magic Cookie + Transaction ID（IPv6）進行 XOR 混淆，
+/// 藉此避免 NAT 路由器誤判並修改 payload，此處進行 XOR 運算還原。
 fn parseStunResponse(
     allocator: std.mem.Allocator,
     response: []const u8,
@@ -2365,7 +2362,7 @@ fn parseStunResponse(
         //
         // 這是現代 STUN 最常用來回報「伺服器看到的來源 IP/port」的欄位。
         // 它不是明文 IP，而是用 magic cookie 和 transaction id 做 XOR，
-        // 目的是避免某些 NAT 裝置誤判 payload 裡的 IP 字串並亂改封包。
+        // 目的是避免某些 NAT 裝置誤判 payload 裡的 IP 字串並變更封包。
         if (attr_type == 0x0020) {
             if (attr_len < 8) return error.InvalidXorMappedAddressLength;
             // value 格式前兩 bytes：
@@ -2406,7 +2403,7 @@ fn parseStunResponse(
         }
         // Attribute value 後面可能有 padding。
         // STUN 規定每個 attribute 都要 4-byte aligned，
-        // `(attr_len + 3) & ~3` 是常見的「向上補到 4 的倍數」寫法。
+        // `(attr_len + 3) & ~3` 是常見的「向上補到 4 的倍數」二進位遮罩寫法。
         offset += (attr_len + 3) & ~@as(usize, 3);
     }
 
@@ -2441,14 +2438,10 @@ fn ipAddressToPosix(a: std.Io.net.IpAddress) union(enum) { ip4: std.posix.sockad
     };
 }
 
-/// 把 libc/socket API 回傳值轉成 Zig `std.posix.socket_t`。
+/// 將 C API 回傳的 socket 轉型為 Zig 的 std.posix.socket_t。
 ///
-/// 這版 Zig 0.17-dev 在 Windows + libc path 下，
-/// `std.posix.system.socket()` 回傳值型別仍走 `c_int`。
-/// 但 `std.posix.socket_t` 在 Windows 是 HANDLE-like pointer。
-/// 因此 Windows 分支需要把整數 bit pattern 轉成 pointer。
-///
-/// 非 Windows 的 socket fd 本來就是整數，直接 `@intCast` 即可。
+/// Windows 平台的 SOCKET 本質上為 Handle 指針，而 POSIX 平台為整數描述符。
+/// 此處在編譯期（comptime）判定平台，並以 @bitCast 與 @ptrFromInt 進行位元級強制轉型。
 fn castSocket(rc: anytype) std.posix.socket_t {
     if (comptime builtin.os.tag == .windows) {
         return @ptrFromInt(@as(usize, @bitCast(@as(isize, rc))));
@@ -2482,6 +2475,7 @@ fn createUdpSocket(family: std.posix.sa_family_t) !std.posix.socket_t {
     return castSocket(rc);
 }
 
+/// 建立 TCP socket。
 fn createTcpSocket(family: std.posix.sa_family_t) !std.posix.socket_t {
     try ensureWindowsSocketsStarted();
 
@@ -2716,8 +2710,6 @@ fn fetchStunIp(allocator: std.mem.Allocator, io: std.Io, stun_endpoint: []const 
     return try parseStunResponse(allocator, response[0..recv_len], transaction_id);
 }
 
-
-
 /// 將第三方回傳的文字修正成穩定的 IP 格式。
 fn normalizePublicIp(text: []const u8) ![]const u8 {
     // 先把前後空白、CRLF 去掉。
@@ -2898,6 +2890,7 @@ fn buildBasicAuthorization(
 fn shouldSkipMaintenanceWindow() bool {
     // Windows 沒有 `localtime_r`，所以改走 Win32 API `GetLocalTime`。
     if (builtin.os.tag == .windows) {
+        // 使用 extern struct 確保結構體記憶體佈局符合 C ABI，以便安全地傳遞給 Windows API。
         const SYSTEMTIME = extern struct {
             wYear: u16,
             wMonth: u16,
@@ -2929,19 +2922,20 @@ fn shouldSkipMaintenanceWindow() bool {
     }
 }
 
+/// 根據傳入的「時」與「分」，判斷是否落在凌晨維護時段（02:00–02:04）。
+///
 /// 真正的規則很單純：
 /// 只要時間落在 02:00 到 02:04，就跳過。
-/// 根據傳入的「時」與「分」，判斷是否落在凌晨維護時段（02:00–02:04）。
 ///
 /// 這個函式把「取得本地時間」與「判斷規則」拆開，
 /// 讓測試可以直接傳入固定的時間值，不需要真的等到凌晨兩點才能測試。
-///
-/// 維護時段規則：
-/// - `hour == 2` 且 `minute` 在 0–4（含）之間 → 回傳 `true`（跳過更新）。
-/// - 其他時間 → 回傳 `false`（正常更新）。
 fn shouldSkipMaintenanceWindowAt(hour: c_int, minute: c_int) bool {
     return hour == 2 and minute >= 0 and minute < 5;
 }
+
+// ============================================================================
+// 單元測試（Unit Tests）
+// ============================================================================
 
 test "normalize public ip trims and validates ipv4" {
     // 測純文字 IP 前後夾了空白與換行時，仍能被清成乾淨格式。
@@ -3173,9 +3167,9 @@ test "process local public ip state skips unchanged ip" {
     try std.testing.expectEqualStrings("stun", snapshot.sourceSlice());
     try std.testing.expectEqualStrings("", snapshot.stunErrorSlice());
 
-    rememberLastProcessedIp("1.2.3.4", "ipify", "ReceiveFailed");
+    rememberLastProcessedIp("1.2.3.4", "cloudflare", "ReceiveFailed");
     const fallback_snapshot = getPublicIpSnapshot();
-    try std.testing.expectEqualStrings("ipify", fallback_snapshot.sourceSlice());
+    try std.testing.expectEqualStrings("cloudflare", fallback_snapshot.sourceSlice());
     try std.testing.expectEqualStrings("ReceiveFailed", fallback_snapshot.stunErrorSlice());
 }
 
@@ -3243,7 +3237,7 @@ test "redis dedupe params keep legacy redis key and value format" {
     try std.testing.expectEqualStrings("MyPublicIP:1.2.3.4", cache_key);
     try std.testing.expectEqualStrings("MyPublicIP", currentPublicIpRedisKey());
     try std.testing.expectEqualStrings("1.2.3.4", ip);
-    try std.testing.expectEqual(@as(u64, 86400), @as(u64, 86400));
+    try std.testing.expect(@as(u64, 86400) == @as(u64, 86400));
 }
 
 test "local dedupe cache respects ttl" {

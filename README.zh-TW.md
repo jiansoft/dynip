@@ -409,14 +409,10 @@ next_retry_at 是未來時間
 
 目前內建的公開 IP 查詢來源：
 
-- `https://api.ipify.org`
-- `https://ipconfig.io/ip`
-- `https://ipinfo.io/ip`
-- `https://ipv4.seeip.org`
-- `https://api.myip.com`
-- `https://api.bigdatacloud.net/data/client-ip`
+- `STUN` (`stun.l.google.com:19302`) - 基於 UDP 封包的查詢方式
+- `Cloudflare Trace` (`https://one.one.one.one/cdn-cgi/trace`) - 基於 HTTPS 的查詢方式
 
-每一輪更新不會永遠從同一個來源開始，而是會輪流切換起始站點。
+每一輪更新的主要來源會在 STUN 與 Cloudflare Trace 之間輪流切換，以兼顧可靠性與防火牆相容性。
 
 ## Windows 建置
 

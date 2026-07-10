@@ -409,14 +409,10 @@ Current logging behavior includes:
 
 Built-in public IP sources:
 
-- `https://api.ipify.org`
-- `https://ipconfig.io/ip`
-- `https://ipinfo.io/ip`
-- `https://ipv4.seeip.org`
-- `https://api.myip.com`
-- `https://api.bigdatacloud.net/data/client-ip`
+- `STUN` (`stun.l.google.com:19302`) - UDP-based query
+- `Cloudflare Trace` (`https://one.one.one.one/cdn-cgi/trace`) - HTTPS-based query
 
-The starting source rotates between update cycles instead of always beginning with the first one.
+The starting source rotates between update cycles (STUN first or Cloudflare first) to balance reliability and firewall compatibility.
 
 ## Windows Build
 
