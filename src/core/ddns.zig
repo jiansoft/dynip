@@ -26,6 +26,10 @@ pub const shared_state = @import("ddns/shared_state.zig");
 pub const local_cache = @import("ddns/local_cache.zig");
 pub const ip_lookup = @import("ddns/ip_lookup.zig");
 pub const providers = @import("ddns/providers.zig");
+/// Cloudflare 原生 DNS API provider；與傳統 DDNS provider 分開實作。
+pub const cloudflare = @import("ddns/cloudflare.zig");
+/// Healthchecks、Uptime Kuma 與通用 webhook 的通知實作。
+pub const notifications = @import("ddns/notifications.zig");
 pub const utils = @import("ddns/utils.zig");
 
 // 公開型別重新導出 (Public Types Re-exports)：使用者不必知道型別實際放在 ddns/types.zig。
@@ -90,7 +94,8 @@ fn redisConfigForCurrentState(original: config_mod.Redis) config_mod.Redis {
     return copy;
 }
 
-/// 執行一次 DDNS 更新檢查的主進入點。
+/// 執行一次雙 stack DDNS 更新。IPv4 與 IPv6 是獨立工作單位：
+/// 一族失敗只記錄錯誤，另一族仍可完成更新，避免沒有 IPv6 的網路阻塞 IPv4。
 pub fn refresh(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -103,14 +108,45 @@ pub fn refresh(
         return .skipped_maintenance_window;
     }
 
+    // 一個 scheduler 週期只決定一次第一來源。兩個 family 都接收同一 primary，
+    // 才不會因 IPv4/IPv6 各自遞增 counter 而讓 IPv4 永遠固定優先 STUN。
+    const round = ip_lookup.primary_source_counter;
+    ip_lookup.primary_source_counter +%= 1;
+    const primary: types.PublicIpService = if (round % 2 == 0) .stun else .cloudflare_trace;
+
+    const ipv4_status = refreshSingle(allocator, io, client, config, .ipv4, primary) catch |err| blk: {
+        std.log.warn("ipv4 ddns refresh failed: {}", .{err});
+        break :blk null;
+    };
+    const ipv6_status = refreshSingle(allocator, io, client, config, .ipv6, primary) catch |err| blk: {
+        std.log.warn("ipv6 ddns refresh failed: {}", .{err});
+        break :blk null;
+    };
+
+    // 只有兩族都無法查詢或更新時才讓 scheduler 視為整輪失敗。
+    if (ipv4_status) |status| return status;
+    if (ipv6_status) |status| return status;
+    return error.AllPublicIpFamilyLookupsFailed;
+}
+
+/// 執行單一 IP family 的既有 DDNS reconcile 流程。
+/// family 專用 lookup endpoint 保證傳入 provider 的 IP 不會跨 A/AAAA family。
+fn refreshSingle(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    client: *std.http.Client,
+    config: config_mod.AppConfig,
+    family: types.IpFamily,
+    primary: types.PublicIpService,
+) !RefreshStatus {
     // 本輪有許多短命字串（IP、URL、Redis 回應）。Arena 讓它們可統一在函式結束時
     // deinit，不需為每一個成功/錯誤分支手動 free。不可把 scratch 配置的 slice 存到本輪外。
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const scratch = arena.allocator();
 
-    // 取得的 IP 已經過格式驗證。try 代表兩個 public-IP 來源皆失敗時立即向呼叫端傳遞錯誤。
-    const public_ip_lookup = try ip_lookup.getPublicIp(scratch, client);
+    // 取得的 IP 已經驗證格式與 family；IPify family endpoint 讓雙 stack 結果可分開更新。
+    const public_ip_lookup = try ip_lookup.getPublicIpForFamily(scratch, client, family, primary);
     const ip_now = public_ip_lookup.ip;
     const ip_source = ip_lookup.serviceName(public_ip_lookup.service);
 
@@ -176,6 +212,8 @@ pub fn refresh(
 
 /// Redis 可用時的 reconcile 流程：先寫 desired IP，依各 provider 的 hash state 決定
 /// 要更新、略過或等待 retry，最後只記錄實際成功的 provider。
+/// Redis reconcile 以單一 IP family 為範圍。將 family 傳入每個 state helper，
+/// 可確保 IPv6 的 desired IP 永遠不會覆蓋 IPv4 的 retry/current state。
 fn refreshWithRedisProviderState(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -260,37 +298,56 @@ fn buildPublicIpCacheKey(allocator: std.mem.Allocator, ip: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "MyPublicIP:{s}", .{ip});
 }
 
+/// 新 key 包含 family，因此 IPv4 與 IPv6 的等效 reconcile state 不會碰撞。
+/// 舊 helper 保留給相容觀察 key 的測試使用。
+fn buildPublicIpCacheKeyForFamily(allocator: std.mem.Allocator, ip: []const u8, family: types.IpFamily) ![]u8 {
+    return std.fmt.allocPrint(allocator, "MyPublicIP:{s}:{s}", .{ family.name(), ip });
+}
+
 /// Redis 中保存最近 public IP 的固定 key，不含 TTL 範圍外的額外資訊。
 fn currentPublicIpRedisKey() []const u8 {
     return "MyPublicIP";
 }
 
 /// Redis 中保存本輪所有 provider 共同目標 IP 的固定 key。
-fn desiredPublicIpRedisKey() []const u8 {
-    return "DDNS:DesiredIP";
+/// Desired-IP key 以 family 分隔。路由器常同時有不同 IPv4 與 IPv6 位址，
+/// 若共用單一 desired key，就會遺失雙 stack state 的其中一半。
+fn desiredPublicIpRedisKey(ip: []const u8) []const u8 {
+    return switch (ip_lookup.familyForIp(ip) catch return "DDNS:DesiredIP:unknown") {
+        .ipv4 => "DDNS:DesiredIP:ipv4",
+        .ipv6 => "DDNS:DesiredIP:ipv6",
+    };
 }
 
 /// 取得 provider hash state 的 Redis key；hash 包含 retry、error 與最後成功 IP 等欄位。
-fn providerStateRedisKey(provider: DdnsProvider) []const u8 {
+/// Provider state key 包含 IP family。這是持久化邊界，可防止 IPv6 的
+/// retry_count/current_ip 覆蓋對應的 IPv4 state。
+fn providerStateRedisKey(provider: DdnsProvider, ip: []const u8) []const u8 {
+    const family = ip_lookup.familyForIp(ip) catch return "DDNS:Provider:unknown";
     return switch (provider) {
-        .afraid => "DDNS:Provider:afraid",
-        .dynu => "DDNS:Provider:dynu",
-        .noip => "DDNS:Provider:noip",
+        .cloudflare => switch (family) { .ipv4 => "DDNS:Provider:cloudflare:ipv4", .ipv6 => "DDNS:Provider:cloudflare:ipv6" },
+        .afraid => switch (family) { .ipv4 => "DDNS:Provider:afraid:ipv4", .ipv6 => "DDNS:Provider:afraid:ipv6" },
+        .dynu => switch (family) { .ipv4 => "DDNS:Provider:dynu:ipv4", .ipv6 => "DDNS:Provider:dynu:ipv6" },
+        .noip => switch (family) { .ipv4 => "DDNS:Provider:noip:ipv4", .ipv6 => "DDNS:Provider:noip:ipv6" },
     };
 }
 
 /// 取得舊版相容的 provider-current-IP key，用於快速 dedupe 判斷。
-fn providerCurrentIpRedisKey(provider: DdnsProvider) []const u8 {
+/// Legacy observer key 也使用相同 family 後綴，讓外部觀察者不會混淆兩種位址。
+fn providerCurrentIpRedisKey(provider: DdnsProvider, ip: []const u8) []const u8 {
+    const family = ip_lookup.familyForIp(ip) catch return "MyPublicIP:unknown";
     return switch (provider) {
-        .afraid => "MyPublicIP:afraid",
-        .dynu => "MyPublicIP:dynu",
-        .noip => "MyPublicIP:noip",
+        .cloudflare => switch (family) { .ipv4 => "MyPublicIP:cloudflare:ipv4", .ipv6 => "MyPublicIP:cloudflare:ipv6" },
+        .afraid => switch (family) { .ipv4 => "MyPublicIP:afraid:ipv4", .ipv6 => "MyPublicIP:afraid:ipv6" },
+        .dynu => switch (family) { .ipv4 => "MyPublicIP:dynu:ipv4", .ipv6 => "MyPublicIP:dynu:ipv6" },
+        .noip => switch (family) { .ipv4 => "MyPublicIP:noip:ipv4", .ipv6 => "MyPublicIP:noip:ipv6" },
     };
 }
 
 /// 將 enum 轉成適合 log 顯示的穩定名稱。
 fn providerName(provider: DdnsProvider) []const u8 {
     return switch (provider) {
+        .cloudflare => "cloudflare",
         .afraid => "afraid",
         .dynu => "dynu",
         .noip => "no-ip",
@@ -300,9 +357,10 @@ fn providerName(provider: DdnsProvider) []const u8 {
 /// 將 enum 映射到固定順序的陣列 slot；目前保留給需要批次索引的呼叫端。
 fn providerSlot(provider: DdnsProvider) usize {
     return switch (provider) {
-        .afraid => 0,
-        .dynu => 1,
-        .noip => 2,
+        .cloudflare => 0,
+        .afraid => 1,
+        .dynu => 2,
+        .noip => 3,
     };
 }
 
@@ -368,6 +426,10 @@ fn allEnabledProvidersAlreadyRecorded(
         checked += 1;
         if (!try providerCurrentIpMatches(allocator, io, redis_config, .afraid, ip)) return false;
     }
+    if (isProviderConfigured(app_config, .cloudflare)) {
+        checked += 1;
+        if (!try providerCurrentIpMatches(allocator, io, redis_config, .cloudflare, ip)) return false;
+    }
     if (isProviderConfigured(app_config, .dynu)) {
         checked += 1;
         if (!try providerCurrentIpMatches(allocator, io, redis_config, .dynu, ip)) return false;
@@ -388,7 +450,7 @@ fn providerCurrentIpMatches(
     provider: DdnsProvider,
     ip: []const u8,
 ) !bool {
-    const key = providerCurrentIpRedisKey(provider);
+    const key = providerCurrentIpRedisKey(provider, ip);
     const stored_ip = redis.get(allocator, io, redis_config, key) catch |err| {
         std.log.warn(
             "failed to read provider redis ip key: provider={s}, key={s}, error={}",
@@ -408,6 +470,7 @@ fn providerCurrentIpMatches(
 /// 檢查 provider 是否啟用且具備足以發出請求的必要憑證/hostname。
 fn isProviderConfigured(app_config: config_mod.AppConfig, provider: DdnsProvider) bool {
     return switch (provider) {
+        .cloudflare => app_config.cloudflare.enabled and app_config.cloudflare.api_token.len != 0 and app_config.cloudflare.zone_id.len != 0 and app_config.cloudflare.hostnames.len != 0,
         .afraid => app_config.afraid.enabled and app_config.afraid.token.len != 0,
         .dynu => app_config.dynu.enabled and app_config.dynu.username.len != 0 and app_config.dynu.password.len != 0,
         .noip => app_config.noip.enabled and app_config.noip.username.len != 0 and app_config.noip.password.len != 0 and app_config.noip.hostnames.len != 0,
@@ -465,12 +528,12 @@ fn rememberProviderCurrentIps(
     ip: []const u8,
     ttl_seconds: u64,
 ) !void {
-    const providers_list = [_]DdnsProvider{ .afraid, .dynu, .noip };
+    const providers_list = [_]DdnsProvider{ .cloudflare, .afraid, .dynu, .noip };
     for (providers_list) |provider| {
         // `continue` 是關鍵：不為本輪失敗 provider 假裝寫入成功 IP。
         if (!successes.includes(provider)) continue;
 
-        const key = providerCurrentIpRedisKey(provider);
+        const key = providerCurrentIpRedisKey(provider, ip);
         try redis.setEx(allocator, io, redis_config, key, ip, ttl_seconds);
         std.log.info(
             "ddns redis provider ip updated: provider={s}, key={s}, ip={s}, ttl={d}s",
@@ -504,11 +567,11 @@ fn rememberProviderCurrentIpsWithSession(
     ip: []const u8,
     ttl_seconds: u64,
 ) !void {
-    const providers_list = [_]DdnsProvider{ .afraid, .dynu, .noip };
+    const providers_list = [_]DdnsProvider{ .cloudflare, .afraid, .dynu, .noip };
     for (providers_list) |provider| {
         if (!successes.includes(provider)) continue;
 
-        const key = providerCurrentIpRedisKey(provider);
+        const key = providerCurrentIpRedisKey(provider, ip);
         try redis_session.setEx(key, ip, ttl_seconds);
         std.log.info(
             "ddns redis provider ip updated: provider={s}, key={s}, ip={s}, ttl={d}s",
@@ -523,7 +586,7 @@ fn rememberDesiredIpWithSession(
     ip: []const u8,
     ttl_seconds: u64,
 ) !void {
-    try redis_session.setEx(desiredPublicIpRedisKey(), ip, ttl_seconds);
+    try redis_session.setEx(desiredPublicIpRedisKey(ip), ip, ttl_seconds);
 }
 
 /// 依固定順序 reconcile 全部 provider，並累積統計；ttl 目前由呼叫鏈保留作 API 穩定性。
@@ -541,6 +604,7 @@ fn updateDdnsServicesReconciled(
     // 與 caller 的 dedupe TTL 能同步擴充而不破壞呼叫端。
     _ = ttl_seconds;
 
+    try reconcileProvider(&summary, allocator, redis_session, client, config, .cloudflare, ip, now_seconds);
     try reconcileProvider(&summary, allocator, redis_session, client, config, .afraid, ip, now_seconds);
     try reconcileProvider(&summary, allocator, redis_session, client, config, .dynu, ip, now_seconds);
     try reconcileProvider(&summary, allocator, redis_session, client, config, .noip, ip, now_seconds);
@@ -566,7 +630,7 @@ fn reconcileProvider(
 
     // 讀取舊狀態失敗時採 fail-open：仍嘗試更新 DDNS，避免 Redis 的短暫讀取錯誤
     // 阻止實際 DNS 修正。空 ProviderState 會導向 .attempt。
-    const state = loadProviderState(allocator, redis_session, provider) catch |err| blk: {
+    const state = loadProviderState(allocator, redis_session, provider, desired_ip) catch |err| blk: {
         std.log.warn(
             "failed to load ddns provider state, will attempt update: provider={s}, error={}",
             .{ providerName(provider), err },
@@ -642,6 +706,7 @@ fn updateProvider(
     ip: []const u8,
 ) !void {
     return switch (provider) {
+        .cloudflare => cloudflare.update(allocator, client, config.cloudflare, ip),
         .afraid => providers.updateAfraid(allocator, client, config.afraid),
         .dynu => providers.updateDynu(allocator, client, config.dynu, ip),
         .noip => providers.updateNoIp(allocator, client, config.noip, ip),
@@ -681,8 +746,9 @@ fn loadProviderState(
     allocator: std.mem.Allocator,
     redis_session: *redis.Session,
     provider: DdnsProvider,
+    desired_ip: []const u8,
 ) !ProviderState {
-    const key = providerStateRedisKey(provider);
+    const key = providerStateRedisKey(provider, desired_ip);
     // 每個 hGet 都可能回傳 null，表示舊版/全新 Redis 尚未有該欄位；optional 正是
     // 用來表達這種「值不存在」的 Zig 型別，而不是空字串。
     return .{
@@ -735,7 +801,7 @@ fn saveProviderSuccess(
     // 所以 stack 生命週期完全足夠，不需要配置字串。
     var now_buffer: [32]u8 = undefined;
     const now_text = try std.fmt.bufPrint(&now_buffer, "{d}", .{now_seconds});
-    const key = providerStateRedisKey(provider);
+    const key = providerStateRedisKey(provider, ip);
 
     const fields = [_]redis.HashField{
         .{ .key = key, .field = "current_ip", .value = ip },
@@ -770,7 +836,7 @@ fn saveProviderFailure(
     const retry_text = try std.fmt.bufPrint(&retry_buffer, "{d}", .{retry_count});
     const next_retry_text = try std.fmt.bufPrint(&next_retry_buffer, "{d}", .{next_retry_at});
     const now_text = try std.fmt.bufPrint(&now_buffer, "{d}", .{now_seconds});
-    const key = providerStateRedisKey(provider);
+    const key = providerStateRedisKey(provider, desired_ip);
 
     const fields = [_]redis.HashField{
         .{ .key = key, .field = "desired_ip", .value = desired_ip },
@@ -795,6 +861,19 @@ fn updateDdnsServices(
 ) !ServiceSummary {
     // 預設值全部是 0/false；每個 provider 分支只改動自己對應的統計數與成功旗標。
     var summary = ServiceSummary{};
+
+    if (isProviderConfigured(config, .cloudflare)) {
+        summary.attempted += 1;
+        if (cloudflare.update(allocator, client, config.cloudflare, ip)) {
+            summary.succeeded += 1;
+            summary.successes.mark(.cloudflare);
+            shared_state.memoryWriteProviderSuccess(.cloudflare, ip, now_seconds);
+        } else |err| {
+            summary.failed += 1;
+            shared_state.memoryWriteProviderAttemptFailure(.cloudflare, ip, err, now_seconds);
+            std.log.err("cloudflare update failed: {}", .{err});
+        }
+    }
 
     // Afraid 的最小有效設定只有 token。沒有 token 視為未設定，不計入 attempted。
     if (config.afraid.enabled and config.afraid.token.len != 0) {
@@ -1081,12 +1160,14 @@ test "provider snapshots expose fixed provider slots before initialization" {
 
     const snapshots = getProviderSnapshots();
 
-    try std.testing.expectEqualStrings("afraid", snapshots[0].nameSlice());
-    try std.testing.expectEqualStrings("dynu", snapshots[1].nameSlice());
-    try std.testing.expectEqualStrings("noip", snapshots[2].nameSlice());
+    try std.testing.expectEqualStrings("cloudflare", snapshots[0].nameSlice());
+    try std.testing.expectEqualStrings("afraid", snapshots[1].nameSlice());
+    try std.testing.expectEqualStrings("dynu", snapshots[2].nameSlice());
+    try std.testing.expectEqualStrings("noip", snapshots[3].nameSlice());
     try std.testing.expect(!snapshots[0].initialized);
     try std.testing.expect(!snapshots[1].initialized);
     try std.testing.expect(!snapshots[2].initialized);
+    try std.testing.expect(!snapshots[3].initialized);
 }
 
 test "provider success snapshot copies status by value" {
@@ -1096,20 +1177,20 @@ test "provider success snapshot copies status by value" {
     shared_state.memoryWriteProviderSuccess(.dynu, "1.2.3.4", 100);
     var snapshots = getProviderSnapshots();
 
-    try std.testing.expect(snapshots[1].initialized);
-    try std.testing.expectEqualStrings("dynu", snapshots[1].nameSlice());
-    try std.testing.expectEqualStrings("1.2.3.4", snapshots[1].currentIpSlice());
-    try std.testing.expectEqualStrings("1.2.3.4", snapshots[1].desiredIpSlice());
-    try std.testing.expectEqualStrings(provider_status_success, snapshots[1].statusSlice());
-    try std.testing.expectEqual(@as(u32, 0), snapshots[1].retry_count);
-    try std.testing.expectEqual(@as(i64, 0), snapshots[1].next_retry_at);
-    try std.testing.expectEqual(@as(i64, 100), snapshots[1].updated_at);
+    try std.testing.expect(snapshots[2].initialized);
+    try std.testing.expectEqualStrings("dynu", snapshots[2].nameSlice());
+    try std.testing.expectEqualStrings("1.2.3.4", snapshots[2].currentIpSlice());
+    try std.testing.expectEqualStrings("1.2.3.4", snapshots[2].desiredIpSlice());
+    try std.testing.expectEqualStrings(provider_status_success, snapshots[2].statusSlice());
+    try std.testing.expectEqual(@as(u32, 0), snapshots[2].retry_count);
+    try std.testing.expectEqual(@as(i64, 0), snapshots[2].next_retry_at);
+    try std.testing.expectEqual(@as(i64, 100), snapshots[2].updated_at);
 
     shared_state.memoryWriteProviderSuccess(.dynu, "5.6.7.8", 200);
-    try std.testing.expectEqualStrings("1.2.3.4", snapshots[1].currentIpSlice());
+    try std.testing.expectEqualStrings("1.2.3.4", snapshots[2].currentIpSlice());
 
     snapshots = getProviderSnapshots();
-    try std.testing.expectEqualStrings("5.6.7.8", snapshots[1].currentIpSlice());
+    try std.testing.expectEqualStrings("5.6.7.8", snapshots[2].currentIpSlice());
 }
 
 test "provider failure snapshot preserves last successful current ip" {
@@ -1120,14 +1201,14 @@ test "provider failure snapshot preserves last successful current ip" {
     shared_state.memoryWriteProviderFailure(.noip, "5.6.7.8", 2, 300, "UnexpectedNoIpResponse", 200);
 
     const snapshots = getProviderSnapshots();
-    try std.testing.expect(snapshots[2].initialized);
-    try std.testing.expectEqualStrings("1.2.3.4", snapshots[2].currentIpSlice());
-    try std.testing.expectEqualStrings("5.6.7.8", snapshots[2].desiredIpSlice());
-    try std.testing.expectEqualStrings(provider_status_failed, snapshots[2].statusSlice());
-    try std.testing.expectEqual(@as(u32, 2), snapshots[2].retry_count);
-    try std.testing.expectEqual(@as(i64, 300), snapshots[2].next_retry_at);
-    try std.testing.expectEqualStrings("UnexpectedNoIpResponse", snapshots[2].lastErrorSlice());
-    try std.testing.expectEqual(@as(i64, 200), snapshots[2].updated_at);
+    try std.testing.expect(snapshots[3].initialized);
+    try std.testing.expectEqualStrings("1.2.3.4", snapshots[3].currentIpSlice());
+    try std.testing.expectEqualStrings("5.6.7.8", snapshots[3].desiredIpSlice());
+    try std.testing.expectEqualStrings(provider_status_failed, snapshots[3].statusSlice());
+    try std.testing.expectEqual(@as(u32, 2), snapshots[3].retry_count);
+    try std.testing.expectEqual(@as(i64, 300), snapshots[3].next_retry_at);
+    try std.testing.expectEqualStrings("UnexpectedNoIpResponse", snapshots[3].lastErrorSlice());
+    try std.testing.expectEqual(@as(i64, 200), snapshots[3].updated_at);
 }
 
 test "redis dedupe params keep legacy redis key and value format" {

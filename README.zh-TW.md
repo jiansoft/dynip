@@ -11,6 +11,7 @@
 - [Afraid.org](https://freedns.afraid.org/)
 - [Dynu](https://www.dynu.com/)
 - [No-IP](https://www.noip.com/)
+- [Cloudflare DNS](https://www.cloudflare.com/)
 
 它支援分層設定載入、結構化日誌、HTTP 請求追蹤，以及使用 Redis 或程式內記憶體來避免重複更新。
 
@@ -20,7 +21,8 @@
 - 使用 `.env` 覆蓋設定
 - 使用系統環境變數再覆蓋一次
 - 以常駐排程模式執行
-- 可獨立更新 Afraid / Dynu / No-IP
+- 可獨立更新 Cloudflare / Afraid / Dynu / No-IP
+- IPv4 與 IPv6 分開查詢；其中一種協定不可用時，不會阻止另一種更新
 - 在多個公開 IP 查詢來源之間輪替
 - 依日誌等級輸出檔案
 - 記錄 HTTP 請求 / 回應日誌
@@ -113,6 +115,14 @@ No-IP  current_ip = 5.6.7.8  -> 更新或重試
 
 ```json
 {
+  "cloudflare": {
+    "enabled": false,
+    "api_token": "",
+    "zone_id": "",
+    "hostnames": ["home.example.com"],
+    "proxied": false,
+    "ttl": 1
+  },
   "afraid": {
     "enabled": true,
     "url": "https://freedns.afraid.org",
@@ -157,6 +167,10 @@ No-IP  current_ip = 5.6.7.8  -> 更新或重試
 ```
 
 ### 供應商設定格式
+
+### Cloudflare DNS
+
+Cloudflare 使用對目標 zone 具有 DNS Edit 權限的 API Token。每個 hostname 都會各自收斂：IPv4 更新 A record、IPv6 更新 AAAA record；IP 相同時略過；IP 不同時只 PATCH IP content，保留 Cloudflare 端既有 proxy、TTL、comment 與 tags。record 不存在時才使用設定的 proxied 與 TTL 建立；TTL 設為 1 代表 Cloudflare Automatic。
 
 三家 DDNS 供應商統一採用這種欄位格式：
 
@@ -205,6 +219,15 @@ DDNS:Provider:noip
 
 ### 支援的環境變數
 
+#### Cloudflare DNS
+
+- `CLOUDFLARE_ENABLED`
+- `CLOUDFLARE_API_TOKEN`
+- `CLOUDFLARE_ZONE_ID`
+- `CLOUDFLARE_HOSTNAMES`（JSON 字串陣列）
+- `CLOUDFLARE_PROXIED`
+- `CLOUDFLARE_TTL`
+
 #### [Afraid.org](https://freedns.afraid.org/)
 
 - `AFRAID_ENABLED`
@@ -246,6 +269,13 @@ DDNS:Provider:noip
 ### `.env` 範例
 
 ```dotenv
+CLOUDFLARE_ENABLED=true
+CLOUDFLARE_API_TOKEN=<cloudflare-api-token>
+CLOUDFLARE_ZONE_ID=<cloudflare-zone-id>
+CLOUDFLARE_HOSTNAMES=["home.example.com"]
+CLOUDFLARE_PROXIED=false
+CLOUDFLARE_TTL=1
+
 AFRAID_ENABLED=true
 AFRAID_URL=https://freedns.afraid.org
 AFRAID_PATH=/dynamic/update.php?

@@ -21,6 +21,9 @@ pub const default_dotenv_path = ".env";
 /// 目前先保留 DDNS 這次移植真正需要的欄位。
 /// 讀取 Rust 版 `app.json` 時，其他尚未移植的欄位會直接忽略。
 pub const AppConfig = struct {
+    /// Cloudflare DNS API 設定。此 provider 直接管理 A / AAAA record，
+    /// 與 Afraid、Dynu、No-IP 的專屬 DDNS 更新 URL 不同。
+    cloudflare: Cloudflare = .{},
     /// Afraid.org 相關設定。
     afraid: Afraid = .{},
     /// Dynu 相關設定。
@@ -33,6 +36,27 @@ pub const AppConfig = struct {
     dashboard: Dashboard = .{},
     /// 日誌輸出設定。
     logging: Logging = .{},
+    /// DDNS 成功、失敗與恢復時的外部通知設定。
+    notifications: Notifications = .{},
+};
+
+/// Cloudflare DNS provider 的設定。
+///
+/// 使用最小權限的 API Token；Token 至少需要目標 zone 的 DNS Edit 權限。
+/// `zone_id` 採顯式設定而非每輪自動搜尋，避免不必要的 Zone Read 權限與 API 呼叫。
+pub const Cloudflare = struct {
+    /// false 時完全不呼叫 Cloudflare API。
+    enabled: bool = false,
+    /// Cloudflare API Token；不要使用舊式 global API key。
+    api_token: []const u8 = "",
+    /// Cloudflare zone ID（32 字元十六進位 ID）。
+    zone_id: []const u8 = "",
+    /// 要管理的完整 record 名稱，例如 `home.example.com`。
+    hostnames: []const []const u8 = &.{},
+    /// 建立新 record 時是否啟用 Cloudflare proxy；既有 record 更新時不變更此設定。
+    proxied: bool = false,
+    /// 建立新 record 時的 TTL；1 代表 Cloudflare Automatic。
+    ttl: u32 = 1,
 };
 
 /// 寫進日誌前用來取代 token / password 的固定遮罩字串。
@@ -137,6 +161,17 @@ pub const Logging = struct {
     seq: SeqLogging = .{},
 };
 
+/// 外部監控與 webhook 通知設定。
+/// 空字串代表該整合未設定；三個 URL 可以同時啟用。
+pub const Notifications = struct {
+    /// Healthchecks 相容 ping URL；每輪成功會送出 ping。
+    healthchecks_url: []const u8 = "",
+    /// Uptime Kuma Push URL；每輪成功會送出 ping。
+    uptime_kuma_url: []const u8 = "",
+    /// 通用 webhook URL；會收到 JSON event body。
+    webhook_url: []const u8 = "",
+};
+
 /// Seq 日誌收集設定。
 pub const SeqLogging = struct {
     /// 是否把本專案日誌送到 Seq。
@@ -205,6 +240,11 @@ pub fn redactedForLog(app_config: AppConfig) AppConfig {
     redactIfPresent(&redacted.ddns.redis.password);
     // 如果 Seq API key 不是空字串，就把它換成固定遮罩字串。
     redactIfPresent(&redacted.logging.seq.api_key);
+    // Healthchecks、Uptime Kuma 與 webhook URL 常將 UUID 或 token 放進路徑或 query，
+    // 因此和密碼一樣不能出現在啟動時輸出的完整設定日誌。
+    redactIfPresent(&redacted.notifications.healthchecks_url);
+    redactIfPresent(&redacted.notifications.uptime_kuma_url);
+    redactIfPresent(&redacted.notifications.webhook_url);
     // 回傳這份「可安全寫進日誌」的設定副本。
     return redacted;
 }
@@ -373,6 +413,12 @@ const EnvOverride = struct {
 /// - `applyProcessEnvOverridesLeaky` 直接從這張表提取 key 名稱。
 /// - `applyOverrideValueLeaky` 直接從這張表找到目標欄位與轉型策略。
 const env_overrides = [_]EnvOverride{
+    .{ .key = "CLOUDFLARE_ENABLED", .field = "cloudflare.enabled", .kind = .bool },
+    .{ .key = "CLOUDFLARE_API_TOKEN", .field = "cloudflare.api_token", .kind = .str },
+    .{ .key = "CLOUDFLARE_ZONE_ID", .field = "cloudflare.zone_id", .kind = .str },
+    .{ .key = "CLOUDFLARE_HOSTNAMES", .field = "cloudflare.hostnames", .kind = .str_arr },
+    .{ .key = "CLOUDFLARE_PROXIED", .field = "cloudflare.proxied", .kind = .bool },
+    .{ .key = "CLOUDFLARE_TTL", .field = "cloudflare.ttl", .kind = .u32 },
     .{ .key = "AFRAID_URL", .field = "afraid.url", .kind = .str },
     .{ .key = "AFRAID_ENABLED", .field = "afraid.enabled", .kind = .bool },
     .{ .key = "AFRAID_PATH", .field = "afraid.path", .kind = .str },
@@ -403,6 +449,9 @@ const env_overrides = [_]EnvOverride{
     .{ .key = "LOG_SEQ_LEVEL", .field = "logging.seq.level", .kind = .str },
     .{ .key = "LOG_SEQ_SERVER_URL", .field = "logging.seq.server_url", .kind = .str },
     .{ .key = "LOG_SEQ_API_KEY", .field = "logging.seq.api_key", .kind = .str },
+    .{ .key = "HEALTHCHECKS_URL", .field = "notifications.healthchecks_url", .kind = .str },
+    .{ .key = "UPTIME_KUMA_URL", .field = "notifications.uptime_kuma_url", .kind = .str },
+    .{ .key = "NOTIFICATION_WEBHOOK_URL", .field = "notifications.webhook_url", .kind = .str },
 };
 
 /// 依 key 把覆寫值寫進設定結構。

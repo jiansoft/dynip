@@ -1,4 +1,12 @@
 {
+  "cloudflare": {
+    "enabled": false,
+    "api_token": "",
+    "zone_id": "",
+    "hostnames": [],
+    "proxied": false,
+    "ttl": 1
+  },
   "afraid": {
     "enabled": true,
     "url": "https://freedns.afraid.org",
@@ -43,5 +51,10 @@
       "server_url": "",
       "api_key": ""
     }
+  },
+  "notifications": {
+    "healthchecks_url": "",
+    "uptime_kuma_url": "",
+    "webhook_url": ""
   }
 }

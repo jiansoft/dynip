@@ -19,7 +19,8 @@ var process_public_ip_state: ProcessPublicIpState = .{};
 /// 保護下方固定三格的 provider 陣列。
 var process_provider_mutex: std.atomic.Mutex = .unlocked;
 /// 每個支援的 provider 一格，索引由 providerSlot 集中轉換，勿直接猜測索引。
-var process_provider_states: [3]ProcessProviderState = .{ .{}, .{}, .{} };
+/// Cloudflare 加入後共有四個固定 provider slot；slot 的對應集中在 providerSlot。
+var process_provider_states: [4]ProcessProviderState = .{ .{}, .{}, .{}, .{} };
 
 /// 回傳第 N 次連續失敗後的等待秒數：30, 60, 120...，最長 15 分鐘。
 pub fn retryDelaySeconds(retry_count: u32) i64 {
@@ -33,15 +34,17 @@ pub fn retryDelaySeconds(retry_count: u32) i64 {
 /// 將 provider enum 映射到固定陣列索引；新增供應商時需同步調整陣列大小與此處。
 fn providerSlot(provider: DdnsProvider) usize {
     return switch (provider) {
-        .afraid => 0,
-        .dynu => 1,
-        .noip => 2,
+        .cloudflare => 0,
+        .afraid => 1,
+        .dynu => 2,
+        .noip => 3,
     };
 }
 
 /// 取得穩定、適合 dashboard 顯示的 provider 名稱。
 fn providerKey(provider: DdnsProvider) []const u8 {
     return switch (provider) {
+        .cloudflare => "cloudflare",
         .afraid => "afraid",
         .dynu => "dynu",
         .noip => "noip",
@@ -49,11 +52,12 @@ fn providerKey(provider: DdnsProvider) []const u8 {
 }
 
 /// 取得三個 provider 的「值複製」快照。鎖會在 return 前釋放，快照可安全交給其他執行緒。
-pub fn getProviderSnapshots() [3]ProviderSnapshot {
+pub fn getProviderSnapshots() [4]ProviderSnapshot {
     lockProcessProviderStates();
     defer process_provider_mutex.unlock();
 
     return .{
+        providerSnapshotFromState(.cloudflare, process_provider_states[providerSlot(.cloudflare)]),
         providerSnapshotFromState(.afraid, process_provider_states[providerSlot(.afraid)]),
         providerSnapshotFromState(.dynu, process_provider_states[providerSlot(.dynu)]),
         providerSnapshotFromState(.noip, process_provider_states[providerSlot(.noip)]),
@@ -179,7 +183,7 @@ pub fn resetProcessProviderStates() void {
     lockProcessProviderStates();
     defer process_provider_mutex.unlock();
 
-    process_provider_states = .{ .{}, .{}, .{} };
+    process_provider_states = .{ .{}, .{}, .{}, .{} };
 }
 
 /// 取得 provider 陣列的自旋鎖；等候時 yield 降低忙等的 CPU 使用。

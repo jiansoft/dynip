@@ -78,6 +78,10 @@ pub fn runForever(
     };
     defer client.deinit();
 
+    // 此旗標記住上一輪是否失敗；下一輪成功時可對 webhook 發出 recovered，
+    // 讓外部監控知道問題不只是「目前成功」，而是「從故障恢復」。
+    var previous_refresh_failed = false;
+
     // `while (true)` 代表無限迴圈。
     // 對常駐服務來說，這就是「一直跑下去」的核心。
     while (true) {
@@ -95,6 +99,10 @@ pub fn runForever(
         _ = ddns.refresh(allocator, io, &client, config) catch |err| {
             // 如果更新失敗，先記錄錯誤。
             std.log.err("scheduled ddns refresh failed: {}", .{err});
+            // 通知採最佳努力模式；notifyFailure 自己吞掉網路錯誤，
+            // 所以健康通知失敗不會改變原本 DDNS 的 retry 節奏。
+            ddns.notifications.notifyFailure(allocator, &client, config.notifications, err);
+            previous_refresh_failed = true;
 
             // 失敗後先短暫睡 5 秒，避免錯誤狀況下瘋狂重試。
             try sleepUntilNextRun(io, 5, stop_token);
@@ -102,6 +110,16 @@ pub fn runForever(
             // `continue` 代表直接進入下一輪 while 迴圈。
             continue;
         };
+
+        // 每一輪成功都 ping Healthchecks/Uptime Kuma。若前輪失敗，同時把 webhook
+        // event 標為 recovered；成功通知完成後才清除這個跨輪狀態。
+        ddns.notifications.notifySuccess(
+            allocator,
+            &client,
+            config.notifications,
+            previous_refresh_failed,
+        );
+        previous_refresh_failed = false;
 
         // 如果這一輪成功，就按照正常設定的間隔等待下一次。
         try sleepUntilNextRun(io, interval_seconds, stop_token);

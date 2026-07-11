@@ -7,6 +7,7 @@ const http = @import("../../io/http.zig");
 
 const PublicIpService = types.PublicIpService;
 const PublicIpLookup = types.PublicIpLookup;
+const IpFamily = types.IpFamily;
 
 /// Cloudflare HTTP 連線逾時。STUN 使用 socket 層的接收逾時，兩者不是同一機制。
 const public_ip_connect_timeout: std.Io.Timeout = .{ .duration = .{
@@ -54,8 +55,17 @@ pub fn getPublicIp(
 ) !PublicIpLookup {
     const current_round = primary_source_counter;
     primary_source_counter +%= 1;
+    return getPublicIpWithPrimary(allocator, client, if (current_round % 2 == 0) .stun else .cloudflare_trace);
+}
 
-    const primary_pair: [2]PublicIpService = if (current_round % 2 == 0)
+/// 以呼叫端明確指定的第一來源取得 public IP。本函式不讀寫全域輪替計數，
+/// 因此同一個 scheduler 週期的 IPv4、IPv6 可共用相同優先來源。
+pub fn getPublicIpWithPrimary(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    primary: PublicIpService,
+) !PublicIpLookup {
+    const primary_pair: [2]PublicIpService = if (primary == .stun)
         .{ .stun, .cloudflare_trace }
     else
         .{ .cloudflare_trace, .stun };
@@ -108,8 +118,55 @@ fn tryFetchFromService(
     return .{
         .ip = ip,
         .service = service,
+        .family = familyForIp(ip) catch unreachable,
         .stun_error = stun_error.*,
     };
+}
+
+/// 從已驗證文字 IP 判斷位址族。normalizePublicIp 已經用同一解析器驗證過輸入；
+/// 這個 helper 仍保留錯誤回傳，方便獨立呼叫者安全使用。
+pub fn familyForIp(ip: []const u8) !IpFamily {
+    return switch (try std.Io.net.IpAddress.parse(ip, 0)) {
+        .ip4 => .ipv4,
+        .ip6 => .ipv6,
+    };
+}
+
+/// 以指定位址族查詢公開 IP。仍只使用既有的 STUN 與 Cloudflare Trace 來源；
+/// 若本次輪替後取得的結果不是要求的位址族，回傳 PublicIpFamilyUnavailable。
+pub fn getPublicIpForFamily(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    family: IpFamily,
+    primary: PublicIpService,
+) !PublicIpLookup {
+    const lookup = try getPublicIpWithPrimary(allocator, client, primary);
+    if (lookup.family == family) return lookup;
+
+    // 第一來源成功但回傳另一種位址族時，不應立刻放棄。本輪仍可改用另一個
+    // 已允許的來源取得目標 family；這不會增加第三方 public-IP 服務。
+    const fallback_primary: PublicIpService = if (primary == .stun) .cloudflare_trace else .stun;
+    const fallback = try getPublicIpWithPrimary(allocator, client, fallback_primary);
+    if (fallback.family != family) return error.PublicIpFamilyUnavailable;
+    return fallback;
+}
+
+/// 下載純文字 IP 並檢查它和呼叫者要求的位址族一致，避免 DNS/Proxy 配置錯誤
+/// 導致 IPv4 流程取得 IPv6（或反過來）後寫入錯誤 DNS record。
+fn fetchPlainTextIp(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    url: []const u8,
+    expected_family: IpFamily,
+) ![]const u8 {
+    const response = try http.fetchText(allocator, client, url, &.{}, .{
+        .connect_timeout = public_ip_connect_timeout,
+    });
+    defer allocator.free(response.body);
+    try http.ensureSuccessStatus(response.status, response.body);
+    const normalized = try normalizePublicIp(response.body);
+    if (try familyForIp(normalized) != expected_family) return error.PublicIpFamilyMismatch;
+    return allocator.dupe(u8, normalized);
 }
 
 /// 以 `服務名: 錯誤` 格式追加到 fixed writer。writer 容量用盡時忽略額外文字，

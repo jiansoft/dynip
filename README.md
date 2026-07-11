@@ -11,6 +11,7 @@ A Zig-based DDNS background service.
 - [Afraid.org](https://freedns.afraid.org/)
 - [Dynu](https://www.dynu.com/)
 - [No-IP](https://www.noip.com/)
+- [Cloudflare DNS](https://www.cloudflare.com/)
 
 It supports layered configuration loading, structured logging, HTTP request tracing, and duplicate-update prevention backed by either Redis or in-process memory.
 
@@ -20,7 +21,8 @@ It supports layered configuration loading, structured logging, HTTP request trac
 - Override config with `.env`
 - Override both again with environment variables
 - Run as a long-running scheduled service
-- Update Afraid / Dynu / No-IP independently
+- Update Cloudflare / Afraid / Dynu / No-IP independently
+- Detect IPv4 and IPv6 independently; an unavailable family does not stop the other family
 - Rotate across multiple public IP sources
 - Write log files by level
 - Record HTTP request/response logs
@@ -113,6 +115,14 @@ Later sources override earlier ones.
 
 ```json
 {
+  "cloudflare": {
+    "enabled": false,
+    "api_token": "",
+    "zone_id": "",
+    "hostnames": ["home.example.com"],
+    "proxied": false,
+    "ttl": 1
+  },
   "afraid": {
     "enabled": true,
     "url": "https://freedns.afraid.org",
@@ -157,6 +167,10 @@ Later sources override earlier ones.
 ```
 
 ### Provider Configuration Shape
+
+### Cloudflare DNS
+
+Cloudflare uses an API Token with DNS Edit permission for the configured zone. Each configured hostname is reconciled independently: IPv4 updates an A record, IPv6 updates an AAAA record, an unchanged record is skipped, and an existing record is PATCHed only at its IP content so its Cloudflare-side proxy, TTL, comments, and tags are preserved. Missing records are created with the configured proxied value and TTL; TTL 1 means Cloudflare Automatic.
 
 All three DDNS providers use the same top-level structure:
 
@@ -205,6 +219,15 @@ When `ddns.redis.enabled = false`:
 
 ### Supported Environment Variables
 
+#### Cloudflare DNS
+
+- `CLOUDFLARE_ENABLED`
+- `CLOUDFLARE_API_TOKEN`
+- `CLOUDFLARE_ZONE_ID`
+- `CLOUDFLARE_HOSTNAMES` (JSON string array)
+- `CLOUDFLARE_PROXIED`
+- `CLOUDFLARE_TTL`
+
 #### [Afraid.org](https://freedns.afraid.org/)
 
 - `AFRAID_ENABLED`
@@ -246,6 +269,13 @@ When `ddns.redis.enabled = false`:
 ### Example `.env`
 
 ```dotenv
+CLOUDFLARE_ENABLED=true
+CLOUDFLARE_API_TOKEN=<cloudflare-api-token>
+CLOUDFLARE_ZONE_ID=<cloudflare-zone-id>
+CLOUDFLARE_HOSTNAMES=["home.example.com"]
+CLOUDFLARE_PROXIED=false
+CLOUDFLARE_TTL=1
+
 AFRAID_ENABLED=true
 AFRAID_URL=https://freedns.afraid.org
 AFRAID_PATH=/dynamic/update.php?

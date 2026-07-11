@@ -19,18 +19,39 @@ pub const PublicIpService = enum {
     cloudflare_trace,
 };
 
+/// public IP 所屬的網路協定族。DDNS 更新時必須保持 family 不混用：
+/// IPv4 只能寫入 A record，IPv6 只能寫入 AAAA record。
+pub const IpFamily = enum {
+    /// 四個位元組的 IPv4 位址。
+    ipv4,
+    /// 十六個位元組的 IPv6 位址。
+    ipv6,
+
+    /// 回傳適合 log、Redis key 與 dashboard 顯示的固定文字。
+    pub fn name(self: IpFamily) []const u8 {
+        return switch (self) {
+            .ipv4 => "ipv4",
+            .ipv6 => "ipv6",
+        };
+    }
+};
+
 /// 單次對外 IP 查詢成功後的結果。
 pub const PublicIpLookup = struct {
     /// 配置在呼叫端 allocator 的 IP 字串；使用完畢由其擁有者釋放。
     ip: []const u8,
     /// 本次成功查到 IP 的來源，供 dashboard/log 顯示。
     service: PublicIpService,
+    /// 此結果的 IP family；上層用它選擇 A 或 AAAA 更新路徑。
+    family: IpFamily,
     /// STUN 失敗而由其他來源成功時，保留 STUN 的錯誤名稱作診斷；否則為 null。
     stun_error: ?[]const u8 = null,
 };
 
 /// 目前支援更新的 DDNS 供應商。
 pub const DdnsProvider = enum {
+    /// Cloudflare API 原生 DNS provider，可管理 A 與 AAAA records。
+    cloudflare,
     /// FreeDNS (afraid.org) 動態 DNS。
     afraid,
     /// Dynu 動態 DNS。
@@ -41,6 +62,8 @@ pub const DdnsProvider = enum {
 
 /// 供應商成功狀態，用來決定哪些 provider 要寫回 Redis。
 pub const ProviderSuccesses = struct {
+    /// 本輪 Cloudflare 是否成功。
+    cloudflare: bool = false,
     /// 本輪 Afraid 是否成功。
     afraid: bool = false,
     /// 本輪 Dynu 是否成功。
@@ -51,6 +74,7 @@ pub const ProviderSuccesses = struct {
     /// 將指定 enum 對應的成功旗標設為 true。
     pub fn mark(self: *ProviderSuccesses, provider: DdnsProvider) void {
         switch (provider) {
+            .cloudflare => self.cloudflare = true,
             .afraid => self.afraid = true,
             .dynu => self.dynu = true,
             .noip => self.noip = true,
@@ -60,6 +84,7 @@ pub const ProviderSuccesses = struct {
     /// 查詢指定 provider 在此集合中是否標記成功。
     pub fn includes(self: ProviderSuccesses, provider: DdnsProvider) bool {
         return switch (provider) {
+            .cloudflare => self.cloudflare,
             .afraid => self.afraid,
             .dynu => self.dynu,
             .noip => self.noip,

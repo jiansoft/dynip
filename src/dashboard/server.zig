@@ -211,7 +211,7 @@ fn renderDashboardPage(allocator: std.mem.Allocator, app_config: config_mod.AppC
     // 取得實際 Public IP 快照。
     const ip_snap = ddns.getPublicIpSnapshot();
     const public_ip = if (ip_snap.initialized) ip_snap.ipSlice() else "—";
-    // Public IP 來源，例如 "stun" / "ipify"。
+    // Public IP 來源，例如 "stun" / "cloudflare"。
     //
     // Dashboard 不自己推測來源；來源必須由 DDNS core 在成功 lookup 時寫入。
     // 這樣畫面看到的值才會和 log 裡的 `public ip service succeeded` 一致。
@@ -363,6 +363,23 @@ fn renderConfigPage(allocator: std.mem.Allocator, app_config: config_mod.AppConf
     , .{ app_config.afraid.enabled, if (afraid_configured) "✅ Yes" else "❌ No" });
     try writeHtml(out, app_config.afraid.url);
     try out.print("</td></tr>\n", .{});
+
+    // Cloudflare 不使用傳統 DDNS 更新 URL，而是固定呼叫 Cloudflare REST API。
+    // Config 頁面只顯示 zone ID 與 hostname 數量；api_token 絕不送到瀏覽器。
+    const cloudflare_configured = app_config.cloudflare.api_token.len > 0 and
+        app_config.cloudflare.zone_id.len > 0 and app_config.cloudflare.hostnames.len > 0;
+    try out.print(
+        \\<tr><td><strong>Cloudflare DNS</strong></td><td>{}</td><td>{s}</td><td>zone=
+    , .{ app_config.cloudflare.enabled, if (cloudflare_configured) "✅ Yes" else "❌ No" });
+    if (app_config.cloudflare.zone_id.len == 0) {
+        try out.writeAll("—");
+    } else {
+        try writeHtml(out, app_config.cloudflare.zone_id);
+    }
+    try out.print(", hostnames={d}, proxied={}</td></tr>\n", .{
+        app_config.cloudflare.hostnames.len,
+        app_config.cloudflare.proxied,
+    });
 
     // Render Dynu
     const dynu_configured = app_config.dynu.username.len > 0 and app_config.dynu.password.len > 0;
@@ -616,7 +633,7 @@ fn displayStatusLabel(status: service.DisplayStatus) []const u8 {
 ///
 /// - `PublicIpSnapshot` 只保存「最後一輪 public IP lookup」的結果。
 /// - STUN 成功時，public IP 的來源就是 "stun"，錯誤欄位為空。
-/// - STUN 失敗但 HTTP fallback 成功時，來源會是 "ipify" 等 HTTP 服務，
+/// - STUN 失敗但 HTTP fallback 成功時，來源會是 "cloudflare" HTTP 服務，
 ///   而 `stun_error_len` 會保存失敗原因，畫面就能顯示 `failed`。
 fn publicIpStunStatus(snapshot: *const ddns.PublicIpSnapshot) []const u8 {
     if (!snapshot.initialized) return "—";

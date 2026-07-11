@@ -1,0 +1,341 @@
+//! Cloudflare DNS API provider.
+//!
+//! 這個模組只負責 Cloudflare HTTP/JSON 協定；排程、Redis retry 與 dashboard
+//! 仍由 ddns.zig 協調。輸入一個驗證過的 IP 後，會更新對應的 A 或 AAAA record。
+
+const std = @import("std");
+const config_mod = @import("../../base/config.zig");
+const http = @import("../../io/http.zig");
+const c = @import("c");
+
+/// Cloudflare REST API 固定根網址。
+const api_base_url = "https://api.cloudflare.com/client/v4";
+
+/// Cloudflare record 的中繼資料通常比排程更新間隔穩定得多。
+/// 使用短時間快取能減少 API 呼叫，同時仍能在合理時間內發現人工 DNS 修改。
+const record_cache_ttl_seconds: i64 = 60;
+
+/// 一筆已存在 record 的快取。所有 slice 都由 page allocator 擁有並存活到行程結束；
+/// 設定的 DDNS record 數量通常很少，因此以設定數量為上限的簡單快取已足夠。
+const CachedRecord = struct {
+    key: []u8,
+    id: []u8,
+    content: []u8,
+    expires_at: i64,
+};
+
+/// 排程工作可能呼叫 Cloudflare provider，同時 dashboard 會讀取 snapshot。
+/// 若未來 refresh 改為並行執行，這把 mutex 仍可讓快取讀寫保持安全。
+var record_cache_mutex: std.atomic.Mutex = .unlocked;
+var record_cache: std.ArrayListUnmanaged(CachedRecord) = .empty;
+
+/// DNS record 對應的位址家族。
+pub const IpFamily = enum {
+    /// IPv4 對應 Cloudflare A record。
+    ipv4,
+    /// IPv6 對應 Cloudflare AAAA record。
+    ipv6,
+};
+
+/// 從已驗證的 IP 字串判斷 IPv4 或 IPv6。
+pub fn familyForIp(ip: []const u8) !IpFamily {
+    return switch (try std.Io.net.IpAddress.parse(ip, 0)) {
+        .ip4 => .ipv4,
+        .ip6 => .ipv6,
+    };
+}
+
+/// 將 IP family 轉換成 Cloudflare DNS record type。
+pub fn recordType(family: IpFamily) []const u8 {
+    return switch (family) {
+        .ipv4 => "A",
+        .ipv6 => "AAAA",
+    };
+}
+
+/// Cloudflare response 的共用 envelope。實際資料放在 result。
+fn Envelope(comptime Result: type) type {
+    return struct {
+        success: bool,
+        result: Result,
+        errors: []const ApiError = &.{},
+    };
+}
+
+/// API 錯誤中可供人類閱讀的最小欄位。
+const ApiError = struct {
+    code: u32 = 0,
+    message: []const u8 = "",
+};
+
+/// 查詢既有 DNS record 時需要的最小資料。
+const Record = struct {
+    id: []const u8,
+    content: []const u8,
+};
+
+/// POST 建立 DNS record 的 JSON request body。
+const CreateBody = struct {
+    @"type": []const u8,
+    name: []const u8,
+    content: []const u8,
+    proxied: bool,
+    ttl: u32,
+};
+
+/// PATCH 時只修改 content，避免覆蓋既有 record 的 proxy、TTL、comment。
+const PatchBody = struct {
+    content: []const u8,
+};
+
+/// 更新設定中全部 hostname 的 A 或 AAAA record。
+///
+/// allocator 預期是單次 refresh 的 Arena allocator，因此所有 JSON、URL、Bearer
+/// header 的暫存配置都會隨 refresh 結束一次釋放。
+pub fn update(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    config: config_mod.Cloudflare,
+    ip: []const u8,
+) !void {
+    if (config.api_token.len == 0) return error.MissingCloudflareApiToken;
+    if (config.zone_id.len == 0) return error.MissingCloudflareZoneId;
+    if (config.hostnames.len == 0) return error.MissingCloudflareHostnames;
+
+    const family = try familyForIp(ip);
+    for (config.hostnames) |hostname| {
+        if (hostname.len == 0) return error.InvalidCloudflareHostname;
+        try updateOne(allocator, client, config, hostname, ip, family);
+    }
+}
+
+/// 對一個 hostname 執行 list、比較、PATCH 或 POST 的收斂流程。
+fn updateOne(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    config: config_mod.Cloudflare,
+    hostname: []const u8,
+    ip: []const u8,
+    family: IpFamily,
+) !void {
+    const existing = try findRecord(allocator, client, config, hostname, family);
+    if (existing) |record| {
+        if (std.mem.eql(u8, record.content, ip)) return;
+        return patchRecord(allocator, client, config, record.id, ip);
+    }
+    return createRecord(allocator, client, config, hostname, ip, family);
+}
+
+/// 查詢同名同型別的 record；null 表示 API 成功但 record 不存在。
+fn findRecord(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    config: config_mod.Cloudflare,
+    hostname: []const u8,
+    family: IpFamily,
+) !?Record {
+    const cache_key = try makeCacheKey(allocator, config.zone_id, hostname, family);
+    if (cacheLookup(cache_key)) |cached| return cached;
+
+    const name = try encodeQueryValue(allocator, hostname);
+    const url = try std.fmt.allocPrint(
+        allocator,
+        "{s}/zones/{s}/dns_records?type={s}&name={s}",
+        .{ api_base_url, config.zone_id, recordType(family), name },
+    );
+    const response = try send(allocator, client, url, config.api_token, .GET, null);
+    defer allocator.free(response.body);
+    try http.ensureSuccessStatus(response.status, response.body);
+
+    const parsed = try std.json.parseFromSliceLeaky(Envelope([]Record), allocator, response.body, .{
+        .ignore_unknown_fields = true,
+    });
+    if (!parsed.success) return reportApiFailure(parsed.errors);
+    if (parsed.result.len == 0) return null;
+    cacheStore(cache_key, parsed.result[0]);
+    return parsed.result[0];
+}
+
+/// 使用 PATCH 只變更 IP，保留 Cloudflare 端原有的非 IP 設定。
+fn patchRecord(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    config: config_mod.Cloudflare,
+    record_id: []const u8,
+    ip: []const u8,
+) !void {
+    const url = try std.fmt.allocPrint(allocator, "{s}/zones/{s}/dns_records/{s}", .{
+        api_base_url, config.zone_id, record_id,
+    });
+    const response = try sendJson(allocator, client, url, config.api_token, .PATCH, PatchBody{ .content = ip });
+    defer allocator.free(response.body);
+    try ensureSuccessfulResponse(allocator, response);
+    cacheUpdateContent(record_id, ip);
+}
+
+/// 建立不易碰撞的行程內快取 key。必須包含 zone ID 與 record type，
+/// 因為同一 hostname 合法情況下可同時擁有彼此獨立的 A 與 AAAA record。
+fn makeCacheKey(allocator: std.mem.Allocator, zone_id: []const u8, hostname: []const u8, family: IpFamily) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}|{s}|{s}", .{ zone_id, recordType(family), hostname });
+}
+
+/// 回傳未過期項目的值複本。回傳 slice 屬於行程快取，呼叫端不可釋放它們。
+fn cacheLookup(key: []const u8) ?Record {
+    // 新增項目時 ArrayList 可能重新配置記憶體，因此讀寫都必須取得同一把鎖。
+    // 回傳的 Record 是小型值複本，內含由 page allocator 擁有的穩定 slice；
+    // 鎖釋放後它仍然有效。
+    lockRecordCache();
+    defer record_cache_mutex.unlock();
+    // 快取策略刻意採粗粒度的 60 秒，因此 Unix 秒已足夠。
+    const now: i64 = @intCast(c.time(null));
+    for (record_cache.items) |entry| {
+        // 此處忽略而不刪除過期項目，讓讀取操作不需要配置或搬移 ArrayList。
+        // 下一次成功 API 查詢會由 cacheStore 直接取代該項目。
+        if (entry.expires_at > now and std.mem.eql(u8, entry.key, key)) {
+            return .{ .id = entry.id, .content = entry.content };
+        }
+    }
+    return null;
+}
+
+/// 新增或取代既有 record 快取項目。必須由 page allocator 複製資料，
+/// 因為 JSON 回應記憶體屬於呼叫端 arena，refresh 結束後就會消失。
+fn cacheStore(key: []const u8, record: Record) void {
+    // JSON parser 產生的 slice 借用 refresh arena。一定要複製到 page allocator，
+    // 因為 arena 會在 refresh 後 deinit，而快取的生命週期比它長。
+    lockRecordCache();
+    defer record_cache_mutex.unlock();
+    const allocator = std.heap.page_allocator;
+    const now: i64 = @intCast(c.time(null));
+    for (record_cache.items) |*entry| {
+        if (!std.mem.eql(u8, entry.key, key)) continue;
+        // 這是更新既有快取項目。保留 key 的配置，但替換新 Cloudflare 回應帶回的兩個欄位。
+        allocator.free(entry.id);
+        allocator.free(entry.content);
+        entry.id = allocator.dupe(u8, record.id) catch return;
+        entry.content = allocator.dupe(u8, record.content) catch return;
+        entry.expires_at = now + record_cache_ttl_seconds;
+        return;
+    }
+    // 沒有相符 key 時新增一筆自有項目。個別配置失敗只代表不快取；
+    // 呼叫端仍會使用剛取得的 API 回應，因此不影響 DNS 更新正確性。
+    record_cache.append(allocator, .{
+        .key = allocator.dupe(u8, key) catch return,
+        .id = allocator.dupe(u8, record.id) catch return,
+        .content = allocator.dupe(u8, record.content) catch return,
+        .expires_at = now + record_cache_ttl_seconds,
+    }) catch {};
+}
+
+/// PATCH 以 record ID 識別目標，所以成功後更新同 ID 的全部快取項目。
+/// 這可避免下一輪 refresh 拿舊 content 比較後，發出不必要的第二次 PATCH。
+fn cacheUpdateContent(record_id: []const u8, content: []const u8) void {
+    // 呼叫此函式前 PATCH 已成功；更新快取值可避免下次排程以舊 IP content 比較，
+    // 進而重複發送 PATCH。
+    lockRecordCache();
+    defer record_cache_mutex.unlock();
+    const allocator = std.heap.page_allocator;
+    const now: i64 = @intCast(c.time(null));
+    for (record_cache.items) |*entry| {
+        if (!std.mem.eql(u8, entry.id, record_id)) continue;
+        const replacement = allocator.dupe(u8, content) catch return;
+        allocator.free(entry.content);
+        entry.content = replacement;
+        entry.expires_at = now + record_cache_ttl_seconds;
+    }
+}
+
+/// Zig 0.17 的 atomic.Mutex 提供 tryLock，而非阻塞式 lock 方法。
+/// 每次失敗後 yield 可避免緊密忙等，並與本專案 local_cache.zig、
+/// shared_state.zig 已採用的鎖定慣例一致。
+fn lockRecordCache() void {
+    while (!record_cache_mutex.tryLock()) {
+        std.Thread.yield() catch {};
+    }
+}
+
+/// 建立不存在的 record；只在建立時套用設定的 proxied 和 ttl。
+fn createRecord(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    config: config_mod.Cloudflare,
+    hostname: []const u8,
+    ip: []const u8,
+    family: IpFamily,
+) !void {
+    const url = try std.fmt.allocPrint(allocator, "{s}/zones/{s}/dns_records", .{ api_base_url, config.zone_id });
+    const response = try sendJson(allocator, client, url, config.api_token, .POST, CreateBody{
+        .@"type" = recordType(family),
+        .name = hostname,
+        .content = ip,
+        .proxied = config.proxied,
+        .ttl = config.ttl,
+    });
+    defer allocator.free(response.body);
+    try ensureSuccessfulResponse(allocator, response);
+}
+
+/// 建立 Bearer header 後送出無 JSON body 的 Cloudflare request。
+fn send(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    url: []const u8,
+    token: []const u8,
+    method: std.http.Method,
+    body: ?[]const u8,
+) !http.FetchTextResponse {
+    const bearer = try std.fmt.allocPrint(allocator, "Bearer {s}", .{token});
+    const headers = [_]std.http.Header{.{ .name = "authorization", .value = bearer }};
+    return http.requestText(allocator, client, url, .{
+        .method = method,
+        .body = body,
+        .headers = .{ .privileged_headers = &headers },
+    });
+}
+
+/// 將 Zig struct 序列化為 JSON，並加上 Cloudflare Bearer header。
+fn sendJson(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    url: []const u8,
+    token: []const u8,
+    method: std.http.Method,
+    value: anytype,
+) !http.FetchTextResponse {
+    const bearer = try std.fmt.allocPrint(allocator, "Bearer {s}", .{token});
+    const headers = [_]std.http.Header{.{ .name = "authorization", .value = bearer }};
+    return http.requestJson(allocator, client, url, value, .{
+        .request = .{ .method = method, .headers = .{ .privileged_headers = &headers } },
+    });
+}
+
+/// HTTP 2xx 仍可能包含 success=false；兩個層級都必須驗證。
+fn ensureSuccessfulResponse(allocator: std.mem.Allocator, response: http.FetchTextResponse) !void {
+    try http.ensureSuccessStatus(response.status, response.body);
+    const parsed = try std.json.parseFromSliceLeaky(Envelope(std.json.Value), allocator, response.body, .{
+        .ignore_unknown_fields = true,
+    });
+    if (!parsed.success) return reportApiFailure(parsed.errors);
+}
+
+/// 將 Cloudflare API 的細節記錄到 log，並回傳統一錯誤給 retry 層。
+fn reportApiFailure(errors: []const ApiError) anyerror {
+    if (errors.len != 0) std.log.err("cloudflare api error: code={d}, message={s}", .{ errors[0].code, errors[0].message });
+    return error.CloudflareApiFailed;
+}
+
+/// URL query value 的最小 percent encoder，避免 hostname 的 wildcard 等字元破壞 URL。
+fn encodeQueryValue(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
+    var output = std.ArrayList(u8).empty;
+    errdefer output.deinit(allocator);
+    for (value) |byte| {
+        if (std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '_' or byte == '.' or byte == '~') {
+            try output.append(allocator, byte);
+        } else {
+            var escaped: [3]u8 = undefined;
+            _ = try std.fmt.bufPrint(&escaped, "%{X:0>2}", .{byte});
+            try output.appendSlice(allocator, &escaped);
+        }
+    }
+    return output.toOwnedSlice(allocator);
+}
