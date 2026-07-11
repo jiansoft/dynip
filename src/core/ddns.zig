@@ -114,11 +114,16 @@ pub fn refresh(
     ip_lookup.primary_source_counter +%= 1;
     const primary: types.PublicIpService = if (round % 2 == 0) .stun else .cloudflare_trace;
 
-    const ipv4_status = refreshSingle(allocator, io, client, config, .ipv4, primary) catch |err| blk: {
+    // 明確標註 optional 型別：catch 分支的 `null` 代表「此 family 沒有結果」，
+    // Zig 0.17 無法僅從 runtime catch flow 推導出 null 對應的 optional payload。
+    const ipv4_status: ?RefreshStatus = refreshSingle(allocator, io, client, config, .ipv4, primary) catch |err| blk: {
+        // `none` 是使用者明確停用該 family，不是網路故障，因此不寫 warning。
+        if (err == error.PublicIpFamilyDisabled) break :blk null;
         std.log.warn("ipv4 ddns refresh failed: {}", .{err});
         break :blk null;
     };
-    const ipv6_status = refreshSingle(allocator, io, client, config, .ipv6, primary) catch |err| blk: {
+    const ipv6_status: ?RefreshStatus = refreshSingle(allocator, io, client, config, .ipv6, primary) catch |err| blk: {
+        if (err == error.PublicIpFamilyDisabled) break :blk null;
         std.log.warn("ipv6 ddns refresh failed: {}", .{err});
         break :blk null;
     };
@@ -126,6 +131,11 @@ pub fn refresh(
     // 只有兩族都無法查詢或更新時才讓 scheduler 視為整輪失敗。
     if (ipv4_status) |status| return status;
     if (ipv6_status) |status| return status;
+    // 若兩族都被明確設成 `none`，這是使用者要求的 idle 模式；回傳正常的
+    // skip 狀態，避免 scheduler 發送「兩個 lookup 都壞掉」的失敗通知。
+    if (std.mem.eql(u8, config.ddns.ipv4_provider, "none") and std.mem.eql(u8, config.ddns.ipv6_provider, "none")) {
+        return .skipped_cached_ip;
+    }
     return error.AllPublicIpFamilyLookupsFailed;
 }
 
@@ -146,7 +156,12 @@ fn refreshSingle(
     const scratch = arena.allocator();
 
     // 取得的 IP 已經驗證格式與 family；IPify family endpoint 讓雙 stack 結果可分開更新。
-    const public_ip_lookup = try ip_lookup.getPublicIpForFamily(scratch, client, family, primary);
+    // 從 config 取出這個 family 自己的來源；IPv4 設為 `none` 不影響 IPv6。
+    const detection_provider = switch (family) {
+        .ipv4 => config.ddns.ipv4_provider,
+        .ipv6 => config.ddns.ipv6_provider,
+    };
+    const public_ip_lookup = try ip_lookup.getPublicIpForFamily(scratch, client, family, primary, detection_provider);
     const ip_now = public_ip_lookup.ip;
     const ip_source = ip_lookup.serviceName(public_ip_lookup.service);
 

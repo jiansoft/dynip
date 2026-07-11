@@ -121,7 +121,10 @@ Later sources override earlier ones.
     "zone_id": "",
     "hostnames": ["home.example.com"],
     "proxied": false,
-    "ttl": 1
+    "ttl": 1,
+    "record_comment": "managed-by:dynip",
+    "managed_record_comment": "managed-by:dynip",
+    "http_retry_count": 2
   },
   "afraid": {
     "enabled": true,
@@ -145,6 +148,8 @@ Later sources override earlier ones.
   "ddns": {
     "refresh_interval_seconds": 60,
     "dedupe_ttl_seconds": 86400,
+    "ipv4_provider": "auto",
+    "ipv6_provider": "auto",
     "redis": {
       "enabled": true,
       "addr": "localhost:6379",
@@ -170,7 +175,13 @@ Later sources override earlier ones.
 
 ### Cloudflare DNS
 
-Cloudflare uses an API Token with DNS Edit permission for the configured zone. Each configured hostname is reconciled independently: IPv4 updates an A record, IPv6 updates an AAAA record, an unchanged record is skipped, and an existing record is PATCHed only at its IP content so its Cloudflare-side proxy, TTL, comments, and tags are preserved. Missing records are created with the configured proxied value and TTL; TTL 1 means Cloudflare Automatic.
+Cloudflare uses an API Token with DNS Edit permission for the configured zone. Each configured hostname is reconciled independently: IPv4 updates an A record, IPv6 updates an AAAA record, an unchanged record is skipped, and an existing record is PATCHed only at its IP content so its Cloudflare-side proxy, TTL, comments, and tags are preserved. Missing records are created with the configured proxied value, TTL, and `record_comment`; TTL 1 means Cloudflare Automatic.
+
+Set both `record_comment` and `managed_record_comment` to a unique value such as `managed-by:dynip` when more than one DDNS instance may use the same hostname. The selector makes this instance update only records it owns. If it finds multiple matching records, it stops safely instead of choosing an arbitrary one. `http_retry_count` retries transient Cloudflare rate-limit (429), server (5xx), and transport failures with exponential backoff.
+
+### Per-family public IP providers
+
+`ddns.ipv4_provider` and `ddns.ipv6_provider` are independent. Each accepts `auto` (STUN/Cloudflare Trace fallback), `none`, `stun`, `cloudflare_trace`, `url:<https-url>`, `file:<absolute-path>`, or `static:<ip>`. Use `none` on an IPv4-only or IPv6-only network; it deliberately skips that family without reporting a refresh failure. `file:` reads the first non-empty, non-comment line and `static:` is intended for deterministic tests.
 
 All three DDNS providers use the same top-level structure:
 
@@ -188,11 +199,11 @@ Provider-specific fields:
 
 When `ddns.redis.enabled = true`:
 
-- the desired public IP is stored in `DDNS:DesiredIP`
-- each provider has a Redis hash: `DDNS:Provider:afraid`, `DDNS:Provider:dynu`, or `DDNS:Provider:noip`
+- the desired public IP is stored separately in `DDNS:DesiredIP:ipv4` and `DDNS:DesiredIP:ipv6`
+- each provider has one Redis hash per family, for example `DDNS:Provider:cloudflare:ipv4` and `DDNS:Provider:cloudflare:ipv6`
 - provider hashes track `current_ip`, `desired_ip`, `status`, `retry_count`, `next_retry_at`, `last_error`, and `updated_at`
 - failed providers are retried with exponential backoff, while successful providers are skipped until the desired IP changes
-- legacy observer keys are still written after successful updates: `MyPublicIP`, `MyPublicIP:{ip}`, and `MyPublicIP:{provider}`
+- observer and dedupe keys are family-isolated, for example `MyPublicIP:ipv4`, `MyPublicIP:ipv4:1.2.3.4`, and `MyPublicIP:cloudflare:ipv4`
 
 Provider hash example:
 
@@ -227,6 +238,9 @@ When `ddns.redis.enabled = false`:
 - `CLOUDFLARE_HOSTNAMES` (JSON string array)
 - `CLOUDFLARE_PROXIED`
 - `CLOUDFLARE_TTL`
+- `CLOUDFLARE_RECORD_COMMENT`
+- `CLOUDFLARE_MANAGED_RECORD_COMMENT`
+- `CLOUDFLARE_HTTP_RETRY_COUNT`
 
 #### [Afraid.org](https://freedns.afraid.org/)
 
@@ -259,6 +273,8 @@ When `ddns.redis.enabled = false`:
 - `REDIS_DB`
 - `DDNS_DEDUPE_TTL_SECONDS`
 - `DDNS_REFRESH_INTERVAL_SECONDS`
+- `DDNS_IPV4_PROVIDER`
+- `DDNS_IPV6_PROVIDER`
 - `LOG_CONSOLE_LEVEL`
 - `LOG_FILE_LEVEL`
 - `LOG_SEQ_ENABLED`
@@ -299,6 +315,8 @@ REDIS_PASSWORD=<set-if-needed>
 REDIS_ENABLED=false
 DDNS_REFRESH_INTERVAL_SECONDS=60
 DDNS_DEDUPE_TTL_SECONDS=86400
+DDNS_IPV4_PROVIDER=auto
+DDNS_IPV6_PROVIDER=auto
 
 LOG_CONSOLE_LEVEL=info
 LOG_FILE_LEVEL=info

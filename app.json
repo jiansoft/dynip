@@ -5,7 +5,10 @@
     "zone_id": "",
     "hostnames": [],
     "proxied": false,
-    "ttl": 1
+    "ttl": 1,
+    "record_comment": "",
+    "managed_record_comment": "",
+    "http_retry_count": 2
   },
   "afraid": {
     "enabled": true,
@@ -29,6 +32,8 @@
   "ddns": {
     "refresh_interval_seconds": 60,
     "dedupe_ttl_seconds": 86400,
+    "ipv4_provider": "auto",
+    "ipv6_provider": "auto",
     "redis": {
       "enabled": false,
       "addr": "localhost:6379",

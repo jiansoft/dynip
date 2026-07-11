@@ -121,7 +121,10 @@ No-IP  current_ip = 5.6.7.8  -> 更新或重試
     "zone_id": "",
     "hostnames": ["home.example.com"],
     "proxied": false,
-    "ttl": 1
+    "ttl": 1,
+    "record_comment": "managed-by:dynip",
+    "managed_record_comment": "managed-by:dynip",
+    "http_retry_count": 2
   },
   "afraid": {
     "enabled": true,
@@ -145,6 +148,8 @@ No-IP  current_ip = 5.6.7.8  -> 更新或重試
   "ddns": {
     "refresh_interval_seconds": 60,
     "dedupe_ttl_seconds": 86400,
+    "ipv4_provider": "auto",
+    "ipv6_provider": "auto",
     "redis": {
       "enabled": true,
       "addr": "localhost:6379",
@@ -170,7 +175,13 @@ No-IP  current_ip = 5.6.7.8  -> 更新或重試
 
 ### Cloudflare DNS
 
-Cloudflare 使用對目標 zone 具有 DNS Edit 權限的 API Token。每個 hostname 都會各自收斂：IPv4 更新 A record、IPv6 更新 AAAA record；IP 相同時略過；IP 不同時只 PATCH IP content，保留 Cloudflare 端既有 proxy、TTL、comment 與 tags。record 不存在時才使用設定的 proxied 與 TTL 建立；TTL 設為 1 代表 Cloudflare Automatic。
+Cloudflare 使用對目標 zone 具有 DNS Edit 權限的 API Token。每個 hostname 都會各自收斂：IPv4 更新 A record、IPv6 更新 AAAA record；IP 相同時略過；IP 不同時只 PATCH IP content，保留 Cloudflare 端既有 proxy、TTL、comment 與 tags。record 不存在時才使用設定的 proxied、TTL 與 `record_comment` 建立；TTL 設為 1 代表 Cloudflare Automatic。
+
+若多個 DDNS instance 可能管理同一 hostname，請把 `record_comment` 與 `managed_record_comment` 都設定為唯一值，例如 `managed-by:dynip`。selector 會讓本 instance 只更新自己擁有的 record；若找到多筆符合 record，程式會安全停止，不會任意挑第一筆。`http_retry_count` 會對 Cloudflare 暫時性 rate limit（429）、server error（5xx）與傳輸失敗，以指數退避重試。
+
+### 每個 family 獨立的 public IP provider
+
+`ddns.ipv4_provider` 與 `ddns.ipv6_provider` 可各自設定，支援 `auto`（STUN/Cloudflare Trace fallback）、`none`、`stun`、`cloudflare_trace`、`url:<https-url>`、`file:<absolute-path>` 與 `static:<ip>`。IPv4-only 或 IPv6-only 網路可設為 `none`，這是刻意略過，不會被視為 refresh 失敗。`file:` 讀取第一個非空、非註解行；`static:` 適合可重現的測試。
 
 三家 DDNS 供應商統一採用這種欄位格式：
 
@@ -188,11 +199,11 @@ Cloudflare 使用對目標 zone 具有 DNS Edit 權限的 API Token。每個 hos
 
 當 `ddns.redis.enabled = true` 時：
 
-- 目前希望所有 provider 收斂到的 public IP 會寫到 `DDNS:DesiredIP`
-- 每家 provider 都有自己的 Redis hash：`DDNS:Provider:afraid`、`DDNS:Provider:dynu` 或 `DDNS:Provider:noip`
+- 希望 provider 收斂到的 public IP 會依 family 分別寫到 `DDNS:DesiredIP:ipv4` 與 `DDNS:DesiredIP:ipv6`
+- 每家 provider 每個 family 都有自己的 Redis hash，例如 `DDNS:Provider:cloudflare:ipv4` 與 `DDNS:Provider:cloudflare:ipv6`
 - provider hash 會記錄 `current_ip`、`desired_ip`、`status`、`retry_count`、`next_retry_at`、`last_error` 與 `updated_at`
 - 失敗 provider 會依 exponential backoff 重試；已成功 provider 會跳過，直到 desired IP 再次變更
-- 成功更新後仍會寫入相容用觀察 key：`MyPublicIP`、`MyPublicIP:{ip}` 與 `MyPublicIP:{provider}`
+- observer 與 dedupe key 也會依 family 隔離，例如 `MyPublicIP:ipv4`、`MyPublicIP:ipv4:1.2.3.4` 與 `MyPublicIP:cloudflare:ipv4`
 
 provider hash 範例：
 
@@ -227,6 +238,9 @@ DDNS:Provider:noip
 - `CLOUDFLARE_HOSTNAMES`（JSON 字串陣列）
 - `CLOUDFLARE_PROXIED`
 - `CLOUDFLARE_TTL`
+- `CLOUDFLARE_RECORD_COMMENT`
+- `CLOUDFLARE_MANAGED_RECORD_COMMENT`
+- `CLOUDFLARE_HTTP_RETRY_COUNT`
 
 #### [Afraid.org](https://freedns.afraid.org/)
 
@@ -259,6 +273,8 @@ DDNS:Provider:noip
 - `REDIS_DB`
 - `DDNS_DEDUPE_TTL_SECONDS`
 - `DDNS_REFRESH_INTERVAL_SECONDS`
+- `DDNS_IPV4_PROVIDER`
+- `DDNS_IPV6_PROVIDER`
 - `LOG_CONSOLE_LEVEL`
 - `LOG_FILE_LEVEL`
 - `LOG_SEQ_ENABLED`
@@ -299,6 +315,8 @@ REDIS_PASSWORD=<set-if-needed>
 REDIS_ENABLED=false
 DDNS_REFRESH_INTERVAL_SECONDS=60
 DDNS_DEDUPE_TTL_SECONDS=86400
+DDNS_IPV4_PROVIDER=auto
+DDNS_IPV6_PROVIDER=auto
 
 LOG_CONSOLE_LEVEL=info
 LOG_FILE_LEVEL=info

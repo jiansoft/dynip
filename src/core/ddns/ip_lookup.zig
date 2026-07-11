@@ -139,7 +139,14 @@ pub fn getPublicIpForFamily(
     client: *std.http.Client,
     family: IpFamily,
     primary: PublicIpService,
+    provider: []const u8,
 ) !PublicIpLookup {
+    // 非 auto provider 不走 STUN/Cloudflare fallback，而是嚴格使用使用者指定來源。
+    // 這讓測試、容器與只有單一 family 的網路可預期地控制行為。
+    if (!std.mem.eql(u8, provider, "auto")) {
+        return getPublicIpFromConfiguredProvider(allocator, client, family, provider);
+    }
+
     const lookup = try getPublicIpWithPrimary(allocator, client, primary);
     if (lookup.family == family) return lookup;
     // getPublicIpWithPrimary 配置了結果字串；這筆結果不屬於要求的 family，
@@ -155,6 +162,73 @@ pub fn getPublicIpForFamily(
         return error.PublicIpFamilyUnavailable;
     }
     return fallback;
+}
+
+/// 解析 `ddns.ipv4_provider` / `ddns.ipv6_provider` 的設定值。
+///
+/// 支援的格式刻意保持簡單且不執行 shell：
+/// - `none`：此 family 不由本程式管理。
+/// - `stun`、`cloudflare_trace`：固定使用內建來源。
+/// - `url:<url>`：向 URL 讀取一行純文字 IP。
+/// - `file:<absolute-path>`：讀取檔案第一個非空、非註解行，適合測試注入。
+/// - `static:<ip>`：直接使用固定 IP，適合單元/整合測試。
+fn getPublicIpFromConfiguredProvider(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    family: IpFamily,
+    provider: []const u8,
+) !PublicIpLookup {
+    if (std.mem.eql(u8, provider, "none")) return error.PublicIpFamilyDisabled;
+
+    if (std.mem.eql(u8, provider, "stun") or std.mem.eql(u8, provider, "cloudflare_trace")) {
+        const service: PublicIpService = if (std.mem.eql(u8, provider, "stun")) .stun else .cloudflare_trace;
+        const ip = try fetchPublicIpFromService(allocator, client, service);
+        const detected_family = try familyForIp(ip);
+        if (detected_family != family) {
+            allocator.free(ip);
+            return error.PublicIpFamilyMismatch;
+        }
+        return .{ .ip = ip, .service = service, .family = family };
+    }
+
+    if (stripProviderPrefix(provider, "static:")) |ip_text| {
+        return configuredTextLookup(allocator, ip_text, family, .cloudflare_trace);
+    }
+    if (stripProviderPrefix(provider, "file:")) |path| {
+        // `readFileAlloc` 限制為 4 KiB，因為這不是一般資料檔，而是一個小型測試/注入介面。
+        const text = try std.Io.Dir.cwd().readFileAlloc(client.io, path, allocator, .limited(4096));
+        return configuredTextLookup(allocator, firstIpLine(text), family, .cloudflare_trace);
+    }
+    if (stripProviderPrefix(provider, "url:")) |url| {
+        const ip = try fetchPlainTextIp(allocator, client, url, family);
+        return .{ .ip = ip, .service = .cloudflare_trace, .family = family };
+    }
+    return error.InvalidPublicIpProvider;
+}
+
+/// Zig 0.17.0 尚未提供 `std.mem.stripIfStartsWith`，因此在此集中實作
+/// 相同語意：前綴相符時回傳剩餘字串，不相符則回傳 null。
+/// 把版本相容細節留在這個小 helper，可讓上方 provider parser 維持易讀。
+fn stripProviderPrefix(value: []const u8, prefix: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, value, prefix)) return null;
+    return value[prefix.len..];
+}
+
+/// 從 static 或 file 的文字取得 IP，並保證它符合被要求的 family。
+fn configuredTextLookup(allocator: std.mem.Allocator, text: []const u8, family: IpFamily, service: PublicIpService) !PublicIpLookup {
+    const normalized = try normalizePublicIp(text);
+    if (try familyForIp(normalized) != family) return error.PublicIpFamilyMismatch;
+    return .{ .ip = try allocator.dupe(u8, normalized), .service = service, .family = family };
+}
+
+/// file provider 只取第一個可用資料行；空白行與 `#` 註解讓測試 fixture 更易閱讀。
+fn firstIpLine(text: []const u8) []const u8 {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len != 0 and trimmed[0] != '#') return trimmed;
+    }
+    return "";
 }
 
 fn lookupMatchesFamily(lookup: PublicIpLookup, family: IpFamily) bool {
@@ -387,4 +461,21 @@ test "family fallback accepts only the requested address family" {
 
     try std.testing.expect(!lookupMatchesFamily(ipv4, .ipv6));
     try std.testing.expect(lookupMatchesFamily(ipv6, .ipv6));
+}
+
+test "configured static provider isolates the requested family" {
+    const lookup = try configuredTextLookup(std.testing.allocator, "2001:db8::42", .ipv6, .cloudflare_trace);
+    defer std.testing.allocator.free(lookup.ip);
+    try std.testing.expectEqual(IpFamily.ipv6, lookup.family);
+    try std.testing.expectEqualStrings("2001:db8::42", lookup.ip);
+    try std.testing.expectError(error.PublicIpFamilyMismatch, configuredTextLookup(std.testing.allocator, "203.0.113.42", .ipv6, .stun));
+}
+
+test "file provider text accepts first non-comment ip line" {
+    try std.testing.expectEqualStrings("203.0.113.42", firstIpLine("# test fixture\n\n 203.0.113.42\r\n"));
+}
+
+test "provider prefix helper returns only matching suffix" {
+    try std.testing.expectEqualStrings("203.0.113.42", stripProviderPrefix("static:203.0.113.42", "static:").?);
+    try std.testing.expect(stripProviderPrefix("stun", "static:") == null);
 }

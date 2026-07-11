@@ -57,6 +57,15 @@ pub const Cloudflare = struct {
     proxied: bool = false,
     /// 建立新 record 時的 TTL；1 代表 Cloudflare Automatic。
     ttl: u32 = 1,
+    /// 新建 record 時寫入的 Cloudflare comment。空字串代表不寫入 comment。
+    /// 建議填入例如 `managed-by:dynip`，讓多個 DDNS instance 可安全共存。
+    record_comment: []const u8 = "",
+    /// 只允許更新 comment 完全相符的既有 record。空字串維持舊行為：
+    /// 所有同名同型別 record 都視為可管理；正式多 instance 部署應設定此欄位。
+    managed_record_comment: []const u8 = "",
+    /// Cloudflare List/PATCH/POST 遇到 429 或 5xx 時的額外嘗試次數。
+    /// 例如 2 代表第一次失敗後最多再試兩次。
+    http_retry_count: u32 = 2,
 };
 
 /// 寫進日誌前用來取代 token / password 的固定遮罩字串。
@@ -127,6 +136,11 @@ pub const Ddns = struct {
     refresh_interval_seconds: u64 = 60,
     /// Redis 防重複更新 key 的 TTL 秒數。
     dedupe_ttl_seconds: u64 = 60 * 60 * 24,
+    /// IPv4 public IP 的來源：`auto`、`none`、`stun`、`cloudflare_trace`、
+    /// `url:<https-url>`、`file:<absolute-path>` 或 `static:<ip>`。
+    ipv4_provider: []const u8 = "auto",
+    /// IPv6 public IP 的來源；格式與 ipv4_provider 相同，兩者可獨立停用或指定。
+    ipv6_provider: []const u8 = "auto",
     /// Redis 連線設定。
     redis: Redis = .{},
 };
@@ -419,6 +433,9 @@ const env_overrides = [_]EnvOverride{
     .{ .key = "CLOUDFLARE_HOSTNAMES", .field = "cloudflare.hostnames", .kind = .str_arr },
     .{ .key = "CLOUDFLARE_PROXIED", .field = "cloudflare.proxied", .kind = .bool },
     .{ .key = "CLOUDFLARE_TTL", .field = "cloudflare.ttl", .kind = .u32 },
+    .{ .key = "CLOUDFLARE_RECORD_COMMENT", .field = "cloudflare.record_comment", .kind = .str },
+    .{ .key = "CLOUDFLARE_MANAGED_RECORD_COMMENT", .field = "cloudflare.managed_record_comment", .kind = .str },
+    .{ .key = "CLOUDFLARE_HTTP_RETRY_COUNT", .field = "cloudflare.http_retry_count", .kind = .u32 },
     .{ .key = "AFRAID_URL", .field = "afraid.url", .kind = .str },
     .{ .key = "AFRAID_ENABLED", .field = "afraid.enabled", .kind = .bool },
     .{ .key = "AFRAID_PATH", .field = "afraid.path", .kind = .str },
@@ -439,6 +456,8 @@ const env_overrides = [_]EnvOverride{
     .{ .key = "REDIS_DB", .field = "ddns.redis.db", .kind = .u32 },
     .{ .key = "DDNS_REFRESH_INTERVAL_SECONDS", .field = "ddns.refresh_interval_seconds", .kind = .u64 },
     .{ .key = "DDNS_DEDUPE_TTL_SECONDS", .field = "ddns.dedupe_ttl_seconds", .kind = .u64 },
+    .{ .key = "DDNS_IPV4_PROVIDER", .field = "ddns.ipv4_provider", .kind = .str },
+    .{ .key = "DDNS_IPV6_PROVIDER", .field = "ddns.ipv6_provider", .kind = .str },
     // Dashboard 可用環境變數覆寫 app.json，Docker 啟動時會用到。
     .{ .key = "DASHBOARD_ENABLED", .field = "dashboard.enabled", .kind = .bool },
     .{ .key = "DASHBOARD_HOST", .field = "dashboard.host", .kind = .str },
@@ -519,6 +538,9 @@ fn resolveField(config: *AppConfig, comptime path: []const u8) *resolveFieldType
 
 /// `resolveField` 的型別層計算：在 comptime 算出點分路徑最終指向的型別。
 fn resolveFieldType(comptime T: type, comptime path: []const u8) type {
+    // env_overrides 會為每個環境變數特化一次這個函式；設定項目較多時，
+    // Zig 預設的 1000 個 comptime 分支不足，明確提高上限而不影響執行期成本。
+    @setEvalBranchQuota(10_000);
     // 找到第一個 `.` 的位置。
     const dot = comptime std.mem.indexOfScalar(u8, path, '.') orelse {
         // 沒有 `.`，代表這已經是最後一層，直接用 `@field` 取出型別。
@@ -539,6 +561,8 @@ fn resolveFieldImpl(ptr: anytype, comptime path: []const u8) *resolveFieldType(
     @typeInfo(@TypeOf(ptr)).pointer.child,
     path,
 ) {
+    // 與 resolveFieldType 同理：這是純編譯期路徑展開，增加 quota 只影響編譯器。
+    @setEvalBranchQuota(10_000);
     // `comptime` 確保條件在編譯期求值，產生的 if/else 是靜態分支，不是執行期分派。
     const dot = comptime std.mem.indexOfScalar(u8, path, '.');
     if (comptime dot == null) {
@@ -705,6 +729,11 @@ test "dotenv text overrides config values" {
         \\REDIS_DB=5
         \\DDNS_DEDUPE_TTL_SECONDS=86400
         \\DDNS_REFRESH_INTERVAL_SECONDS=90
+        \\DDNS_IPV4_PROVIDER=static:203.0.113.9
+        \\DDNS_IPV6_PROVIDER=none
+        \\CLOUDFLARE_RECORD_COMMENT=managed-by:dynip
+        \\CLOUDFLARE_MANAGED_RECORD_COMMENT=managed-by:dynip
+        \\CLOUDFLARE_HTTP_RETRY_COUNT=3
         \\DASHBOARD_ENABLED=true
         \\DASHBOARD_HOST=127.0.0.1
         \\DASHBOARD_PORT=18080
@@ -735,6 +764,11 @@ test "dotenv text overrides config values" {
     try std.testing.expectEqual(@as(u32, 5), config.ddns.redis.db);
     try std.testing.expectEqual(@as(u64, 86400), config.ddns.dedupe_ttl_seconds);
     try std.testing.expectEqual(@as(u64, 90), config.ddns.refresh_interval_seconds);
+    try std.testing.expectEqualStrings("static:203.0.113.9", config.ddns.ipv4_provider);
+    try std.testing.expectEqualStrings("none", config.ddns.ipv6_provider);
+    try std.testing.expectEqualStrings("managed-by:dynip", config.cloudflare.record_comment);
+    try std.testing.expectEqualStrings("managed-by:dynip", config.cloudflare.managed_record_comment);
+    try std.testing.expectEqual(@as(u32, 3), config.cloudflare.http_retry_count);
     try std.testing.expect(config.dashboard.enabled);
     try std.testing.expectEqualStrings("127.0.0.1", config.dashboard.host);
     try std.testing.expectEqual(@as(u32, 18080), config.dashboard.port);

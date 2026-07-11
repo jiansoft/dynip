@@ -72,6 +72,9 @@ const ApiError = struct {
 const Record = struct {
     id: []const u8,
     content: []const u8,
+    /// Cloudflare record comment 是 ownership selector 的依據；舊 record 沒有 comment 時
+    /// API 可能省略欄位，因此提供空字串預設值。
+    comment: []const u8 = "",
 };
 
 /// POST 建立 DNS record 的 JSON request body。
@@ -81,6 +84,7 @@ const CreateBody = struct {
     content: []const u8,
     proxied: bool,
     ttl: u32,
+    comment: []const u8,
 };
 
 /// PATCH 時只修改 content，避免覆蓋既有 record 的 proxy、TTL、comment。
@@ -138,7 +142,7 @@ fn findRecord(
     if (cacheLookup(cache_key)) |cached| return cached;
 
     const url = try listRecordUrl(allocator, config.zone_id, hostname, family);
-    const response = try send(allocator, client, url, config.api_token, .GET, null);
+    const response = try send(allocator, client, url, config.api_token, .GET, null, config.http_retry_count);
     defer allocator.free(response.body);
     try http.ensureSuccessStatus(response.status, response.body);
 
@@ -146,9 +150,24 @@ fn findRecord(
         .ignore_unknown_fields = true,
     });
     if (!parsed.success) return reportApiFailure(parsed.errors);
-    if (parsed.result.len == 0) return null;
-    cacheStore(cache_key, parsed.result[0]);
-    return parsed.result[0];
+    const record = try selectManagedRecord(parsed.result, config.managed_record_comment);
+    if (record == null) return null;
+    cacheStore(cache_key, record.?);
+    return record;
+}
+
+/// 從同名同型別的 Cloudflare 回應中選出「本 instance 擁有」的唯一 record。
+///
+/// selector 空字串是相容模式，接受無 comment 的舊設定；若有兩筆以上同樣可管理，
+/// 寧可停止並交給操作者清理，也絕不任意更新 API 回傳的第一筆。
+fn selectManagedRecord(records: []const Record, selector: []const u8) !?Record {
+    var selected: ?Record = null;
+    for (records) |record| {
+        if (selector.len != 0 and !std.mem.eql(u8, record.comment, selector)) continue;
+        if (selected != null) return error.MultipleManagedCloudflareRecords;
+        selected = record;
+    }
+    return selected;
 }
 
 /// 使用 PATCH 只變更 IP，保留 Cloudflare 端原有的非 IP 設定。
@@ -162,7 +181,7 @@ fn patchRecord(
     const url = try std.fmt.allocPrint(allocator, "{s}/zones/{s}/dns_records/{s}", .{
         api_base_url, config.zone_id, record_id,
     });
-    const response = try sendJson(allocator, client, url, config.api_token, .PATCH, PatchBody{ .content = ip });
+    const response = try sendJson(allocator, client, url, config.api_token, .PATCH, PatchBody{ .content = ip }, config.http_retry_count);
     defer allocator.free(response.body);
     try ensureSuccessfulResponse(allocator, response);
     cacheUpdateContent(record_id, ip);
@@ -171,6 +190,19 @@ fn patchRecord(
 /// 建立不易碰撞的行程內快取 key。必須包含 zone ID 與 record type，
 /// 因為同一 hostname 合法情況下可同時擁有彼此獨立的 A 與 AAAA record。
 fn makeCacheKey(allocator: std.mem.Allocator, zone_id: []const u8, hostname: []const u8, family: IpFamily) ![]u8 {
+    // `std.fmt.allocPrint` 會依格式字串組出一個全新的文字 key，並用傳入的
+    // `allocator` 配置記憶體；函式成功後回傳的 `[]u8` 由呼叫端的 allocator 擁有。
+    // 本模組的呼叫端使用單輪 refresh 的 Arena allocator，所以 refresh 結束時
+    // 這個暫存 key 會自動釋放，不需要在每個 return 分支手動 free。
+    //
+    // 格式 `"{s}|{s}|{s}"` 有三個 `{s}`：`{s}` 的意思是把對應參數當 UTF-8
+    // 字串 slice 寫入；中間的 `|` 是刻意選用的分隔符，讓三段資料不會黏在一起。
+    // 例如 zone_id=`zone-a`、family=`ipv6`、hostname=`home.example.com`，最後會是：
+    // `zone-a|AAAA|home.example.com`。
+    //
+    // 三個欄位缺一不可：同 hostname 可以在不同 zone 存在，也可以同時有 A 和
+    // AAAA record。把 zone、record type、hostname 全放進 key，才能確保它們各自
+    // 使用獨立的 cache entry，不會把 IPv4 的 record ID/content 誤拿給 IPv6 使用。
     return std.fmt.allocPrint(allocator, "{s}|{s}|{s}", .{ zone_id, recordType(family), hostname });
 }
 
@@ -280,7 +312,8 @@ fn createRecord(
         .content = ip,
         .proxied = config.proxied,
         .ttl = config.ttl,
-    });
+        .comment = config.record_comment,
+    }, config.http_retry_count);
     defer allocator.free(response.body);
     try ensureSuccessfulResponse(allocator, response);
 }
@@ -293,14 +326,27 @@ fn send(
     token: []const u8,
     method: std.http.Method,
     body: ?[]const u8,
+    retry_count: u32,
 ) !http.FetchTextResponse {
     const bearer = try std.fmt.allocPrint(allocator, "Bearer {s}", .{token});
     const headers = [_]std.http.Header{.{ .name = "authorization", .value = bearer }};
-    return http.requestText(allocator, client, url, .{
-        .method = method,
-        .body = body,
-        .headers = .{ .privileged_headers = &headers },
-    });
+    var retries_used: u32 = 0;
+    while (true) {
+        const response = http.requestText(allocator, client, url, .{
+            .method = method,
+            .body = body,
+            .headers = .{ .privileged_headers = &headers },
+        }) catch |err| {
+            if (retries_used >= retry_count) return err;
+            retries_used += 1;
+            try waitBeforeRetry(client, retries_used);
+            continue;
+        };
+        if (!isTransientStatus(response.status) or retries_used >= retry_count) return response;
+        allocator.free(response.body);
+        retries_used += 1;
+        try waitBeforeRetry(client, retries_used);
+    }
 }
 
 /// 將 Zig struct 序列化為 JSON，並加上 Cloudflare Bearer header。
@@ -311,12 +357,40 @@ fn sendJson(
     token: []const u8,
     method: std.http.Method,
     value: anytype,
+    retry_count: u32,
 ) !http.FetchTextResponse {
     const bearer = try std.fmt.allocPrint(allocator, "Bearer {s}", .{token});
     const headers = [_]std.http.Header{.{ .name = "authorization", .value = bearer }};
-    return http.requestJson(allocator, client, url, value, .{
-        .request = .{ .method = method, .headers = .{ .privileged_headers = &headers } },
-    });
+    var retries_used: u32 = 0;
+    while (true) {
+        const response = http.requestJson(allocator, client, url, value, .{
+            .request = .{ .method = method, .headers = .{ .privileged_headers = &headers } },
+        }) catch |err| {
+            if (retries_used >= retry_count) return err;
+            retries_used += 1;
+            try waitBeforeRetry(client, retries_used);
+            continue;
+        };
+        if (!isTransientStatus(response.status) or retries_used >= retry_count) return response;
+        allocator.free(response.body);
+        retries_used += 1;
+        try waitBeforeRetry(client, retries_used);
+    }
+}
+
+/// 只有 Cloudflare rate limit（429）與 server error（5xx）可安全立即重試。
+fn isTransientStatus(status: std.http.Status) bool {
+    const code = @intFromEnum(status);
+    return code == 429 or (code >= 500 and code < 600);
+}
+
+/// 指數退避：第 1 次等待 250ms、第 2 次 500ms，最大 4 秒。
+/// `std.Io` 的 sleep 讓這個等待可沿用目前 runtime，而不是自行阻塞 OS thread。
+fn waitBeforeRetry(client: *std.http.Client, retries_used: u32) !void {
+    const shift = @min(retries_used - 1, 4);
+    const milliseconds: i64 = 250 * (@as(i64, 1) << @intCast(shift));
+    std.log.warn("retrying transient cloudflare api failure: attempt={d}, wait_ms={d}", .{ retries_used, milliseconds });
+    try client.io.sleep(.fromMilliseconds(milliseconds), .awake);
 }
 
 /// HTTP 2xx 仍可能包含 success=false；兩個層級都必須驗證。
@@ -384,9 +458,33 @@ test "cloudflare post body creates an A record with configured options" {
         .content = "1.2.3.4",
         .proxied = true,
         .ttl = 120,
+        .comment = "managed-by:dynip",
     }, .{}, &writer.writer);
     buffer = writer.toArrayList();
-    try std.testing.expectEqualStrings("{\"type\":\"A\",\"name\":\"home.example.com\",\"content\":\"1.2.3.4\",\"proxied\":true,\"ttl\":120}", buffer.items);
+    try std.testing.expectEqualStrings("{\"type\":\"A\",\"name\":\"home.example.com\",\"content\":\"1.2.3.4\",\"proxied\":true,\"ttl\":120,\"comment\":\"managed-by:dynip\"}", buffer.items);
+}
+
+test "cloudflare ownership selector only returns the tagged record" {
+    const records = [_]Record{
+        .{ .id = "foreign", .content = "203.0.113.1", .comment = "managed-by:other" },
+        .{ .id = "ours", .content = "203.0.113.2", .comment = "managed-by:dynip" },
+    };
+    const selected = (try selectManagedRecord(&records, "managed-by:dynip")).?;
+    try std.testing.expectEqualStrings("ours", selected.id);
+}
+
+test "cloudflare ownership selector refuses ambiguous records" {
+    const records = [_]Record{
+        .{ .id = "one", .content = "203.0.113.1", .comment = "managed-by:dynip" },
+        .{ .id = "two", .content = "203.0.113.2", .comment = "managed-by:dynip" },
+    };
+    try std.testing.expectError(error.MultipleManagedCloudflareRecords, selectManagedRecord(&records, "managed-by:dynip"));
+}
+
+test "cloudflare retries only rate limits and server errors" {
+    try std.testing.expect(isTransientStatus(@enumFromInt(429)));
+    try std.testing.expect(isTransientStatus(@enumFromInt(503)));
+    try std.testing.expect(!isTransientStatus(.bad_request));
 }
 
 test "cloudflare record cache ttl expires at its boundary" {
