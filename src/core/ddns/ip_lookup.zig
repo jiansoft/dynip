@@ -142,13 +142,24 @@ pub fn getPublicIpForFamily(
 ) !PublicIpLookup {
     const lookup = try getPublicIpWithPrimary(allocator, client, primary);
     if (lookup.family == family) return lookup;
+    // getPublicIpWithPrimary 配置了結果字串；這筆結果不屬於要求的 family，
+    // 在進行 fallback 前必須釋放，避免雙 stack 長時間執行時累積配置。
+    allocator.free(lookup.ip);
 
     // 第一來源成功但回傳另一種位址族時，不應立刻放棄。本輪仍可改用另一個
     // 已允許的來源取得目標 family；這不會增加第三方 public-IP 服務。
     const fallback_primary: PublicIpService = if (primary == .stun) .cloudflare_trace else .stun;
     const fallback = try getPublicIpWithPrimary(allocator, client, fallback_primary);
-    if (fallback.family != family) return error.PublicIpFamilyUnavailable;
+    if (fallback.family != family) {
+        allocator.free(fallback.ip);
+        return error.PublicIpFamilyUnavailable;
+    }
     return fallback;
+}
+
+fn lookupMatchesFamily(lookup: PublicIpLookup, family: IpFamily) bool {
+    // 將這個很小的判斷抽出，可獨立測試 fallback 不會接受另一種 IP family。
+    return lookup.family == family;
 }
 
 /// 下載純文字 IP 並檢查它和呼叫者要求的位址族一致，避免 DNS/Proxy 配置錯誤
@@ -368,4 +379,12 @@ pub fn normalizePublicIp(text: []const u8) ![]const u8 {
 
     _ = std.Io.net.IpAddress.parse(trimmed, 0) catch return error.InvalidPublicIpResponse;
     return trimmed;
+}
+
+test "family fallback accepts only the requested address family" {
+    const ipv4 = PublicIpLookup{ .ip = "203.0.113.10", .service = .stun, .family = .ipv4 };
+    const ipv6 = PublicIpLookup{ .ip = "2001:db8::10", .service = .cloudflare_trace, .family = .ipv6 };
+
+    try std.testing.expect(!lookupMatchesFamily(ipv4, .ipv6));
+    try std.testing.expect(lookupMatchesFamily(ipv6, .ipv6));
 }

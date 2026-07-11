@@ -40,20 +40,27 @@ pub const ProviderDisplayData = struct {
 };
 
 /// 從 process-level DDNS snapshot 與 AppConfig 組出 Dashboard 展示資料。
-pub fn readDisplayData(config: config_mod.AppConfig) [4]ProviderDisplayData {
-    // ddns.getProviderSnapshots() 回傳固定四個 slot：
-    // [0] cloudflare, [1] afraid, [2] dynu, [3] noip。
+pub fn readDisplayData(config: config_mod.AppConfig) [8]ProviderDisplayData {
+    // ddns.getProviderSnapshots() 以「provider、family」排列固定八格：
+    // [0..1] cloudflare、[2..3] afraid、[4..5] dynu、[6..7] noip；
+    // 每一對的偶數索引是 IPv4/A，奇數索引是 IPv6/AAAA。
     const snapshots = ddns.getProviderSnapshots();
     // 狀態分類需要拿現在時間，才能判斷 next_retry_at 是否還在未來。
     const now = currentUnixSeconds();
 
     // 每個 provider 的 enabled 旗標來自 app.json。
     // 即使 snapshot 裡有資料，只要 provider 設成 disabled，UI 就顯示 disabled。
+    // 必須保留這個配對順序。Dashboard server 以每兩筆資料組成一張 provider 卡片，
+    // 因此不能在這裡依狀態排序，否則 A 與 AAAA 可能被錯誤配到不同 provider。
     return .{
         buildDisplayData(snapshots[0], config.cloudflare.enabled, now),
-        buildDisplayData(snapshots[1], config.afraid.enabled, now),
-        buildDisplayData(snapshots[2], config.dynu.enabled, now),
-        buildDisplayData(snapshots[3], config.noip.enabled, now),
+        buildDisplayData(snapshots[1], config.cloudflare.enabled, now),
+        buildDisplayData(snapshots[2], config.afraid.enabled, now),
+        buildDisplayData(snapshots[3], config.afraid.enabled, now),
+        buildDisplayData(snapshots[4], config.dynu.enabled, now),
+        buildDisplayData(snapshots[5], config.dynu.enabled, now),
+        buildDisplayData(snapshots[6], config.noip.enabled, now),
+        buildDisplayData(snapshots[7], config.noip.enabled, now),
     };
 }
 
@@ -61,7 +68,7 @@ pub fn readDisplayData(config: config_mod.AppConfig) [4]ProviderDisplayData {
 ///
 /// 優先使用最新的 desired_ip；若該 provider 沒有 desired_ip，才退回 current_ip。
 /// 回傳 slice 指向呼叫端傳入的 snapshots，呼叫端需確保 snapshots 生命週期足夠。
-pub fn resolveDesiredIp(snapshots: *const [4]ddns.ProviderSnapshot) []const u8 {
+pub fn resolveDesiredIp(snapshots: *const [8]ddns.ProviderSnapshot) []const u8 {
     // `best_index` 記錄目前找到的最佳 provider index。
     // 用 optional 是因為剛啟動時可能完全沒有任何有效快照。
     var best_index: ?usize = null;
@@ -214,6 +221,10 @@ test "resolve desired ip returns latest initialized provider ip" {
         testSnapshot(true, "1.1.1.1", "2.2.2.2", "success", 0, 0, 100),
         testSnapshot(false, "", "", "", 0, 0, 0),
         testSnapshot(true, "3.3.3.3", "4.4.4.4", "failed", 1, 200, 150),
+        testSnapshot(false, "", "", "", 0, 0, 0),
+        testSnapshot(false, "", "", "", 0, 0, 0),
+        testSnapshot(false, "", "", "", 0, 0, 0),
+        testSnapshot(false, "", "", "", 0, 0, 0),
         testSnapshot(false, "", "", "", 0, 0, 0),
     };
 

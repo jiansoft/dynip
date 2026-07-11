@@ -170,9 +170,11 @@ pub const PublicIpSnapshot = struct {
 /// 對外公開的 provider 狀態快照。
 pub const ProviderSnapshot = struct {
     /// provider 固定名稱的儲存空間。
-    name: [8]u8 = undefined,
+    name: [16]u8 = undefined,
     /// name 的有效長度。
     name_len: usize = 0,
+    /// 此快照所代表的 IP family。provider 名稱與 family 合起來才是一筆獨立狀態。
+    family: IpFamily = .ipv4,
     /// 是否曾為此 provider 寫入任何狀態。
     initialized: bool = false,
 

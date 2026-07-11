@@ -23,6 +23,18 @@ const WebhookPayload = struct {
     error_name: ?[]const u8,
 };
 
+/// 將通知事件集中轉成 wire-format 文字，避免 webhook payload 與測試各自維護字串。
+fn eventName(event: Event) []const u8 {
+    // @tagName 會把 enum `.recovered` 轉為 webhook 的穩定文字 "recovered"。
+    return @tagName(event);
+}
+
+fn webhookPayload(event: Event, error_name: ?[]const u8) WebhookPayload {
+    // 集中在此處建立 payload，可確保 success/recovered 都送 null error，
+    // 而 failure 才攜帶原始 Zig error 名稱。
+    return .{ .event = eventName(event), .error_name = error_name };
+}
+
 /// 送出成功事件：Healthchecks/Uptime Kuma 皆 ping，webhook 則收到 success/recovered。
 pub fn notifySuccess(
     allocator: std.mem.Allocator,
@@ -68,10 +80,7 @@ fn sendWebhook(
     error_name: ?[]const u8,
 ) void {
     if (url.len == 0) return;
-    const response = http.requestJson(allocator, client, url, WebhookPayload{
-        .event = @tagName(event),
-        .error_name = error_name,
-    }, .{}) catch |err| {
+    const response = http.requestJson(allocator, client, url, webhookPayload(event, error_name), .{}) catch |err| {
         std.log.warn("failed to send notification webhook: {}", .{err});
         return;
     };
@@ -81,3 +90,16 @@ fn sendWebhook(
     };
 }
 
+test "notification webhook payload covers success failure and recovered" {
+    const success = webhookPayload(.success, null);
+    try std.testing.expectEqualStrings("success", success.event);
+    try std.testing.expect(success.error_name == null);
+
+    const failure = webhookPayload(.failure, "AllDdnsUpdatesFailed");
+    try std.testing.expectEqualStrings("failure", failure.event);
+    try std.testing.expectEqualStrings("AllDdnsUpdatesFailed", failure.error_name.?);
+
+    const recovered = webhookPayload(.recovered, null);
+    try std.testing.expectEqualStrings("recovered", recovered.event);
+    try std.testing.expect(recovered.error_name == null);
+}

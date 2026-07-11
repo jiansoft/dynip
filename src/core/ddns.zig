@@ -295,7 +295,11 @@ fn refreshWithRedisProviderState(
 
 /// 建立單次 public IP 去重 key；回傳配置的字串，需由同一 allocator 釋放。
 fn buildPublicIpCacheKey(allocator: std.mem.Allocator, ip: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "MyPublicIP:{s}", .{ip});
+    // 先解析輸入字串，而不是用「有沒有冒號」猜測。這樣無效 IP 不能產生
+    // 看似正常的 Redis key，也能讓 key 的 family 與實際更新目標一致。
+    const family = try ip_lookup.familyForIp(ip);
+    // 統一交給 family 版本組字串；此函式負責驗證，下一個函式只負責格式化。
+    return buildPublicIpCacheKeyForFamily(allocator, ip, family);
 }
 
 /// 新 key 包含 family，因此 IPv4 與 IPv6 的等效 reconcile state 不會碰撞。
@@ -305,8 +309,14 @@ fn buildPublicIpCacheKeyForFamily(allocator: std.mem.Allocator, ip: []const u8, 
 }
 
 /// Redis 中保存最近 public IP 的固定 key，不含 TTL 範圍外的額外資訊。
-fn currentPublicIpRedisKey() []const u8 {
-    return "MyPublicIP";
+fn currentPublicIpRedisKey(ip: []const u8) []const u8 {
+    // `catch return` 是防禦性 fallback：呼叫端正常只會傳已驗證 IP，
+    // 但若未來新增呼叫點傳入壞資料，也絕不能誤寫進 IPv4 或 IPv6 的正式 key。
+    return switch (ip_lookup.familyForIp(ip) catch return "MyPublicIP:unknown") {
+        // 同一個名稱加上 family 後，雙 stack 路由器可同時保有兩個目前 IP。
+        .ipv4 => "MyPublicIP:ipv4",
+        .ipv6 => "MyPublicIP:ipv6",
+    };
 }
 
 /// Redis 中保存本輪所有 provider 共同目標 IP 的固定 key。
@@ -325,10 +335,22 @@ fn desiredPublicIpRedisKey(ip: []const u8) []const u8 {
 fn providerStateRedisKey(provider: DdnsProvider, ip: []const u8) []const u8 {
     const family = ip_lookup.familyForIp(ip) catch return "DDNS:Provider:unknown";
     return switch (provider) {
-        .cloudflare => switch (family) { .ipv4 => "DDNS:Provider:cloudflare:ipv4", .ipv6 => "DDNS:Provider:cloudflare:ipv6" },
-        .afraid => switch (family) { .ipv4 => "DDNS:Provider:afraid:ipv4", .ipv6 => "DDNS:Provider:afraid:ipv6" },
-        .dynu => switch (family) { .ipv4 => "DDNS:Provider:dynu:ipv4", .ipv6 => "DDNS:Provider:dynu:ipv6" },
-        .noip => switch (family) { .ipv4 => "DDNS:Provider:noip:ipv4", .ipv6 => "DDNS:Provider:noip:ipv6" },
+        .cloudflare => switch (family) {
+            .ipv4 => "DDNS:Provider:cloudflare:ipv4",
+            .ipv6 => "DDNS:Provider:cloudflare:ipv6",
+        },
+        .afraid => switch (family) {
+            .ipv4 => "DDNS:Provider:afraid:ipv4",
+            .ipv6 => "DDNS:Provider:afraid:ipv6",
+        },
+        .dynu => switch (family) {
+            .ipv4 => "DDNS:Provider:dynu:ipv4",
+            .ipv6 => "DDNS:Provider:dynu:ipv6",
+        },
+        .noip => switch (family) {
+            .ipv4 => "DDNS:Provider:noip:ipv4",
+            .ipv6 => "DDNS:Provider:noip:ipv6",
+        },
     };
 }
 
@@ -337,10 +359,22 @@ fn providerStateRedisKey(provider: DdnsProvider, ip: []const u8) []const u8 {
 fn providerCurrentIpRedisKey(provider: DdnsProvider, ip: []const u8) []const u8 {
     const family = ip_lookup.familyForIp(ip) catch return "MyPublicIP:unknown";
     return switch (provider) {
-        .cloudflare => switch (family) { .ipv4 => "MyPublicIP:cloudflare:ipv4", .ipv6 => "MyPublicIP:cloudflare:ipv6" },
-        .afraid => switch (family) { .ipv4 => "MyPublicIP:afraid:ipv4", .ipv6 => "MyPublicIP:afraid:ipv6" },
-        .dynu => switch (family) { .ipv4 => "MyPublicIP:dynu:ipv4", .ipv6 => "MyPublicIP:dynu:ipv6" },
-        .noip => switch (family) { .ipv4 => "MyPublicIP:noip:ipv4", .ipv6 => "MyPublicIP:noip:ipv6" },
+        .cloudflare => switch (family) {
+            .ipv4 => "MyPublicIP:cloudflare:ipv4",
+            .ipv6 => "MyPublicIP:cloudflare:ipv6",
+        },
+        .afraid => switch (family) {
+            .ipv4 => "MyPublicIP:afraid:ipv4",
+            .ipv6 => "MyPublicIP:afraid:ipv6",
+        },
+        .dynu => switch (family) {
+            .ipv4 => "MyPublicIP:dynu:ipv4",
+            .ipv6 => "MyPublicIP:dynu:ipv6",
+        },
+        .noip => switch (family) {
+            .ipv4 => "MyPublicIP:noip:ipv4",
+            .ipv6 => "MyPublicIP:noip:ipv6",
+        },
     };
 }
 
@@ -495,6 +529,8 @@ fn rememberDedupe(
         return;
     }
 
+    // 第二筆 key 是方便外部觀察目前 IP 的索引；同樣必須帶上 family，
+    // 否則稍後寫入 IPv6 時會蓋掉 IPv4 的觀察值。
     try redis.setEx(
         allocator,
         io,
@@ -507,7 +543,7 @@ fn rememberDedupe(
         allocator,
         io,
         redis_config,
-        currentPublicIpRedisKey(),
+        currentPublicIpRedisKey(ip),
         ip,
         ttl_seconds,
     );
@@ -515,7 +551,7 @@ fn rememberDedupe(
     std.log.info("ddns redis cache updated: key={s}, ttl={d}s", .{ cache_key, ttl_seconds });
     std.log.info(
         "ddns redis current public ip updated: key={s}, ip={s}, ttl={d}s",
-        .{ currentPublicIpRedisKey(), ip, ttl_seconds },
+        .{ currentPublicIpRedisKey(ip), ip, ttl_seconds },
     );
 }
 
@@ -550,13 +586,15 @@ fn rememberDedupeWithSession(
     ttl_seconds: u64,
     successes: ProviderSuccesses,
 ) !void {
+    // 此版本與上方版本的差別只有 Redis connection 已由呼叫端持有；
+    // 寫入的 key 規則必須完全一致，否則兩條流程會產生不同的快取行為。
     try redis_session.setEx(cache_key, ip, ttl_seconds);
-    try redis_session.setEx(currentPublicIpRedisKey(), ip, ttl_seconds);
+    try redis_session.setEx(currentPublicIpRedisKey(ip), ip, ttl_seconds);
     try rememberProviderCurrentIpsWithSession(redis_session, successes, ip, ttl_seconds);
     std.log.info("ddns redis cache updated: key={s}, ttl={d}s", .{ cache_key, ttl_seconds });
     std.log.info(
         "ddns redis current public ip updated: key={s}, ip={s}, ttl={d}s",
-        .{ currentPublicIpRedisKey(), ip, ttl_seconds },
+        .{ currentPublicIpRedisKey(ip), ip, ttl_seconds },
     );
 }
 
@@ -1033,22 +1071,27 @@ test "noip url percent-encodes hostname" {
     );
 }
 
-test "public ip cache key matches rust format" {
+test "public ip cache keys isolate ipv4 and ipv6" {
     const allocator = std.testing.allocator;
-    const key = try buildPublicIpCacheKey(allocator, "1.2.3.4");
-    defer allocator.free(key);
+    const ipv4_key = try buildPublicIpCacheKey(allocator, "1.2.3.4");
+    defer allocator.free(ipv4_key);
+    const ipv6_key = try buildPublicIpCacheKey(allocator, "2001:db8::1");
+    defer allocator.free(ipv6_key);
 
-    try std.testing.expectEqualStrings("MyPublicIP:1.2.3.4", key);
+    try std.testing.expectEqualStrings("MyPublicIP:ipv4:1.2.3.4", ipv4_key);
+    try std.testing.expectEqualStrings("MyPublicIP:ipv6:2001:db8::1", ipv6_key);
+    try std.testing.expect(!std.mem.eql(u8, ipv4_key, ipv6_key));
 }
 
-test "current public ip redis key matches expected format" {
-    try std.testing.expectEqualStrings("MyPublicIP", currentPublicIpRedisKey());
+test "current public ip redis keys isolate address families" {
+    try std.testing.expectEqualStrings("MyPublicIP:ipv4", currentPublicIpRedisKey("1.2.3.4"));
+    try std.testing.expectEqualStrings("MyPublicIP:ipv6", currentPublicIpRedisKey("2001:db8::1"));
 }
 
 test "provider current ip redis keys match expected format" {
-    try std.testing.expectEqualStrings("MyPublicIP:afraid", providerCurrentIpRedisKey(.afraid));
-    try std.testing.expectEqualStrings("MyPublicIP:dynu", providerCurrentIpRedisKey(.dynu));
-    try std.testing.expectEqualStrings("MyPublicIP:noip", providerCurrentIpRedisKey(.noip));
+    try std.testing.expectEqualStrings("MyPublicIP:afraid:ipv4", providerCurrentIpRedisKey(.afraid, "1.2.3.4"));
+    try std.testing.expectEqualStrings("MyPublicIP:dynu:ipv4", providerCurrentIpRedisKey(.dynu, "1.2.3.4"));
+    try std.testing.expectEqualStrings("MyPublicIP:noip:ipv6", providerCurrentIpRedisKey(.noip, "2001:db8::1"));
 }
 
 test "provider success state tracks successful ddns providers" {
@@ -1161,13 +1204,14 @@ test "provider snapshots expose fixed provider slots before initialization" {
     const snapshots = getProviderSnapshots();
 
     try std.testing.expectEqualStrings("cloudflare", snapshots[0].nameSlice());
-    try std.testing.expectEqualStrings("afraid", snapshots[1].nameSlice());
-    try std.testing.expectEqualStrings("dynu", snapshots[2].nameSlice());
-    try std.testing.expectEqualStrings("noip", snapshots[3].nameSlice());
-    try std.testing.expect(!snapshots[0].initialized);
-    try std.testing.expect(!snapshots[1].initialized);
-    try std.testing.expect(!snapshots[2].initialized);
-    try std.testing.expect(!snapshots[3].initialized);
+    try std.testing.expectEqualStrings("cloudflare", snapshots[1].nameSlice());
+    try std.testing.expectEqualStrings("afraid", snapshots[2].nameSlice());
+    try std.testing.expectEqualStrings("afraid", snapshots[3].nameSlice());
+    try std.testing.expectEqualStrings("dynu", snapshots[4].nameSlice());
+    try std.testing.expectEqualStrings("dynu", snapshots[5].nameSlice());
+    try std.testing.expectEqualStrings("noip", snapshots[6].nameSlice());
+    try std.testing.expectEqualStrings("noip", snapshots[7].nameSlice());
+    for (snapshots) |snapshot| try std.testing.expect(!snapshot.initialized);
 }
 
 test "provider success snapshot copies status by value" {
@@ -1177,20 +1221,20 @@ test "provider success snapshot copies status by value" {
     shared_state.memoryWriteProviderSuccess(.dynu, "1.2.3.4", 100);
     var snapshots = getProviderSnapshots();
 
-    try std.testing.expect(snapshots[2].initialized);
-    try std.testing.expectEqualStrings("dynu", snapshots[2].nameSlice());
-    try std.testing.expectEqualStrings("1.2.3.4", snapshots[2].currentIpSlice());
-    try std.testing.expectEqualStrings("1.2.3.4", snapshots[2].desiredIpSlice());
-    try std.testing.expectEqualStrings(provider_status_success, snapshots[2].statusSlice());
-    try std.testing.expectEqual(@as(u32, 0), snapshots[2].retry_count);
-    try std.testing.expectEqual(@as(i64, 0), snapshots[2].next_retry_at);
-    try std.testing.expectEqual(@as(i64, 100), snapshots[2].updated_at);
+    try std.testing.expect(snapshots[4].initialized);
+    try std.testing.expectEqualStrings("dynu", snapshots[4].nameSlice());
+    try std.testing.expectEqualStrings("1.2.3.4", snapshots[4].currentIpSlice());
+    try std.testing.expectEqualStrings("1.2.3.4", snapshots[4].desiredIpSlice());
+    try std.testing.expectEqualStrings(provider_status_success, snapshots[4].statusSlice());
+    try std.testing.expectEqual(@as(u32, 0), snapshots[4].retry_count);
+    try std.testing.expectEqual(@as(i64, 0), snapshots[4].next_retry_at);
+    try std.testing.expectEqual(@as(i64, 100), snapshots[4].updated_at);
 
     shared_state.memoryWriteProviderSuccess(.dynu, "5.6.7.8", 200);
-    try std.testing.expectEqualStrings("1.2.3.4", snapshots[2].currentIpSlice());
+    try std.testing.expectEqualStrings("1.2.3.4", snapshots[4].currentIpSlice());
 
     snapshots = getProviderSnapshots();
-    try std.testing.expectEqualStrings("5.6.7.8", snapshots[2].currentIpSlice());
+    try std.testing.expectEqualStrings("5.6.7.8", snapshots[4].currentIpSlice());
 }
 
 test "provider failure snapshot preserves last successful current ip" {
@@ -1201,24 +1245,24 @@ test "provider failure snapshot preserves last successful current ip" {
     shared_state.memoryWriteProviderFailure(.noip, "5.6.7.8", 2, 300, "UnexpectedNoIpResponse", 200);
 
     const snapshots = getProviderSnapshots();
-    try std.testing.expect(snapshots[3].initialized);
-    try std.testing.expectEqualStrings("1.2.3.4", snapshots[3].currentIpSlice());
-    try std.testing.expectEqualStrings("5.6.7.8", snapshots[3].desiredIpSlice());
-    try std.testing.expectEqualStrings(provider_status_failed, snapshots[3].statusSlice());
-    try std.testing.expectEqual(@as(u32, 2), snapshots[3].retry_count);
-    try std.testing.expectEqual(@as(i64, 300), snapshots[3].next_retry_at);
-    try std.testing.expectEqualStrings("UnexpectedNoIpResponse", snapshots[3].lastErrorSlice());
-    try std.testing.expectEqual(@as(i64, 200), snapshots[3].updated_at);
+    try std.testing.expect(snapshots[6].initialized);
+    try std.testing.expectEqualStrings("1.2.3.4", snapshots[6].currentIpSlice());
+    try std.testing.expectEqualStrings("5.6.7.8", snapshots[6].desiredIpSlice());
+    try std.testing.expectEqualStrings(provider_status_failed, snapshots[6].statusSlice());
+    try std.testing.expectEqual(@as(u32, 2), snapshots[6].retry_count);
+    try std.testing.expectEqual(@as(i64, 300), snapshots[6].next_retry_at);
+    try std.testing.expectEqualStrings("UnexpectedNoIpResponse", snapshots[6].lastErrorSlice());
+    try std.testing.expectEqual(@as(i64, 200), snapshots[6].updated_at);
 }
 
-test "redis dedupe params keep legacy redis key and value format" {
+test "redis dedupe params use family-isolated redis cache key" {
     const allocator = std.testing.allocator;
     const ip = "1.2.3.4";
     const cache_key = try buildPublicIpCacheKey(allocator, ip);
     defer allocator.free(cache_key);
 
-    try std.testing.expectEqualStrings("MyPublicIP:1.2.3.4", cache_key);
-    try std.testing.expectEqualStrings("MyPublicIP", currentPublicIpRedisKey());
+    try std.testing.expectEqualStrings("MyPublicIP:ipv4:1.2.3.4", cache_key);
+    try std.testing.expectEqualStrings("MyPublicIP:ipv4", currentPublicIpRedisKey(ip));
     try std.testing.expectEqualStrings("1.2.3.4", ip);
     try std.testing.expect(@as(u64, 86400) == @as(u64, 86400));
 }
@@ -1271,15 +1315,20 @@ test "parseStunResponse decodes valid ipv4 xor-mapped-address" {
     var response = [_]u8{
         0x01, 0x01,
         0x00, 0x0c,
-        0x21, 0x12, 0xA4, 0x42,
-        'a',  'n',  't',  'i',
-        'g',  'r',  'a',  'v',
-        'i',  't',  'y',  '1',
+        0x21, 0x12,
+        0xA4, 0x42,
+        'a',  'n',
+        't',  'i',
+        'g',  'r',
+        'a',  'v',
+        'i',  't',
+        'y',  '1',
         0x00, 0x20,
         0x00, 0x08,
         0x00, 0x01,
         0x32, 0xA1,
-        0xE1, 0xBA, 0xA5, 0x26,
+        0xE1, 0xBA,
+        0xA5, 0x26,
     };
 
     const ip = try ip_lookup.parseStunResponse(allocator, &response, tx_id);

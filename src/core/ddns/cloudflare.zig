@@ -76,7 +76,7 @@ const Record = struct {
 
 /// POST 建立 DNS record 的 JSON request body。
 const CreateBody = struct {
-    @"type": []const u8,
+    type: []const u8,
     name: []const u8,
     content: []const u8,
     proxied: bool,
@@ -137,12 +137,7 @@ fn findRecord(
     const cache_key = try makeCacheKey(allocator, config.zone_id, hostname, family);
     if (cacheLookup(cache_key)) |cached| return cached;
 
-    const name = try encodeQueryValue(allocator, hostname);
-    const url = try std.fmt.allocPrint(
-        allocator,
-        "{s}/zones/{s}/dns_records?type={s}&name={s}",
-        .{ api_base_url, config.zone_id, recordType(family), name },
-    );
+    const url = try listRecordUrl(allocator, config.zone_id, hostname, family);
     const response = try send(allocator, client, url, config.api_token, .GET, null);
     defer allocator.free(response.body);
     try http.ensureSuccessStatus(response.status, response.body);
@@ -177,6 +172,21 @@ fn patchRecord(
 /// 因為同一 hostname 合法情況下可同時擁有彼此獨立的 A 與 AAAA record。
 fn makeCacheKey(allocator: std.mem.Allocator, zone_id: []const u8, hostname: []const u8, family: IpFamily) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}|{s}|{s}", .{ zone_id, recordType(family), hostname });
+}
+
+/// 建立 DNS record List API URL。分離成純函式，讓 query encoding 與 A/AAAA
+/// 選擇可在不發網路請求的情況下驗證。
+fn listRecordUrl(allocator: std.mem.Allocator, zone_id: []const u8, hostname: []const u8, family: IpFamily) ![]u8 {
+    // Hostname 會出現在 query string；例如 wildcard `*` 不能直接放入 URL，
+    // 必須先 percent-encode，否則 Cloudflare 可能收到不同的搜尋條件。
+    const name = try encodeQueryValue(allocator, hostname);
+    // `recordType(family)` 把內部 enum 轉成 Cloudflare API 要的 "A" / "AAAA"。
+    // allocPrint 的結果由傳入 allocator 擁有，findRecord 的 arena 結束時會一起釋放。
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}/zones/{s}/dns_records?type={s}&name={s}",
+        .{ api_base_url, zone_id, recordType(family), name },
+    );
 }
 
 /// 回傳未過期項目的值複本。回傳 slice 屬於行程快取，呼叫端不可釋放它們。
@@ -265,7 +275,7 @@ fn createRecord(
 ) !void {
     const url = try std.fmt.allocPrint(allocator, "{s}/zones/{s}/dns_records", .{ api_base_url, config.zone_id });
     const response = try sendJson(allocator, client, url, config.api_token, .POST, CreateBody{
-        .@"type" = recordType(family),
+        .type = recordType(family),
         .name = hostname,
         .content = ip,
         .proxied = config.proxied,
@@ -338,4 +348,50 @@ fn encodeQueryValue(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
         }
     }
     return output.toOwnedSlice(allocator);
+}
+
+test "cloudflare list request targets the selected record family" {
+    const allocator = std.testing.allocator;
+    const url = try listRecordUrl(allocator, "zone", "*.example.com", .ipv6);
+    defer allocator.free(url);
+
+    try std.testing.expectEqualStrings(
+        "https://api.cloudflare.com/client/v4/zones/zone/dns_records?type=AAAA&name=%2A.example.com",
+        url,
+    );
+}
+
+test "cloudflare patch body changes only record content" {
+    // ArrayList + allocating writer 模擬真正 requestJson 序列化前的輸出位置。
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+    var writer: std.Io.Writer.Allocating = .fromArrayList(std.testing.allocator, &buffer);
+    defer writer.deinit();
+    // PATCH body 只應有 content；TTL/proxied 等既有設定要由 Cloudflare 保留。
+    try std.json.Stringify.value(PatchBody{ .content = "2001:db8::1" }, .{}, &writer.writer);
+    buffer = writer.toArrayList();
+    try std.testing.expectEqualStrings("{\"content\":\"2001:db8::1\"}", buffer.items);
+}
+
+test "cloudflare post body creates an A record with configured options" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+    var writer: std.Io.Writer.Allocating = .fromArrayList(std.testing.allocator, &buffer);
+    defer writer.deinit();
+    try std.json.Stringify.value(CreateBody{
+        .type = recordType(.ipv4),
+        .name = "home.example.com",
+        .content = "1.2.3.4",
+        .proxied = true,
+        .ttl = 120,
+    }, .{}, &writer.writer);
+    buffer = writer.toArrayList();
+    try std.testing.expectEqualStrings("{\"type\":\"A\",\"name\":\"home.example.com\",\"content\":\"1.2.3.4\",\"proxied\":true,\"ttl\":120}", buffer.items);
+}
+
+test "cloudflare record cache ttl expires at its boundary" {
+    // 快取判斷使用嚴格大於 (`expires_at > now`)；剛好等於 expires_at 就要重新 List。
+    const created_at: i64 = 100;
+    try std.testing.expect(created_at + record_cache_ttl_seconds > 159);
+    try std.testing.expect(!(created_at + record_cache_ttl_seconds > 160));
 }

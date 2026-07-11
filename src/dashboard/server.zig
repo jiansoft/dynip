@@ -1,4 +1,4 @@
-﻿//! 單一 process 內的 Dashboard HTTP server。
+//! 單一 process 內的 Dashboard HTTP server。
 //!
 //! - 這個檔案不負責 DDNS 更新，只負責「把記憶體狀態變成 HTTP 回應」。
 //! - 真正的 provider 狀態來自 `dashboard/service.zig`，再往下讀
@@ -247,7 +247,13 @@ fn renderDashboardPage(allocator: std.mem.Allocator, app_config: config_mod.AppC
     }
     try out.print("</span></small><small id=\"last-updated\">Last Updated: -</small></section></header><div class=\"status-row\"><span>Provider Status Cards</span><strong>Memory Store: Active</strong><button type=\"button\" id=\"refresh-toggle\" onclick=\"toggleRefresh()\">⟳ Auto-refresh: ON</button></div><section id=\"providers\" class=\"provider-grid\">", .{});
     // 首次載入時先 server-side render 一版卡片；JS 載入後會再用 JSON 重畫一次。
-    for (data) |provider| try writeProviderCard(out, provider);
+    // `data` 的相鄰兩筆是同一 provider 的 IPv4、IPv6。用 while 每次加 2，
+    // 明確告訴讀者「這是在走 pair」，而不是剛好跳過一筆資料。
+    var provider_index: usize = 0;
+    while (provider_index < data.len) : (provider_index += 2) {
+        // 先寫 A/IPv4，再寫 AAAA/IPv6；writeProviderCard 會把兩個區塊包進同一張卡。
+        try writeProviderCard(out, data[provider_index], data[provider_index + 1]);
+    }
     // 這段是頁面底部、detail panel，以及前端輪詢 JS。
     try out.writeAll(
         \\</section><aside class="memory-note"><strong>Note:</strong> State is from process memory. Restarting the service resets counters until the next update cycle writes fresh snapshots.</aside>
@@ -264,18 +270,33 @@ fn renderDashboardPage(allocator: std.mem.Allocator, app_config: config_mod.AppC
         \\   document.getElementById('public-ip-stun-status').textContent=data.public_ip_stun_status||'-';
         \\   document.getElementById('public-ip-stun-error').textContent=data.public_ip_stun_error?' ('+data.public_ip_stun_error+')':'';
         \\   document.getElementById('last-updated').textContent='Last Updated: '+formatRfc3339(new Date());
-        \\   document.getElementById('providers').innerHTML=latestProviders.map(providerCard).join('');
+        \\   renderProviders();
         \\ } catch(e) { console.error(e); }
         \\}
-        \\function providerCard(p){
-        \\ const isFailed = p.display_status === 'failed' || p.display_status === 'retry_deferred';
-        \\ const timeLabel = isFailed ? 'Next' : 'Updated';
-        \\ const timeValue = isFailed ? formatTime(p.next_retry_at) : formatTime(p.updated_at);
-        \\ return `<article class="provider ${p.display_status}"><div class="status-strip"></div><header><span>${escapeHtml(p.name)}</span><strong>${label(p.display_status)}</strong></header><dl><div><dt>Status</dt><dd>${label(p.display_status)}</dd></div><div><dt>IP</dt><dd>${escapeHtml(p.current_ip)||'-'}</dd></div><div><dt>Retry</dt><dd>${p.retry_count}</dd></div><div><dt>${timeLabel}</dt><dd>${timeValue}</dd></div></dl><button type="button" onclick="showDetail('${escapeAttr(p.name)}')">View Details</button></article>`;
+        \\// API 回傳是扁平陣列；每兩筆依固定契約組成一張 provider 卡。
+        \\function renderProviders(){
+        \\ const cards=[];
+        \\ for(let i=0;i<latestProviders.length;i+=2){
+        \\  cards.push(providerCard(latestProviders[i],latestProviders[i+1]));
+        \\ }
+        \\ document.getElementById('providers').innerHTML=cards.join('');
         \\}
-        \\function showDetail(name){
-        \\ const p=latestProviders.find(x=>x.name===name); if(!p)return;
-        \\ document.getElementById('detail-title').textContent=p.name+' - detail';
+        \\// 只負責一個 IP family 的狀態；避免 A 與 AAAA 共用 retry/error 顯示。
+        \\function familyStatus(p){
+        \\ const isFailed=p.display_status==='failed'||p.display_status==='retry_deferred';
+        \\ const timeLabel=isFailed?'Next':'Updated';
+        \\ const timeValue=isFailed?formatTime(p.next_retry_at):formatTime(p.updated_at);
+        \\ const labelText=p.family==='ipv4'?'A / IPv4':'AAAA / IPv6';
+        \\ return `<section class="family ${p.display_status}"><header><span>${labelText}</span><strong>${label(p.display_status)}</strong></header><dl><div><dt>Current IP</dt><dd>${escapeHtml(p.current_ip)||'-'}</dd></div><div><dt>Retry</dt><dd>${p.retry_count}</dd></div><div><dt>${timeLabel}</dt><dd>${timeValue}</dd></div><div><dt>Last error</dt><dd>${escapeHtml(p.last_error)||'-'}</dd></div></dl><button type="button" onclick="showDetail('${escapeAttr(p.name)}','${escapeAttr(p.family)}')">View Details</button></section>`;
+        \\}
+        \\// 外層卡片只顯示 provider 名稱；內部固定並排 IPv4 與 IPv6 子卡。
+        \\function providerCard(ipv4,ipv6){
+        \\ const name=(ipv4||ipv6||{}).name||'provider';
+        \\ return `<article class="provider"><header><span>${escapeHtml(name)}</span></header><div class="family-grid">${familyStatus(ipv4)}${familyStatus(ipv6)}</div></article>`;
+        \\}
+        \\function showDetail(name,family){
+        \\ const p=latestProviders.find(x=>x.name===name&&x.family===family); if(!p)return;
+        \\ document.getElementById('detail-title').textContent=p.name+' '+(p.family==='ipv4'?'A / IPv4':'AAAA / IPv6')+' - detail';
         \\ document.getElementById('detail-body').innerHTML=[
         \\ ['current_ip',p.current_ip||'-'],['desired_ip',p.desired_ip||'-'],['status',p.status||p.display_status],['display_status',label(p.display_status)],['retry_count',p.retry_count],['next_retry_at',formatTime(p.next_retry_at)],['last_error',p.last_error||'-'],['updated_at',formatTime(p.updated_at)]
         \\ ].map(([k,v])=>`<div><dt>${k}</dt><dd>${escapeHtml(v)}</dd></div>`).join('');
@@ -323,7 +344,7 @@ fn renderDashboardPage(allocator: std.mem.Allocator, app_config: config_mod.AppC
         try writeProviderJson(out, provider);
     }
     try out.writeAll(
-        \\]; document.getElementById('providers').innerHTML=latestProviders.map(providerCard).join(''); document.getElementById('last-updated').textContent='Last Updated: '+formatRfc3339(new Date());
+        \\]; renderProviders(); document.getElementById('last-updated').textContent='Last Updated: '+formatRfc3339(new Date());
         \\startRefresh();
         \\</script>
     );
@@ -463,25 +484,40 @@ fn renderStatusJson(allocator: std.mem.Allocator, app_config: config_mod.AppConf
 }
 
 /// 寫一張 provider 卡片的 HTML。
-fn writeProviderCard(out: *std.Io.Writer, provider: service.ProviderDisplayData) !void {
+fn writeProviderCard(out: *std.Io.Writer, ipv4: service.ProviderDisplayData, ipv6: service.ProviderDisplayData) !void {
+    // provider 名稱對同一對資料必定相同，所以以 ipv4 的 snapshot 作為標題來源。
+    try out.writeAll("<article class=\"provider\"><header><span>");
+    try writeHtml(out, ipv4.snapshot.nameSlice());
+    try out.writeAll("</span></header><div class=\"family-grid\">");
+    try writeFamilyStatus(out, ipv4);
+    try writeFamilyStatus(out, ipv6);
+    try out.writeAll("</div></article>");
+}
+
+fn writeFamilyStatus(out: *std.Io.Writer, provider: service.ProviderDisplayData) !void {
+    // 這個 helper 對應前端的 familyStatus：一個呼叫只渲染 A 或 AAAA，
+    // 因此 retry 與 last_error 永遠是該 family 的獨立值。
     const snap = provider.snapshot;
-    try out.print("<article class=\"provider {s}\"><div class=\"status-strip\"></div><header><span>", .{@tagName(provider.display_status)});
-    try writeHtml(out, snap.nameSlice());
-    try out.print("</span><strong>{s}</strong></header><dl>", .{displayStatusLabel(provider.display_status)});
-    try writeMetric(out, "Status", displayStatusLabel(provider.display_status));
-    try writeMetric(out, "IP", snap.currentIpSlice());
-
-    const is_failed = (provider.display_status == .failed or provider.display_status == .retry_deferred);
+    // DNS record type 使用 A / AAAA；括號後補上新手較熟悉的 IP family 名稱。
+    const family_label = if (snap.family == .ipv4) "A / IPv4" else "AAAA / IPv6";
+    const is_failed = provider.display_status == .failed or provider.display_status == .retry_deferred;
     const time_label = if (is_failed) "Next" else "Updated";
-    try out.print("<div><dt>Retry</dt><dd>{d}</dd></div><div><dt>{s}</dt><dd>—</dd></div>", .{ snap.retry_count, time_label });
-
+    try out.print("<section class=\"family {s}\"><header><span>{s}</span><strong>{s}</strong></header><dl>", .{ @tagName(provider.display_status), family_label, displayStatusLabel(provider.display_status) });
+    try writeMetric(out, "Current IP", snap.currentIpSlice());
+    try out.print("<div><dt>Retry</dt><dd>{d}</dd></div>", .{snap.retry_count});
+    try writeMetric(out, time_label, "—");
+    try writeMetric(out, "Last error", snap.lastErrorSlice());
     try out.writeAll("</dl><button type=\"button\" onclick=\"showDetail('");
     try writeHtml(out, snap.nameSlice());
-    try out.writeAll("')\">View Details</button></article>");
+    try out.writeAll("','");
+    try writeHtml(out, snap.family.name());
+    try out.writeAll("')\">View Details</button></section>");
 }
 
 /// 將單一 provider 寫成 JSON object。
 fn writeProviderJson(out: *std.Io.Writer, provider: service.ProviderDisplayData) !void {
+    // 此 JSON 是 browser 自動刷新時唯一的狀態來源；欄位必須和 familyStatus 使用的
+    // `name`、`family`、`current_ip`、`retry_count`、`last_error` 保持一致。
     const snap = provider.snapshot;
     try out.writeAll("{\"name\":\"");
     try writeJsonStringContent(out, snap.nameSlice());
@@ -489,7 +525,10 @@ fn writeProviderJson(out: *std.Io.Writer, provider: service.ProviderDisplayData)
     try writeJsonStringContent(out, @tagName(provider.display_status));
     try out.writeAll("\",\"initialized\":");
     try out.writeAll(if (snap.initialized) "true" else "false");
-    try out.writeAll(",\"status\":\"");
+    // 將 enum 轉為 "ipv4" / "ipv6"，讓 JavaScript 不必依陣列索引猜 family。
+    try out.writeAll(",\"family\":\"");
+    try writeJsonStringContent(out, snap.family.name());
+    try out.writeAll("\",\"status\":\"");
     try writeJsonStringContent(out, snap.statusSlice());
     try out.writeAll("\",\"enabled\":");
     try out.writeAll(if (provider.enabled) "true" else "false");
@@ -516,13 +555,17 @@ fn writePageStart(out: *std.Io.Writer, title: []const u8) !void {
         \\*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
         \\.shell{width:min(1180px,calc(100% - 32px));margin:0 auto;padding:22px 0 40px}.hero{display:grid;grid-template-columns:1fr minmax(320px,440px);gap:16px;align-items:stretch;margin-bottom:14px}.brand,.public-ip,.provider,.memory-note,.detail-panel,.config-list>div,.config-section{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px}.brand{display:grid;gap:8px}.brand strong{font-size:26px}.brand span,.public-ip span,.status-row span,.config-list span,dt{color:var(--muted)}nav{display:flex;gap:14px;margin-top:6px}a{color:var(--info);text-decoration:none;font-weight:650}.public-ip{display:grid;align-content:center}.public-ip strong{font-size:28px;overflow-wrap:anywhere}.public-ip small{color:var(--muted)}
         \\.status-row{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:18px 0 12px}.status-row strong{color:var(--ok)}.status-row em{font-style:normal;color:var(--muted)}
-        \\.provider-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.provider{position:relative;overflow:hidden}.status-strip{height:4px;background:var(--off);position:absolute;inset:0 0 auto}.provider header{display:flex;justify-content:space-between;gap:12px;align-items:center;margin:10px 0 12px}.provider header span{font-size:18px;font-weight:750;text-transform:uppercase}.provider header strong{text-transform:capitalize;font-size:12px;padding:2px 8px;border:1px solid var(--line);border-radius:999px}
-        \\.provider.success .status-strip{background:var(--ok)}.provider.failed .status-strip{background:var(--bad)}.provider.retry_deferred .status-strip{background:var(--wait)}.provider.initializing .status-strip{background:var(--init)}.provider.updating .status-strip{background:var(--info)}.provider.disabled .status-strip{background:var(--off)}.provider.disabled{opacity:.72}.provider.success header strong{color:var(--ok)}.provider.failed header strong{color:var(--bad)}.provider.retry_deferred header strong{color:var(--wait)}.provider.initializing header strong{color:var(--init)}.provider.updating header strong{color:var(--info)}.provider.disabled header strong{color:var(--off)}
+        \\/* 外層是一家 provider；兩欄 provider grid 可讓四家服務不顯得過於擁擠。 */
+        \\.provider-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.provider{overflow:hidden}.provider>header{margin:0 0 12px}.provider>header span{font-size:18px;font-weight:750;text-transform:uppercase}
+        \\/* 每張 provider 卡內再以兩欄放 A/IPv4 和 AAAA/IPv6。 */
+        \\.family-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.family{position:relative;overflow:hidden;border:1px solid var(--line);border-radius:7px;padding:12px}.family:before{content:'';height:4px;background:var(--off);position:absolute;inset:0 0 auto}.family header{display:flex;justify-content:space-between;gap:8px;align-items:center;margin:6px 0 10px}.family header span{font-weight:750}.family header strong{text-transform:capitalize;font-size:12px;padding:2px 8px;border:1px solid var(--line);border-radius:999px}
+        \\/* 色條與狀態徽章各依 family 自己的 display_status 著色。 */
+        \\.family.success:before{background:var(--ok)}.family.failed:before{background:var(--bad)}.family.retry_deferred:before{background:var(--wait)}.family.initializing:before{background:var(--init)}.family.updating:before{background:var(--info)}.family.disabled:before{background:var(--off)}.family.disabled{opacity:.72}.family.success header strong{color:var(--ok)}.family.failed header strong{color:var(--bad)}.family.retry_deferred header strong{color:var(--wait)}.family.initializing header strong{color:var(--init)}.family.updating header strong{color:var(--info)}.family.disabled header strong{color:var(--off)}
         \\dl{margin:0;display:grid;gap:8px}dl div{display:grid;grid-template-columns:92px minmax(0,1fr);gap:10px}dd{margin:0;font-weight:650;overflow-wrap:anywhere}button{border:1px solid var(--line);background:transparent;color:var(--fg);border-radius:7px;padding:7px 10px;font:inherit;font-weight:650;cursor:pointer}.provider button{width:100%;margin-top:14px}.memory-note{margin-top:14px;color:var(--muted)}.memory-note strong{color:var(--fg)}
         \\.detail-panel{margin-top:14px}.detail-panel[hidden]{display:none}.detail-panel header{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:12px}.detail-panel header strong{font-size:18px}.detail-panel dl div{grid-template-columns:150px minmax(0,1fr);border-top:1px solid var(--line);padding-top:8px}.config-list{display:grid;gap:10px}.config-list>div{display:flex;justify-content:space-between;gap:16px}.config-list strong{overflow-wrap:anywhere;text-align:right}
         \\.config-section{padding:20px;margin-bottom:14px}.config-section h2{margin:0 0 12px;font-size:18px}.config-table{width:100%;border-collapse:collapse;margin:12px 0 24px}.config-table th,.config-table td{border:1px solid var(--line);padding:10px;text-align:left}.config-table th{background:var(--bg);font-weight:650}
         \\#refresh-toggle{padding:4px 10px;font-size:12px;border-radius:999px;border:1px solid var(--line);background:transparent;cursor:pointer;font-weight:650;color:var(--info);border-color:var(--info)}#refresh-toggle.off{color:var(--muted);border-color:var(--line)}
-        \\@media (max-width:760px){.shell{width:min(100% - 20px,1180px);padding-top:12px}.hero,.provider-grid{grid-template-columns:1fr}.brand strong{font-size:21px}.public-ip strong{font-size:22px}.status-row{align-items:flex-start;flex-direction:column}.config-list>div{align-items:flex-start}.detail-panel dl div{grid-template-columns:1fr}.config-table th,.config-table td{padding:6px;font-size:12px}}
+        \\@media (max-width:760px){.shell{width:min(100% - 20px,1180px);padding-top:12px}.hero,.provider-grid,.family-grid{grid-template-columns:1fr}.brand strong{font-size:21px}.public-ip strong{font-size:22px}.status-row{align-items:flex-start;flex-direction:column}.config-list>div{align-items:flex-start}.detail-panel dl div{grid-template-columns:1fr}.config-table th,.config-table td{padding:6px;font-size:12px}}
         \\</style></head><body>
     );
 }
@@ -652,6 +695,19 @@ test "dashboard json exposes providers" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"public_ip_source\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"public_ip_stun_status\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"public_ip_stun_error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"family\":\"ipv4\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"family\":\"ipv6\"") != null);
+}
+
+test "dashboard groups A and AAAA status in each provider card" {
+    const allocator = std.testing.allocator;
+    const html = try renderDashboardPage(allocator, .{});
+    defer allocator.free(html);
+
+    try std.testing.expect(std.mem.indexOf(u8, html, "A / IPv4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "AAAA / IPv6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "Last error") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "family-grid") != null);
 }
 
 test "dashboard html escapes dynamic content" {
