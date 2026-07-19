@@ -38,6 +38,41 @@ const text_headers = [_]std.http.Header{
     .{ .name = "cache-control", .value = "no-store" },
 };
 
+/// Dashboard 的 CSS/JS 原始碼放在 `static/`，透過 `@embedFile` 在編譯期烤進
+/// binary，執行期不需要讀取檔案系統。
+///
+/// 為什麼不用執行期讀檔（例如放到專案根目錄 `public/` 再用 `std.fs` 讀取）？
+/// `Dockerfile` 只把編譯好的單一 binary 複製進最終 image，並未一併複製任何
+/// 靜態資源目錄；若改成執行期讀檔，容器內會直接 404。`@embedFile` 讓這兩個
+/// 檔案永遠跟著 binary 一起部署。
+const dashboard_css = @embedFile("static/dashboard.css");
+const dashboard_js = @embedFile("static/dashboard.js");
+
+/// ETag 用內容的 Wyhash 在編譯期算好；同一個 binary 對同一份靜態資源永遠回同
+/// 一個 ETag，換 binary（=內容可能變了）才會換 ETag。
+const dashboard_css_etag = blk: {
+    // Wyhash 逐 48-byte round 處理；預設 1000 backward-branch quota 不夠掃完
+    // 整份 CSS/JS，所以要在這個 comptime 區塊內拉高上限。
+    @setEvalBranchQuota(200_000);
+    break :blk std.fmt.comptimePrint("\"{x}\"", .{std.hash.Wyhash.hash(0, dashboard_css)});
+};
+const dashboard_js_etag = blk: {
+    @setEvalBranchQuota(200_000);
+    break :blk std.fmt.comptimePrint("\"{x}\"", .{std.hash.Wyhash.hash(0, dashboard_js)});
+};
+
+const dashboard_css_headers = [_]std.http.Header{
+    .{ .name = "content-type", .value = "text/css; charset=utf-8" },
+    .{ .name = "cache-control", .value = "public, max-age=3600, must-revalidate" },
+    .{ .name = "etag", .value = dashboard_css_etag },
+};
+
+const dashboard_js_headers = [_]std.http.Header{
+    .{ .name = "content-type", .value = "text/javascript; charset=utf-8" },
+    .{ .name = "cache-control", .value = "public, max-age=3600, must-revalidate" },
+    .{ .name = "etag", .value = dashboard_js_etag },
+};
+
 /// 啟動 Dashboard server，並把錯誤寫進 log。
 ///
 /// 為什麼要包一層？
@@ -165,6 +200,16 @@ fn handleRequest(
         return;
     }
 
+    // CSS/JS 靜態資源。放在 HTML 路由之前，讓瀏覽器能對這兩個路徑做 304 快取。
+    if (std.mem.eql(u8, target_path, "/dashboard.css")) {
+        try serveStatic(request, dashboard_css, dashboard_css_etag, &dashboard_css_headers);
+        return;
+    }
+    if (std.mem.eql(u8, target_path, "/dashboard.js")) {
+        try serveStatic(request, dashboard_js, dashboard_js_etag, &dashboard_js_headers);
+        return;
+    }
+
     // 首頁和 /dashboard 都導到同一個 HTML。
     if (std.mem.eql(u8, target_path, "/") or std.mem.eql(u8, target_path, "/dashboard")) {
         // render function 會配置一段完整 HTML 字串；回應後要 free。
@@ -198,6 +243,34 @@ fn handleRequest(
         .extra_headers = &text_headers,
         .keep_alive = false,
     });
+}
+
+/// 回應一個 embedded 靜態資源，支援 `If-None-Match` 條件請求。
+///
+/// 命中快取時回 304 並帶空 body；未命中則回完整內容。兩種情況都要帶上
+/// `etag`，這樣瀏覽器下一次請求才有東西可以拿來比對。
+fn serveStatic(
+    request: *std.http.Server.Request,
+    content: []const u8,
+    etag: []const u8,
+    headers: []const std.http.Header,
+) !void {
+    if (clientHasFreshEtag(request, etag)) {
+        try request.respond("", .{ .status = .not_modified, .extra_headers = headers, .keep_alive = false });
+        return;
+    }
+    try request.respond(content, .{ .extra_headers = headers, .keep_alive = false });
+}
+
+/// 檢查 request 的 `If-None-Match` header 是否等於目前資源的 ETag。
+fn clientHasFreshEtag(request: *std.http.Server.Request, etag: []const u8) bool {
+    var it = request.iterateHeaders();
+    while (it.next()) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "if-none-match") and std.mem.eql(u8, header.value, etag)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /// 產生 Dashboard 主頁 HTML。
@@ -254,88 +327,11 @@ fn renderDashboardPage(allocator: std.mem.Allocator, app_config: config_mod.AppC
         // 先寫 A/IPv4，再寫 AAAA/IPv6；writeProviderCard 會把兩個區塊包進同一張卡。
         try writeProviderCard(out, data[provider_index], data[provider_index + 1]);
     }
-    // 這段是頁面底部、detail panel，以及前端輪詢 JS。
+    // 這段是頁面底部、detail panel。實際輪詢/render 邏輯都在 `static/dashboard.js`
+    // 裡（同樣走 304 快取），這裡只留「載入外部 JS + 帶入首次渲染資料」的 bootstrap。
     try out.writeAll(
         \\</section><aside class="memory-note"><strong>Note:</strong> State is from process memory. Restarting the service resets counters until the next update cycle writes fresh snapshots.</aside>
-        \\<section id="detail-panel" class="detail-panel" hidden><header><strong id="detail-title">Provider detail</strong><button type="button" onclick="hideDetail()">Close</button></header><dl id="detail-body"></dl></section></main><script>
-        \\let latestProviders = [];
-        \\let refreshInterval = null;
-        \\let isRefreshing = true;
-        \\async function refresh(){
-        \\ try {
-        \\   const r=await fetch('/api/status.json',{cache:'no-store'}); if(!r.ok)return;
-        \\   const data=await r.json(); latestProviders=data.providers||[];
-        \\   document.getElementById('desired-ip').textContent=data.desired_ip||data.public_ip||'-';
-        \\   document.getElementById('public-ip-source').textContent=data.public_ip_source||'-';
-        \\   document.getElementById('public-ip-stun-status').textContent=data.public_ip_stun_status||'-';
-        \\   document.getElementById('public-ip-stun-error').textContent=data.public_ip_stun_error?' ('+data.public_ip_stun_error+')':'';
-        \\   document.getElementById('last-updated').textContent='Last Updated: '+formatRfc3339(new Date());
-        \\   renderProviders();
-        \\ } catch(e) { console.error(e); }
-        \\}
-        \\// API 回傳是扁平陣列；每兩筆依固定契約組成一張 provider 卡。
-        \\function renderProviders(){
-        \\ const cards=[];
-        \\ for(let i=0;i<latestProviders.length;i+=2){
-        \\  cards.push(providerCard(latestProviders[i],latestProviders[i+1]));
-        \\ }
-        \\ document.getElementById('providers').innerHTML=cards.join('');
-        \\}
-        \\// 只負責一個 IP family 的狀態；避免 A 與 AAAA 共用 retry/error 顯示。
-        \\function familyStatus(p){
-        \\ const isFailed=p.display_status==='failed'||p.display_status==='retry_deferred';
-        \\ const timeLabel=isFailed?'Next':'Updated';
-        \\ const timeValue=isFailed?formatTime(p.next_retry_at):formatTime(p.updated_at);
-        \\ const labelText=p.family==='ipv4'?'A / IPv4':'AAAA / IPv6';
-        \\ return `<section class="family ${p.display_status}"><header><span>${labelText}</span><strong>${label(p.display_status)}</strong></header><dl><div><dt>Current IP</dt><dd>${escapeHtml(p.current_ip)||'-'}</dd></div><div><dt>Retry</dt><dd>${p.retry_count}</dd></div><div><dt>${timeLabel}</dt><dd>${timeValue}</dd></div><div><dt>Last error</dt><dd>${escapeHtml(p.last_error)||'-'}</dd></div></dl><button type="button" onclick="showDetail('${escapeAttr(p.name)}','${escapeAttr(p.family)}')">View Details</button></section>`;
-        \\}
-        \\// 外層卡片只顯示 provider 名稱；內部固定並排 IPv4 與 IPv6 子卡。
-        \\function providerCard(ipv4,ipv6){
-        \\ const name=(ipv4||ipv6||{}).name||'provider';
-        \\ return `<article class="provider"><header><span>${escapeHtml(name)}</span></header><div class="family-grid">${familyStatus(ipv4)}${familyStatus(ipv6)}</div></article>`;
-        \\}
-        \\function showDetail(name,family){
-        \\ const p=latestProviders.find(x=>x.name===name&&x.family===family); if(!p)return;
-        \\ document.getElementById('detail-title').textContent=p.name+' '+(p.family==='ipv4'?'A / IPv4':'AAAA / IPv6')+' - detail';
-        \\ document.getElementById('detail-body').innerHTML=[
-        \\ ['current_ip',p.current_ip||'-'],['desired_ip',p.desired_ip||'-'],['status',p.status||p.display_status],['display_status',label(p.display_status)],['retry_count',p.retry_count],['next_retry_at',formatTime(p.next_retry_at)],['last_error',p.last_error||'-'],['updated_at',formatTime(p.updated_at)]
-        \\ ].map(([k,v])=>`<div><dt>${k}</dt><dd>${escapeHtml(v)}</dd></div>`).join('');
-        \\ document.getElementById('detail-panel').hidden=false;
-        \\}
-        \\function hideDetail(){document.getElementById('detail-panel').hidden=true;}
-        \\function label(v){return String(v||'').replace('_',' ');}
-        \\function formatTime(v){return v?formatRfc3339(new Date(v*1000)):'-';}
-        \\function formatRfc3339(d){
-        \\ const pad=n=>String(Math.trunc(Math.abs(n))).padStart(2,'0');
-        \\ const offsetMinutes=-d.getTimezoneOffset();
-        \\ const sign=offsetMinutes>=0?'+':'-';
-        \\ const offsetHours=pad(offsetMinutes/60);
-        \\ const offsetMins=pad(offsetMinutes%60);
-        \\ return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}${sign}${offsetHours}:${offsetMins}`;
-        \\}
-        \\function escapeAttr(v){return String(v||'').replace(/['\\]/g,'');}
-        \\function escapeHtml(v){return String(v||'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));}
-        \\function startRefresh(){
-        \\  if (refreshInterval) clearInterval(refreshInterval);
-        \\  refreshInterval = setInterval(refresh, 30000);
-        \\}
-        \\function toggleRefresh(){
-        \\  isRefreshing = !isRefreshing;
-        \\  const btn = document.getElementById('refresh-toggle');
-        \\  if (isRefreshing) {
-        \\    btn.textContent = '⟳ Auto-refresh: ON';
-        \\    btn.classList.remove('off');
-        \\    refresh();
-        \\    startRefresh();
-        \\  } else {
-        \\    btn.textContent = '⟳ Auto-refresh: OFF';
-        \\    btn.classList.add('off');
-        \\    if (refreshInterval) {
-        \\      clearInterval(refreshInterval);
-        \\      refreshInterval = null;
-        \\    }
-        \\  }
-        \\}
+        \\<section id="detail-panel" class="detail-panel" hidden><header><strong id="detail-title">Provider detail</strong><button type="button" onclick="hideDetail()">Close</button></header><dl id="detail-body"></dl></section></main><script src="/dashboard.js"></script><script>
         \\latestProviders=[
     );
     // 把目前三個 provider 狀態也嵌成 JSON，讓初始 detail panel 不必等第一次 fetch。
@@ -541,33 +537,14 @@ fn writeProviderJson(out: *std.Io.Writer, provider: service.ProviderDisplayData)
     try out.writeAll("\"}");
 }
 
-/// 寫 HTML 文件開頭、CSS 與 `<body>` 起始。
+/// 寫 HTML 文件開頭與 `<body>` 起始。
 ///
-/// CSS 放在這裡是為了讓 Dashboard 不需要額外 static file，也就不需要
-/// 新增 `/public/...` 路由。後續若切回 Jetzig，可以把這段搬成 CSS 檔。
+/// CSS 是獨立檔案 `static/dashboard.css`，透過 `<link>` 載入並可被瀏覽器
+/// 用 304 快取，而不是像之前那樣整段 `<style>` 隨每次回應重送。
 fn writePageStart(out: *std.Io.Writer, title: []const u8) !void {
     try out.writeAll("<!doctype html><html lang=\"zh-Hant\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>");
     try writeHtml(out, title);
-    try out.writeAll(
-        \\</title><style>
-        \\:root{color-scheme:light dark;--bg:#f6f7f9;--fg:#15171a;--muted:#667085;--line:#d8dde5;--panel:#fff;--ok:#22c55e;--bad:#ef4444;--wait:#f97316;--init:#64748b;--info:#3b82f6;--off:#6b7280}
-        \\@media (prefers-color-scheme:dark){:root{--bg:#101214;--fg:#f3f5f7;--muted:#a8b0bb;--line:#303741;--panel:#171a1f}}
-        \\*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
-        \\.shell{width:min(1180px,calc(100% - 32px));margin:0 auto;padding:22px 0 40px}.hero{display:grid;grid-template-columns:1fr minmax(320px,440px);gap:16px;align-items:stretch;margin-bottom:14px}.brand,.public-ip,.provider,.memory-note,.detail-panel,.config-list>div,.config-section{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px}.brand{display:grid;gap:8px}.brand strong{font-size:26px}.brand span,.public-ip span,.status-row span,.config-list span,dt{color:var(--muted)}nav{display:flex;gap:14px;margin-top:6px}a{color:var(--info);text-decoration:none;font-weight:650}.public-ip{display:grid;align-content:center}.public-ip strong{font-size:28px;overflow-wrap:anywhere}.public-ip small{color:var(--muted)}
-        \\.status-row{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:18px 0 12px}.status-row strong{color:var(--ok)}.status-row em{font-style:normal;color:var(--muted)}
-        \\/* 外層是一家 provider；兩欄 provider grid 可讓四家服務不顯得過於擁擠。 */
-        \\.provider-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.provider{overflow:hidden}.provider>header{margin:0 0 12px}.provider>header span{font-size:18px;font-weight:750;text-transform:uppercase}
-        \\/* 每張 provider 卡內再以兩欄放 A/IPv4 和 AAAA/IPv6。 */
-        \\.family-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.family{position:relative;overflow:hidden;border:1px solid var(--line);border-radius:7px;padding:12px}.family:before{content:'';height:4px;background:var(--off);position:absolute;inset:0 0 auto}.family header{display:flex;justify-content:space-between;gap:8px;align-items:center;margin:6px 0 10px}.family header span{font-weight:750}.family header strong{text-transform:capitalize;font-size:12px;padding:2px 8px;border:1px solid var(--line);border-radius:999px}
-        \\/* 色條與狀態徽章各依 family 自己的 display_status 著色。 */
-        \\.family.success:before{background:var(--ok)}.family.failed:before{background:var(--bad)}.family.retry_deferred:before{background:var(--wait)}.family.initializing:before{background:var(--init)}.family.updating:before{background:var(--info)}.family.disabled:before{background:var(--off)}.family.disabled{opacity:.72}.family.success header strong{color:var(--ok)}.family.failed header strong{color:var(--bad)}.family.retry_deferred header strong{color:var(--wait)}.family.initializing header strong{color:var(--init)}.family.updating header strong{color:var(--info)}.family.disabled header strong{color:var(--off)}
-        \\dl{margin:0;display:grid;gap:8px}dl div{display:grid;grid-template-columns:92px minmax(0,1fr);gap:10px}dd{margin:0;font-weight:650;overflow-wrap:anywhere}button{border:1px solid var(--line);background:transparent;color:var(--fg);border-radius:7px;padding:7px 10px;font:inherit;font-weight:650;cursor:pointer}.provider button{width:100%;margin-top:14px}.memory-note{margin-top:14px;color:var(--muted)}.memory-note strong{color:var(--fg)}
-        \\.detail-panel{margin-top:14px}.detail-panel[hidden]{display:none}.detail-panel header{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:12px}.detail-panel header strong{font-size:18px}.detail-panel dl div{grid-template-columns:150px minmax(0,1fr);border-top:1px solid var(--line);padding-top:8px}.config-list{display:grid;gap:10px}.config-list>div{display:flex;justify-content:space-between;gap:16px}.config-list strong{overflow-wrap:anywhere;text-align:right}
-        \\.config-section{padding:20px;margin-bottom:14px}.config-section h2{margin:0 0 12px;font-size:18px}.config-table{width:100%;border-collapse:collapse;margin:12px 0 24px}.config-table th,.config-table td{border:1px solid var(--line);padding:10px;text-align:left}.config-table th{background:var(--bg);font-weight:650}
-        \\#refresh-toggle{padding:4px 10px;font-size:12px;border-radius:999px;border:1px solid var(--line);background:transparent;cursor:pointer;font-weight:650;color:var(--info);border-color:var(--info)}#refresh-toggle.off{color:var(--muted);border-color:var(--line)}
-        \\@media (max-width:760px){.shell{width:min(100% - 20px,1180px);padding-top:12px}.hero,.provider-grid,.family-grid{grid-template-columns:1fr}.brand strong{font-size:21px}.public-ip strong{font-size:22px}.status-row{align-items:flex-start;flex-direction:column}.config-list>div{align-items:flex-start}.detail-panel dl div{grid-template-columns:1fr}.config-table th,.config-table td{padding:6px;font-size:12px}}
-        \\</style></head><body>
-    );
+    try out.writeAll("</title><link rel=\"stylesheet\" href=\"/dashboard.css\"></head><body>");
 }
 
 /// 寫 HTML 文件結尾。

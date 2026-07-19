@@ -12,7 +12,7 @@ $ProjectDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $BinName = 'dynip'
 $OutDir = Join-Path $ProjectDir 'zig-out\bin'
 $Optimize = 'ReleaseFast'
-$FallbackZig = 'D:\Runtime\zig\0.16.0\zig.exe'
+$FallbackZig = 'D:\Runtime\zig\0.17.0\zig.exe'
 
 function Resolve-ZigCommand {
     # `Get-Command zig` 會去找目前環境能不能執行 `zig`。
@@ -113,7 +113,7 @@ try {
     # 先決定這次要使用哪一支 Zig。
     $ZigCmd = Resolve-ZigCommand
 
-    Write-Host '[1/4] Zig version:'
+    Write-Host '[1/5] Zig version:'
 
     # 直接呼叫 `zig version` 取得版本字串。
     $zigVersion = & $ZigCmd 'version'
@@ -122,7 +122,7 @@ try {
     }
     Write-Host "  - zig $zigVersion"
 
-    Write-Host '[2/4] Preparing output directory...'
+    Write-Host '[2/5] Preparing output directory...'
 
     # 如果舊的 `zig-out\bin` 已存在，就整個刪掉重建，避免舊檔混進來。
     if (Test-Path $OutDir) {
@@ -132,10 +132,16 @@ try {
     # 重新建立乾淨的輸出目錄。
     New-Item -ItemType Directory -Path $OutDir | Out-Null
 
-    # 這個腳本現在只建一個 target：Linux ARM64。
-    Build-Target -ZigCmd $ZigCmd -Target 'aarch64-linux' -SourceRelativePath "zig-out\\bin\\$BinName" -DestFileName "${BinName}_linux_arm64" -Step '3/4'
+    # 目前建兩個 target：Linux ARM64 與 Linux ARMv7（32-bit，如 Raspberry Pi 3 armv7l 系統）。
+    Build-Target -ZigCmd $ZigCmd -Target 'aarch64-linux' -SourceRelativePath "zig-out\\bin\\$BinName" -DestFileName "${BinName}_linux_arm64" -Step '3/5'
 
-    Write-Host '[4/4] Done.'
+    # `arm-linux-musleabihf`：
+    # - `arm` = 32-bit ARM（對應 uname 顯示的 armv7l）
+    # - `musl` = 靜態連結的 libc，產物不依賴目標機的 glibc 版本，部署最省事
+    # - `eabihf` = hard-float ABI，Raspberry Pi 3 的 Raspberry Pi OS（armhf）使用這個 ABI
+    Build-Target -ZigCmd $ZigCmd -Target 'arm-linux-musleabihf' -SourceRelativePath "zig-out\\bin\\$BinName" -DestFileName "${BinName}_linux_armv7" -Step '4/5'
+
+    Write-Host '[5/5] Done.'
     Write-Host 'Output files:'
 
     # 只列出 `zig-out\bin` 下面的檔名，方便快速確認結果。

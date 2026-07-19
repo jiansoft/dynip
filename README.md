@@ -478,7 +478,7 @@ Set-Location C:\dynip
 powershell.exe -ExecutionPolicy Bypass -File .\build.ps1
 ```
 
-The PowerShell build currently emits a stripped ARM64 Linux binary into `zig-out\bin\`.
+The PowerShell build currently emits stripped ARM64 and ARMv7 Linux binaries into `zig-out\bin\`.
 
 ## Docker
 
@@ -496,9 +496,9 @@ bash control.sh docker_update
 
 Current assumptions:
 
-- `control.sh` and `dynip_linux_arm64` are placed in the same directory for deployment
+- `control.sh`, `dynip_linux_arm64`, and `dynip_linux_armv7` are placed in the same directory for deployment
 - `control.sh` does not build the binary on the production host
-- `docker_build` packages the existing binary with `Dockerfile`
+- `docker_build` packages the existing binaries with `Dockerfile`, which auto-selects the matching one via BuildKit's `TARGETARCH`/`TARGETVARIANT` (arm64 vs. armv7, e.g. Raspberry Pi 3)
 
 Default names:
 

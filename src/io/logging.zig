@@ -89,10 +89,26 @@ fn ensureLogDir(io: std.Io) !void {
 fn getFileLength(io: std.Io, file: std.Io.File) !u64 {
     if (comptime builtin.os.tag == .linux) {
         // SEEK_END 的 whence 是 2
-        const rc = std.os.linux.lseek(file.handle, 0, 2);
-        switch (std.os.linux.errno(rc)) {
-            .SUCCESS => return rc,
-            else => return error.Unexpected,
+        if (comptime @sizeOf(usize) == 8) {
+            // 64 位元系統：`lseek` 系統呼叫的 offset 直接就是 64 位元。
+            const rc = std.os.linux.lseek(file.handle, 0, 2);
+            switch (std.os.linux.errno(rc)) {
+                .SUCCESS => return rc,
+                else => return error.Unexpected,
+            }
+        } else {
+            // 32 位元系統（例如 Raspberry Pi 的 armv7l）：
+            // `lseek` 的 offset 只有 32 位元，Kernel 另外提供 `_llseek`，
+            // 把 64 位元 offset 拆成高低兩半傳入，結果寫進 `result` 指標。
+            // 標準庫的 `lseek` 在 32 位元 target 上不可用，必須走這條路。
+            // `result` 的型別跟著標準庫的 `off_t`（i64）宣告；
+            // seek 成功時檔案大小必為非負，所以最後可以安全轉成 u64。
+            var result: std.os.linux.off_t = 0;
+            const rc = std.os.linux.llseek(file.handle, 0, &result, 2);
+            switch (std.os.linux.errno(rc)) {
+                .SUCCESS => return @intCast(result),
+                else => return error.Unexpected,
+            }
         }
     } else {
         return try file.length(io);

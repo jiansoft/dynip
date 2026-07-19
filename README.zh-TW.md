@@ -478,7 +478,7 @@ Set-Location C:\dynip
 powershell.exe -ExecutionPolicy Bypass -File .\build.ps1
 ```
 
-目前 PowerShell 建置會把經過 `strip` 的 ARM64 Linux 執行檔輸出到 `zig-out\bin\`。
+目前 PowerShell 建置會把經過 `strip` 的 ARM64 與 ARMv7 Linux 執行檔輸出到 `zig-out\bin\`。
 
 ## Docker
 
@@ -496,9 +496,9 @@ bash control.sh docker_update
 
 目前的假設如下：
 
-- 部署時 `control.sh` 和 `dynip_linux_arm64` 在同一層目錄
+- 部署時 `control.sh`、`dynip_linux_arm64`、`dynip_linux_armv7` 在同一層目錄
 - `control.sh` 不負責在正式環境端編譯執行檔
-- `docker_build` 直接拿現成執行檔搭配 `Dockerfile` 打包
+- `docker_build` 拿現成的兩份執行檔搭配 `Dockerfile` 打包，`Dockerfile` 會透過 BuildKit 的 `TARGETARCH`/`TARGETVARIANT` 自動選出對應平台（arm64 或 armv7，例如 Raspberry Pi 3）的那一份
 
 預設名稱：
 
