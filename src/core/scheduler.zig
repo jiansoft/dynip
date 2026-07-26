@@ -1,4 +1,4 @@
-﻿//! DDNS 排程器。
+//! DDNS 排程器。
 
 /// 匯入 Zig 標準函式庫。
 ///
@@ -101,8 +101,7 @@ pub fn runForever(
             std.log.err("scheduled ddns refresh failed: {}", .{err});
             // 通知採最佳努力模式；notifyFailure 自己吞掉網路錯誤，
             // 所以健康通知失敗不會改變原本 DDNS 的 retry 節奏。
-            ddns.notifications.notifyFailure(
-                allocator, &client, config.notifications, err);
+            ddns.notifications.notifyFailure(allocator, &client, config.notifications, err);
             previous_refresh_failed = true;
 
             // 失敗後先短暫睡 5 秒，避免錯誤狀況下瘋狂重試。

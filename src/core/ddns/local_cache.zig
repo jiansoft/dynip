@@ -12,8 +12,9 @@ const LocalDedupeEntry = struct {
 
 /// 保護 entries 的自旋鎖。ArrayList 不是 thread-safe，不能省略此鎖。
 var local_dedupe_mutex: std.atomic.Mutex = .unlocked;
-/// 目前活著的本機去重項目；Unmanaged 表示每次配置時要明確傳入 allocator。
-var local_dedupe_entries: std.ArrayListUnmanaged(LocalDedupeEntry) = .empty;
+/// 目前活著的本機去重項目；`std.ArrayList` 本身就是 unmanaged 版本，
+/// 所以每次配置都要明確傳入 allocator。
+var local_dedupe_entries: std.ArrayList(LocalDedupeEntry) = .empty;
 
 /// 容量未達此值時不縮小，避免少量項目反覆 realloc。
 const local_dedupe_shrink_min_capacity: usize = 32;

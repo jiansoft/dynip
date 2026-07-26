@@ -598,6 +598,14 @@ fn writeJsonStringContent(out: *std.Io.Writer, value: []const u8) !void {
         switch (byte) {
             '\\' => try out.writeAll("\\\\"),
             '"' => try out.writeAll("\\\""),
+            // `<` 對 JSON 本身無害，但 renderDashboardPage 會把同一份 JSON
+            // 直接嵌進 `<script>` 區塊。瀏覽器在解析 `<script>` 內容時，
+            // 是先找 `</script>` 這個字串才交給 JS engine，所以只要值裡出現
+            // `</script>` 就能提早關掉 script 標籤，變成 HTML injection。
+            //
+            // `<` 在 JSON 與 JS 裡都還原成同一個 `<` 字元，不影響前端讀到的值，
+            // 但已經不再是能結束 script 標籤的字面內容。
+            '<' => try out.writeAll("\\u003c"),
             else => try out.writeByte(byte),
         }
     }
@@ -685,6 +693,26 @@ test "dashboard groups A and AAAA status in each provider card" {
     try std.testing.expect(std.mem.indexOf(u8, html, "AAAA / IPv6") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "Last error") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "family-grid") != null);
+}
+
+test "dashboard json escaping cannot close the embedded script tag" {
+    // renderDashboardPage 把 provider JSON 直接嵌在 `<script>` 裡，
+    // 所以 JSON escaping 必須讓 `</script>` 無法以字面形式出現在輸出中。
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+    var writer: std.Io.Writer.Allocating = .fromArrayList(std.testing.allocator, &buffer);
+    defer writer.deinit();
+
+    try writeJsonStringContent(&writer.writer, "</script><img src=x onerror=alert(1)>");
+    buffer = writer.toArrayList();
+
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "</script>") == null);
+    // 只有 `<` 需要處理。`>` 單獨出現無法結束 script 標籤，所以保持原樣，
+    // 讓輸出盡量接近原始文字。
+    try std.testing.expectEqualStrings(
+        "\\u003c/script>\\u003cimg src=x onerror=alert(1)>",
+        buffer.items,
+    );
 }
 
 test "dashboard html escapes dynamic content" {

@@ -383,13 +383,47 @@ fn applyProcessEnvOverridesLeaky(allocator: std.mem.Allocator, config: *AppConfi
     // `inline for` 在編譯期把所有 override 展開成獨立的 `if (getEnv(...))` 判斷。
     // 每個 key 都是 comptime 已知的字串常數，不需要執行期額外配置。
     inline for (env_overrides) |override| {
-        // 把 comptime 已知的 key 字串轉成 C 格式（在尾端補 null byte）。
-        // `@as([*:0]const u8, ...)` 讓 Zig 知道這是 sentinel 終止指標，
-        // 可以直接傳給 `std.c.getenv`。
-        const sentinel_key: [*:0]const u8 = comptime @as([*:0]const u8, @ptrCast((override.key ++ .{0}).ptr));
-        if (getEnv(sentinel_key)) |value| {
-            try applyOverrideValueLeaky(allocator, config, override.key, value);
+        // `key` 宣告成 `[:0]const u8`，所以 `.ptr` 已經是 `getenv` 要的
+        // null 結尾指標，不需要額外拼接或轉型。
+        if (getEnv(override.key.ptr)) |value| {
+            // 這裡的 `override` 是 comptime 值，可以直接套用對應欄位，
+            // 不必再走 `applyOverrideValueLeaky` 逐一比對 key 字串。
+            try applyOverrideLeaky(allocator, config, override, value);
         }
+    }
+}
+
+/// 把單一筆已知的覆寫規則套進設定結構。
+///
+/// `override` 必須是 comptime 值，因為 `resolveField` 需要在編譯期解析點分路徑，
+/// `switch (override.kind)` 的每個分支也才能被靜態特化成直接賦值。
+fn applyOverrideLeaky(
+    allocator: std.mem.Allocator,
+    config: *AppConfig,
+    comptime override: EnvOverride,
+    value: []const u8,
+) !void {
+    // `resolveField` 在 comptime 用 `@field` 逐層解析點分路徑，
+    // 讓巢狀欄位（例如 `ddns.redis.addr`）也能正確取到可寫的欄位指標。
+    const field_ptr = resolveField(config, override.field);
+
+    switch (override.kind) {
+        // 字串型別：直接把 value slice 寫入欄位。
+        .str => field_ptr.* = value,
+        // 布林型別：辨識 true/false/1/0/yes/no/on/off 等常見寫法。
+        .bool => field_ptr.* = parseBoolOrKeep(value, field_ptr.*),
+        // 無號 32 位整數：解析失敗時保留原值，不中斷整個覆寫流程。
+        .u32 => field_ptr.* = std.fmt.parseUnsigned(u32, value, 10) catch field_ptr.*,
+        // 無號 64 位整數：同上。
+        .u64 => field_ptr.* = std.fmt.parseUnsigned(u64, value, 10) catch field_ptr.*,
+        // JSON 字串陣列：例如 `["a.ddns.net","b.zapto.org"]`。
+        // `Leaky` 表示解析後的字串記憶體交給外層 arena 統一回收。
+        .str_arr => field_ptr.* = try std.json.parseFromSliceLeaky(
+            [][]const u8,
+            allocator,
+            value,
+            .{},
+        ),
     }
 }
 
@@ -410,7 +444,12 @@ const FieldKind = enum { str, bool, u32, u64, str_arr };
 /// 再搭配 `kind` 決定轉型策略。
 const EnvOverride = struct {
     /// 環境變數名稱（例如 `"AFRAID_TOKEN"`）。
-    key: []const u8,
+    ///
+    /// 型別是 `[:0]const u8` 而不是 `[]const u8`：`[:0]` 代表這段字串在結尾
+    /// 保證多帶一個 null byte。Zig 的字串字面值本來就符合這個條件，所以下方
+    /// 表格不用改寫；但有了這個保證，`key.ptr` 就能直接當成 C 的
+    /// `[*:0]const u8` 傳給 `getenv`，不必再另外拼接 null byte 或做 `@ptrCast`。
+    key: [:0]const u8,
     /// 從 `AppConfig` 根到目標欄位的點分路徑（例如 `"afraid.token"`）。
     ///
     /// `applyOverrideValueLeaky` 裡的 `inline for` 會在 comptime 用
@@ -494,32 +533,9 @@ fn applyOverrideValueLeaky(
         // 注意：`inline for` 裡的 `continue` 只有在條件為 comptime 時才合法；
         // 這裡 `key` 是執行期值，所以改用 `if` 把整個賦值區塊包起來。
         if (std.mem.eql(u8, key, override.key)) {
-            // `resolveField` 在 comptime 用 `@field` 逐層解析點分路徑，
-            // 讓巢狀欄位（例如 `ddns.redis.addr`）也能正確取到可寫的欄位指標。
-            // `override.field` 是 comptime 常數，這個呼叫完全在編譯期完成。
-            const field_ptr = resolveField(config, override.field);
-
-            // `override.kind` 也是 comptime 常數，`switch` 的每個分支都能被編譯器靜態特化，
-            // 不同 kind 的展開版本不會互相混合。
-            switch (override.kind) {
-                // 字串型別：直接把 value slice 寫入欄位。
-                .str => field_ptr.* = value,
-                // 布林型別：辨識 true/false/1/0/yes/no/on/off 等常見寫法。
-                .bool => field_ptr.* = parseBoolOrKeep(value, field_ptr.*),
-                // 無號 32 位整數：解析失敗時保留原值，不中斷整個覆寫流程。
-                .u32 => field_ptr.* = std.fmt.parseUnsigned(u32, value, 10) catch field_ptr.*,
-                // 無號 64 位整數：同上。
-                .u64 => field_ptr.* = std.fmt.parseUnsigned(u64, value, 10) catch field_ptr.*,
-                // JSON 字串陣列：例如 `["a.ddns.net","b.zapto.org"]`。
-                // `Leaky` 表示解析後的字串記憶體交給外層 arena 統一回收。
-                .str_arr => field_ptr.* = try std.json.parseFromSliceLeaky(
-                    [][]const u8,
-                    allocator,
-                    value,
-                    .{},
-                ),
-            }
-            return;
+            // 真正的寫入邏輯只有一份，和環境變數路徑共用同一個 helper，
+            // 確保 `.env` 與 process env 對同一個 key 的轉型規則永遠一致。
+            return applyOverrideLeaky(allocator, config, override, value);
         }
     }
 }

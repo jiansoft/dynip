@@ -248,7 +248,7 @@ pub fn ensureSuccessStatus(status: std.http.Status, body: []const u8) !void {
         var preview_buffer: [body_preview_len]u8 = undefined;
         // 先把錯誤狀態碼和 body 預覽打進 log，方便除錯。
         std.log.err("unexpected http status {d}: {s}", .{
-            @intFromEnum(status),
+            @backingInt(status),
             bodyPreviewForLog(&preview_buffer, body),
         });
         // 再把統一的 HTTP 失敗錯誤往外拋。
@@ -358,7 +358,7 @@ fn logHttpResponse(
     if (status.class() == .success) {
         http_log.debug(
             "response {s} {s} status={d} bytes={d}",
-            .{ @tagName(method), log_url, @intFromEnum(status), body.len },
+            .{ @tagName(method), log_url, @backingInt(status), body.len },
         );
         // 只有 body 預覽不是空的時候，才另外補一筆 debug log。
         if (body_preview.len != 0) {
@@ -374,7 +374,7 @@ fn logHttpResponse(
     // 非 2xx 視為錯誤，直接把狀態碼與 body 預覽一起記下來。
     http_log.err(
         "response {s} {s} status={d} bytes={d} body={s}",
-        .{ @tagName(method), log_url, @intFromEnum(status), body.len, body_preview },
+        .{ @tagName(method), log_url, @backingInt(status), body.len, body_preview },
     );
 }
 
@@ -397,10 +397,10 @@ fn executeRequest(
     const protocol = std.http.Client.Protocol.fromUri(uri) orelse return error.UnsupportedUriScheme;
     // 如果是 TLS，先確保 client 已經準備好 CA bundle 等必要狀態。
     try ensureTlsClientReady(client, protocol);
-    // 準備一塊固定大小 buffer，拿來承接 `uri.getHost(...)` 的結果。
+    // 準備一塊固定大小 buffer，拿來承接 URI host 正規化後的結果。
     var host_name_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
     // 從 URI 中取出 host，後面 connect 會用到它。
-    const host_name = try uri.getHost(&host_name_buffer);
+    const host_name = try std.Io.net.HostName.fromUri(uri, &host_name_buffer);
     // 如果 URI 沒明確指定 port，就依照協定套用預設埠號。
     const port: u16 = uri.port orelse switch (protocol) {
         .plain => 80,
@@ -575,7 +575,7 @@ fn maskSlice(text: []u8) void {
 
 fn initDefaultAcceptEncoding() [content_encoding_count]bool {
     var result: [content_encoding_count]bool = @splat(false);
-    result[@intFromEnum(std.http.ContentEncoding.identity)] = true;
+    result[@backingInt(std.http.ContentEncoding.identity)] = true;
     return result;
 }
 
@@ -620,6 +620,6 @@ test "request text options keep get bodiless by default" {
     try std.testing.expectEqual(std.http.Method.GET, options.method);
     try std.testing.expect(options.body == null);
     try std.testing.expect(options.headers.standard.accept_encoding == .omit);
-    try std.testing.expect(options.headers.accept_encoding[@intFromEnum(std.http.ContentEncoding.identity)]);
+    try std.testing.expect(options.headers.accept_encoding[@backingInt(std.http.ContentEncoding.identity)]);
     try std.testing.expectEqual(std.Io.Timeout.none, options.timeouts.connect);
 }

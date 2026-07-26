@@ -63,7 +63,7 @@ pub fn build(b: *std.Build) void {
     // - Debug: 不 strip，方便開發與除錯
     // - 非 Debug: 預設 strip，較接近正式部署時的版本
     const strip = b.option(bool, "strip", "Strip debug symbols from build artifacts") orelse
-        (optimize != .Debug);
+        (optimize != .debug);
 
     // 讀取 `build.zig.zon` 裡宣告的第三方依賴。
     // 這裡抓的是放在 `vendor/okredis` 裡的 `zig-okredis`，

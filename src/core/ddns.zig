@@ -1391,20 +1391,29 @@ test "parseStunResponse decodes valid ipv6 xor-mapped-address" {
     try std.testing.expectEqualStrings("2001:0db8:0000:0000:0000:0000:0000:0001", ip);
 }
 
-test "fetchStunIp retrieves public ip or fails gracefully due to network" {
+/// 與 `io/redis.zig` 相同的開關：只有 `DYNIP_LIVE_TESTS=1` 才跑會用到外網的測試。
+fn liveTestsEnabled() bool {
+    const value = std.c.getenv("DYNIP_LIVE_TESTS") orelse return false;
+    return std.mem.eql(u8, std.mem.span(value), "1");
+}
+
+test "fetchStunIp retrieves a public ip from a real stun server" {
+    // 這個測試預設跳過，因為它需要對外的 UDP 連線。
+    //
+    // 之前的版本會把 `ReceiveFailed` / `SetSocketTimeoutFailed` 當成「環境沒網路」
+    // 而直接通過，結果反而掩蓋了真正的 bug：Windows 上 `SO_RCVTIMEO` 的單位換算
+    // 錯誤讓接收逾時變成 2 毫秒，STUN 每次都 `ReceiveFailed`，測試卻依然是綠的。
+    //
+    // 現在的作法是：預設不跑；一旦明確開啟，就要求它真的成功，
+    // 這樣同一個 bug 再次出現時測試會直接失敗。
+    if (!liveTestsEnabled()) return error.SkipZigTest;
+
     const allocator = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
 
-    const ip = ip_lookup.fetchStunIp(allocator, io, ip_lookup.publicIpServiceUrl(.stun)) catch |err| {
-        switch (err) {
-            error.DnsResolutionFailed, error.SocketCreationFailed, error.SendFailed, error.ReceiveFailed, error.SetSocketTimeoutFailed => {
-                return;
-            },
-            else => return err,
-        }
-    };
+    const ip = try ip_lookup.fetchStunIp(allocator, io, ip_lookup.publicIpServiceUrl(.stun));
     defer allocator.free(ip);
 
     const normalized = try ip_lookup.normalizePublicIp(ip);

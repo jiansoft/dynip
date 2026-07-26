@@ -27,7 +27,7 @@ const CachedRecord = struct {
 /// 排程工作可能呼叫 Cloudflare provider，同時 dashboard 會讀取 snapshot。
 /// 若未來 refresh 改為並行執行，這把 mutex 仍可讓快取讀寫保持安全。
 var record_cache_mutex: std.atomic.Mutex = .unlocked;
-var record_cache: std.ArrayListUnmanaged(CachedRecord) = .empty;
+var record_cache: std.ArrayList(CachedRecord) = .empty;
 
 /// DNS record 對應的位址家族。
 pub const IpFamily = enum {
@@ -380,7 +380,7 @@ fn sendJson(
 
 /// 只有 Cloudflare rate limit（429）與 server error（5xx）可安全立即重試。
 fn isTransientStatus(status: std.http.Status) bool {
-    const code = @intFromEnum(status);
+    const code = @backingInt(status);
     return code == 429 or (code >= 500 and code < 600);
 }
 
@@ -482,8 +482,8 @@ test "cloudflare ownership selector refuses ambiguous records" {
 }
 
 test "cloudflare retries only rate limits and server errors" {
-    try std.testing.expect(isTransientStatus(@enumFromInt(429)));
-    try std.testing.expect(isTransientStatus(@enumFromInt(503)));
+    try std.testing.expect(isTransientStatus(@fromBackingInt(@intCast(429))));
+    try std.testing.expect(isTransientStatus(@fromBackingInt(@intCast(503))));
     try std.testing.expect(!isTransientStatus(.bad_request));
 }
 

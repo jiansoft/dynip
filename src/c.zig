@@ -1,4 +1,4 @@
-﻿//! 專案自用的 C / platform shim。
+//! 專案自用的 C / platform shim。
 //!
 //! - `shim` 可以理解成「薄薄一層轉接器」。
 //! - 原本可以用 `translate-c` 把 C header 自動翻成 Zig declarations。

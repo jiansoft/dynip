@@ -46,13 +46,13 @@ pub const ws2_32 = if (builtin.os.tag == .windows) struct {
     /// - `lpWSAData`: 接收 Winsock 詳細資訊的結構體指標。
     /// - 回傳值: 成功時回傳 0，失敗時回傳特定的錯誤代碼。
     pub extern "ws2_32" fn WSAStartup(wVersionRequired: u16, lpWSAData: *WSADATA) callconv(.winapi) c_int;
-    
+
     /// 關閉 Windows 系統的 Socket。
     ///
     /// - `s`: 要關閉的 Windows Socket控制代碼 (Handle)。
     /// - 回傳值: 成功時回傳 0，失敗時回傳 -1 (SOCKET_ERROR)。
     pub extern "ws2_32" fn closesocket(s: std.posix.socket_t) callconv(.winapi) c_int;
-    
+
     /// 對指定的 Windows Socket 建立 TCP 連線。
     ///
     /// - `s`: 已建立的 Socket 描述符。
@@ -60,6 +60,21 @@ pub const ws2_32 = if (builtin.os.tag == .windows) struct {
     /// - `namelen`: sockaddr 結構體的長度。
     /// - 回傳值: 成功時回傳 0，失敗時回傳 -1 (SOCKET_ERROR)。
     pub extern "ws2_32" fn connect(s: std.posix.socket_t, name: ?*const anyopaque, namelen: c_int) callconv(.winapi) c_int;
+
+    /// 讀回某個 socket option 目前生效的值。
+    ///
+    /// 目前只有單元測試用得到：Winsock 對 `SO_RCVTIMEO` 一律以 DWORD 毫秒回報，
+    /// 所以這是唯一能確認逾時單位有沒有換算錯的方法。
+    ///
+    /// - `optval`: 接收結果的緩衝區。
+    /// - `optlen`: 傳入時是緩衝區大小，傳出時是實際寫入的位元組數。
+    pub extern "ws2_32" fn getsockopt(
+        s: std.posix.socket_t,
+        level: c_int,
+        optname: c_int,
+        optval: [*]u8,
+        optlen: *c_int,
+    ) callconv(.winapi) c_int;
 } else struct {};
 
 /// 行程內 Windows Sockets 是否已經啟動的狀態變數。
@@ -173,10 +188,30 @@ pub fn connectSocket(fd: std.posix.socket_t, addr: anytype, len: std.posix.sockl
 ///
 /// - `fd`: 目標 Socket 描述符。
 /// - `timeout_val`: 包含秒數與微秒數的 timeval 結構體。
+///
+/// 兩個平台對這個 option 的資料格式不同：
+/// - POSIX 收 `struct timeval`（秒 + 微秒）。
+/// - Winsock 收一個 `DWORD` 毫秒值。
+///
+/// 這個差異很容易被忽略，因為 Winsock 收到長度不符的 buffer 時**不會回報錯誤**，
+/// 而是直接把前 4 個 byte 當成毫秒讀走。以 `timeval{ .sec = 2 }` 為例，
+/// Windows 的 `c_long` 是 32-bit，前 4 個 byte 就是 `2`，
+/// 於是原本想要的 2 秒會變成 2 毫秒，讓 STUN 幾乎必定逾時失敗。
 pub fn setSocketTimeout(fd: std.posix.socket_t, timeout_val: std.posix.timeval) !void {
+    if (comptime builtin.os.tag == .windows) {
+        // 先換算成 Winsock 要的毫秒。微秒不足 1 毫秒的部分直接捨去，
+        // 因為 Winsock 本來就沒有比毫秒更細的解析度。
+        const milliseconds: u32 = @intCast(timeout_val.sec * 1000 + @divTrunc(timeout_val.usec, 1000));
+        return setSocketTimeoutOption(fd, std.mem.asBytes(&milliseconds));
+    }
+
     // 系統 API 接受的是位元組指標與長度，而非 Zig 結構本身；`asBytes`
     // 取得 timeout_val 在記憶體中的位元組視圖，且其生命週期涵蓋本次呼叫。
-    const opt_bytes = std.mem.asBytes(&timeout_val);
+    return setSocketTimeoutOption(fd, std.mem.asBytes(&timeout_val));
+}
+
+/// 兩個平台唯一的差別只有 option 內容的形狀，實際的 setsockopt 呼叫共用這裡。
+fn setSocketTimeoutOption(fd: std.posix.socket_t, opt_bytes: []const u8) !void {
     const rc = std.posix.system.setsockopt(
         fd,
         std.posix.SOL.SOCKET,
@@ -187,6 +222,39 @@ pub fn setSocketTimeout(fd: std.posix.socket_t, timeout_val: std.posix.timeval) 
     if (rc == -1) {
         return error.SetSocketTimeoutFailed;
     }
+}
+
+test "socket receive timeout is applied with the platform's expected unit" {
+    // 這個測試直接開一個 UDP socket，設定 2 秒逾時後把值讀回來驗證。
+    // 它不需要對外連線，所以不會像 STUN 測試那樣受網路環境影響。
+    //
+    // 之所以值得測：Winsock 對長度不符的 option buffer 不會回報錯誤，
+    // 單看 `setsockopt` 的回傳值無法發現單位換算寫錯。
+    try ensureWindowsSocketsStarted();
+
+    const socket = try createUdpSocket(std.posix.AF.INET);
+    defer closeSocket(socket);
+
+    const timeout = if (comptime @hasField(std.posix.timeval, "tv_sec"))
+        std.posix.timeval{ .tv_sec = 2, .tv_usec = 0 }
+    else
+        std.posix.timeval{ .sec = 2, .usec = 0 };
+    try setSocketTimeout(socket, timeout);
+
+    if (comptime builtin.os.tag != .windows) return;
+
+    // Winsock 一律以 DWORD 毫秒回報 SO_RCVTIMEO，因此正確設定應該讀回 2000。
+    var effective_milliseconds: u32 = 0;
+    var option_len: c_int = @sizeOf(u32);
+    const rc = ws2_32.getsockopt(
+        socket,
+        std.posix.SOL.SOCKET,
+        std.posix.SO.RCVTIMEO,
+        @ptrCast(&effective_milliseconds),
+        &option_len,
+    );
+    try std.testing.expectEqual(@as(c_int, 0), rc);
+    try std.testing.expectEqual(@as(u32, 2000), effective_milliseconds);
 }
 
 /// UDP Socket 發送資料包的跨平台封裝函數。

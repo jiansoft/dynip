@@ -492,40 +492,43 @@ test "ddns dedupe helper writes both redis keys on miss" {
     try std.testing.expectEqual(@as(u64, 86400), session.seen_ttls[1]);
 }
 
+/// 只有設定 `DYNIP_LIVE_TESTS=1` 時才執行會連外部服務的測試。
+///
+/// 這類測試預設關閉的原因有三個：
+/// 1. 它們需要真實的 Redis 憑證與可用的外網，在 CI 或離線開發時必定失敗。
+/// 2. 它們讓 `zig build test` 的結果取決於本機網路狀態，而不是程式碼本身。
+/// 3. 這個 Redis 測試在 build runner 的 `--listen=-` 模式下會讓測試行程以
+///    非零碼結束，導致 build runner 重跑整個測試二進位，也就是實際上會對
+///    正式 Redis 送出兩次 PING。
+fn liveTestsEnabled() bool {
+    const value = std.c.getenv("DYNIP_LIVE_TESTS") orelse return false;
+    return std.mem.eql(u8, std.mem.span(value), "1");
+}
+
 test "live redis ping returns pong" {
     // 這是一個真的會連線到 Redis 的測試。
     // 它會讀目前專案根目錄下的 `app.json` / `.env`，
     // 然後使用裡面的 Redis 設定做一次 `PING`。
-    std.debug.print("[live redis test] step 1: start test\n", .{});
+    if (!liveTestsEnabled()) return error.SkipZigTest;
 
     // 這裡直接使用 Zig 測試框架提供的 allocator。
     // 如果有記憶體漏掉，測試本身就會失敗。
     const allocator = std.testing.allocator;
-    std.debug.print("[live redis test] step 2: use std.testing.allocator\n", .{});
 
-    // 建立 Zig 0.16 的 threaded IO 環境。
+    // 建立 threaded IO 環境。
     var threaded: std.Io.Threaded = .init(allocator, .{});
     defer threaded.deinit();
-    std.debug.print("[live redis test] step 3: init threaded io\n", .{});
     const io = threaded.io();
-    std.debug.print("[live redis test] step 4: acquire io handle\n", .{});
 
     // 設定資料適合放在 arena 裡，
     // 因為整個測試過程都會一直用到它。
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    std.debug.print("[live redis test] step 5: init arena allocator for config\n", .{});
 
     const app_config = try config_mod.loadLeaky(arena.allocator(), io, config_mod.default_config_path);
-    std.debug.print(
-        "[live redis test] step 6: loaded config, redis addr={s}, db={d}\n",
-        .{ app_config.ddns.redis.addr, app_config.ddns.redis.db },
-    );
 
     const pong = try ping(allocator, io, app_config.ddns.redis);
     defer allocator.free(pong);
-    std.debug.print("[live redis test] step 7: sent PING and received reply={s}\n", .{pong});
 
     try std.testing.expectEqualStrings("PONG", pong);
-    std.debug.print("[live redis test] step 8: assert reply == PONG\n", .{});
 }
