@@ -36,7 +36,7 @@ jobs:
     name: 格式與測試
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: mlugg/setup-zig@v2
         with:
@@ -65,7 +65,7 @@ jobs:
           - target: arm-linux-musleabihf
             name: dynip_linux_armv7
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: mlugg/setup-zig@v2
         with:
@@ -84,7 +84,7 @@ jobs:
       - name: 確認產物架構
         run: file "${{ matrix.name }}"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.name }}
           path: ${{ matrix.name }}
