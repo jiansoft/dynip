@@ -171,6 +171,14 @@ pub const Logging = struct {
     console_level: []const u8 = "info",
     /// 檔案日誌最低輸出等級。
     file_level: []const u8 = "info",
+    /// 舊日誌保留天數。預設 7 天，小於等於 0 代表不自動刪除。
+    max_age_days: i64 = 7,
+    /// 單一日誌檔大小上限（MB）。預設 10 MB，小於等於 0 代表不依大小輪轉。
+    ///
+    /// 超過上限時，正在寫入的檔案會被改名成帶時間戳的封存檔，
+    /// 程式再開一個同名的空檔繼續寫（詳見 `src/io/logging.zig`）。
+    /// 有效值會收斂到 1 MB ～ 1024 MB。
+    max_size_mb: i64 = 10,
     /// Seq HTTP ingestion 設定。
     seq: SeqLogging = .{},
 };
@@ -416,6 +424,8 @@ fn applyOverrideLeaky(
         .u32 => field_ptr.* = std.fmt.parseUnsigned(u32, value, 10) catch field_ptr.*,
         // 無號 64 位整數：同上。
         .u64 => field_ptr.* = std.fmt.parseUnsigned(u64, value, 10) catch field_ptr.*,
+        // 有號 64 位整數：同上。
+        .i64 => field_ptr.* = std.fmt.parseInt(i64, value, 10) catch field_ptr.*,
         // JSON 字串陣列：例如 `["a.ddns.net","b.zapto.org"]`。
         // `Leaky` 表示解析後的字串記憶體交給外層 arena 統一回收。
         .str_arr => field_ptr.* = try std.json.parseFromSliceLeaky(
@@ -436,8 +446,9 @@ fn applyOverrideLeaky(
 /// - `.bool`   : 用 `parseBoolOrKeep` 把常見布林字串轉成 `bool`。
 /// - `.u32`    : 用 `std.fmt.parseUnsigned(u32, ...)` 轉成無號 32 位整數。
 /// - `.u64`    : 用 `std.fmt.parseUnsigned(u64, ...)` 轉成無號 64 位整數。
+/// - `.i64`    : 用 `std.fmt.parseInt(i64, ...)` 轉成有號 64 位整數。
 /// - `.str_arr`: 用 JSON 解析把 `["a","b"]` 轉成 `[][]const u8`。
-const FieldKind = enum { str, bool, u32, u64, str_arr };
+const FieldKind = enum { str, bool, u32, u64, i64, str_arr };
 
 /// 每一筆環境變數覆寫規則的描述。
 /// comptime 建表時需要用字串路徑（`field`）來找到 `AppConfig` 裡對應的欄位指標，
@@ -503,6 +514,8 @@ const env_overrides = [_]EnvOverride{
     .{ .key = "DASHBOARD_PORT", .field = "dashboard.port", .kind = .u32 },
     .{ .key = "LOG_CONSOLE_LEVEL", .field = "logging.console_level", .kind = .str },
     .{ .key = "LOG_FILE_LEVEL", .field = "logging.file_level", .kind = .str },
+    .{ .key = "LOG_MAX_AGE_DAYS", .field = "logging.max_age_days", .kind = .i64 },
+    .{ .key = "LOG_MAX_SIZE_MB", .field = "logging.max_size_mb", .kind = .i64 },
     .{ .key = "LOG_SEQ_ENABLED", .field = "logging.seq.enabled", .kind = .bool },
     .{ .key = "LOG_SEQ_LEVEL", .field = "logging.seq.level", .kind = .str },
     .{ .key = "LOG_SEQ_SERVER_URL", .field = "logging.seq.server_url", .kind = .str },
@@ -755,6 +768,8 @@ test "dotenv text overrides config values" {
         \\DASHBOARD_PORT=18080
         \\LOG_CONSOLE_LEVEL=debug
         \\LOG_FILE_LEVEL=info
+        \\LOG_MAX_AGE_DAYS=14
+        \\LOG_MAX_SIZE_MB=32
         \\LOG_SEQ_ENABLED=true
         \\LOG_SEQ_LEVEL=warn
         \\LOG_SEQ_SERVER_URL=http://seq.example.com:5341
@@ -790,6 +805,8 @@ test "dotenv text overrides config values" {
     try std.testing.expectEqual(@as(u32, 18080), config.dashboard.port);
     try std.testing.expectEqualStrings("debug", config.logging.console_level);
     try std.testing.expectEqualStrings("info", config.logging.file_level);
+    try std.testing.expectEqual(@as(i64, 14), config.logging.max_age_days);
+    try std.testing.expectEqual(@as(i64, 32), config.logging.max_size_mb);
     try std.testing.expect(config.logging.seq.enabled);
     try std.testing.expectEqualStrings("warn", config.logging.seq.level);
     try std.testing.expectEqualStrings("http://seq.example.com:5341", config.logging.seq.server_url);

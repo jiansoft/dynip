@@ -50,6 +50,8 @@
   "logging": {
     "console_level": "info",
     "file_level": "info",
+    "max_age_days": 7,
+    "max_size_mb": 1,
     "seq": {
       "enabled": false,
       "level": "warn",

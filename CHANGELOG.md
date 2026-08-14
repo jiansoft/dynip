@@ -7,6 +7,78 @@
 
 ---
 
+## [26.8.14]
+
+建置基準：Zig `0.17.0-dev.1745+ac8a8d0c5`，`x86_64-windows.win11_br-gnu`。
+
+### 變更
+
+- **`src/io/logging.zig` 依職責拆成三個子模組。**
+
+  原本一個檔同時管檔案輪轉、Seq HTTP 推送、跨平台時間取得與 log 行格式化，
+  加上大小輪轉後超過 1300 行。拆完後對外 API（`init` / `configure` / `deinit` /
+  `logFn` / `infoFile` 等）完全不變，呼叫端一行都不用改：
+
+  - `src/io/logging.zig`（約 330 行）：logger 狀態、等級過濾與對外 API。
+  - `src/io/logging/format.zig`（約 160 行）：本地時間取得、log 行格式化、console 輸出。
+  - `src/io/logging/rotate.zig`（約 770 行，含測試）：檔案輪轉與過期清理。
+  - `src/io/logging/seq.zig`（約 170 行）：CLEF 事件與 Seq 推送。
+
+  `SeqSink` 的 `Service` 欄位改由呼叫端傳入，`seq.zig` 因此不必回頭依賴檔名規則，
+  三個子模組之間只有 `rotate` / `seq` → `format` 這一個方向的依賴。
+
+- **`control.sh` 的一般模式 `update` 改成完整部署流程。**
+
+  原本 `update` 只是 `restart`，沒有把新執行檔換上去。現在改為
+  `stop`（並等舊程序真的退出）→ `move` → `start`，與 stock_rust 的 control.sh 一致：
+
+  - 新執行檔從 `$UPLOAD_BIN_DIR`（預設 `/tmp`）搬到 `control.sh` 同層；
+    也可用 `UPLOAD_BIN_FILE` 指定完整路徑。刻意不接受 `zig-out/bin/dynip` 這種本機編譯
+    產物：這支腳本不在正式環境端編譯，且那個檔名沒有架構後綴。
+  - 搬入前先把舊執行檔改名成帶時間戳的備份並拿掉執行權限，讓新檔是全新的 inode，
+    避免直接覆蓋執行中的檔案踩到 `Text file busy`（ETXTBSY）。
+  - `stop` 新增 `wait_for_exit`（上限 `STOP_WAIT_SECONDS`，預設 60 秒），
+    避免舊程序還活著就啟動新的造成雙實例同時更新 DDNS。
+  - 新增可單獨執行的 `move` 指令。
+
+- **`control.sh start` 會先輪轉 `log/general_stdout.log`。**
+
+  這個檔收的是程式 stdout/stderr（`nohup ... >>` 重導向），內容和 `log/*.log` 幾乎重複，
+  但沒有任何人管理，只會一直 append —— 正式機上實際長到 48 MB。
+
+  現在 `start` 前若超過 `STDOUT_LOG_MAX_SIZE_MB`（預設 10 MB）就改名備份，
+  並只保留最近 `STDOUT_LOG_KEEP`（預設 3）份。備份的保留判斷依「檔名時間戳」而非 mtime：
+  備份是用 `mv` 改名，mtime 保留的是原檔最後寫入時間，拿它排序會把剛備份的檔排錯位置。
+
+  只能在啟動前處理：服務執行中時重導向綁的是已開啟的 fd（inode），
+  改名或刪檔都不會讓執行中的程序改寫到新檔。想從源頭少寫，
+  可把 `.env` 的 `LOG_CONSOLE_LEVEL` 調成 `warn` 或 `error`。
+
+### 新增
+
+- **日誌檔支援依大小輪轉，採 rename-on-rollover 命名。**
+
+  在此之前檔案日誌只有跨日換檔，單一等級的日誌檔會無上限成長。現在新增
+  `logging.max_size_mb`（預設 `10` MB，`<= 0` 代表停用；可由 `.env` 的
+  `LOG_MAX_SIZE_MB` 覆寫，有效值收斂到 1 MB ～ 1 GB）。
+
+  命名策略刻意讓**正在寫入的檔案永遠不帶時間戳**：
+
+  ```text
+  09:00     寫入中 ──────► log/2026-04-26_dynip_info.log
+  09:06:56  超過上限
+            改名   ──────► log/2026-04-26_dynip_info.09-06-56.log   （封存，內容截止於 09:06:56）
+            開新檔 ──────► log/2026-04-26_dynip_info.log            （繼續寫）
+  ```
+
+  - 最新日誌固定在同一個路徑，tail 與 log 收集器不必追檔名。
+  - 封存檔的時間戳取自該檔**最後一筆**日誌，檔名直接標示內容截止時間，
+    回頭查特定時段可由檔名定位。
+  - 同一秒內連續輪轉會加序號（`.09-06-56-1.log`），不覆蓋既有封存檔。
+  - 改名前會先關閉檔案 handle（Windows 不允許改名開啟中的檔案）；
+    改名失敗時只在 console 提示一次並續寫原檔，下一筆日誌會再試，不中斷服務。
+  - 封存檔名的日期仍在開頭，`cleanupOldFiles` 的保留天數判斷照舊生效。
+
 ## [26.7.26]
 
 建置基準：Zig `0.17.0-dev.1282+c0f9b51d8`，`x86_64-windows.win11_br-gnu`。

@@ -6,14 +6,66 @@
 //! - 統一管理 standard headers / extra headers / privileged headers。
 //! - 連線 timeout 設定。
 //! - 整理 HTTP 日誌，避免把敏感資訊直接寫進 log。
+//!
+//! ## 三個對外入口
+//!
+//! 對外的送 request 函式有三個，但真正做事的只有一個：
+//!
+//! ```text
+//! fetchText()    ─┐  舊式 GET 相容 API
+//! requestJson()  ─┤  先把值序列化成 JSON，再往下丟
+//!                 └─► requestText() ──► executeRequest()
+//! ```
+//!
+//! 全部收斂到 `requestText()` 的好處是：URL 遮罩、request/response 日誌、
+//! 錯誤處理只需要維護一份，不會出現「某個呼叫路徑忘了遮密碼」這種漏洞。
+//!
+//! ## 為什麼要自己遮罩 URL
+//!
+//! 這個專案要更新的 DDNS 供應商，有好幾家是把帳密或 token 直接放在 query string，例如：
+//!
+//! ```text
+//! https://api.dynu.com/nic/update?username=demo&password=abcdef
+//! https://freedns.afraid.org/dynamic/update.php?<token>
+//! ```
+//!
+//! 這種 URL 只要照原樣寫進日誌，等於把帳密留在磁碟上（而且日誌常會被一起打包送出）。
+//! 因此所有寫日誌的路徑都不直接使用原始 URL，一律先經過 [`urlForLog`] 遮罩。
+//!
+//! ## 記憶體與所有權
+//!
+//! [`FetchTextResponse.body`] 是配置出來的記憶體，**所有權會交給呼叫端**，
+//! 呼叫端必須自己 `allocator.free(...)`。模組內部的暫存緩衝則一律用
+//! `defer` / `errdefer` 在函式內收乾淨。
 
 /// 匯入 Zig 標準函式庫。
 ///
 /// HTTP 客戶端、JSON、ArrayList、字串處理與 log 都由這裡提供。
 const std = @import("std");
+
+/// `std.http.ContentEncoding` 的成員數量。
+///
+/// Accept-Encoding 的開關是「每個編碼一個 bool」的固定長度陣列，
+/// 陣列長度必須剛好等於這個 enum 的成員數，所以在編譯期算出來共用。
 const content_encoding_count = enumFieldCount(std.http.ContentEncoding);
+
+/// Accept-Encoding 開關的預設值：只接受 `identity`（未壓縮）。
+///
+/// 在編譯期就算好一份，讓每個 [`HeaderPolicy`] 都能直接拿來當預設值，
+/// 不必在執行期重複組。
 const default_accept_encoding: [content_encoding_count]bool = initDefaultAcceptEncoding();
 
+/// 取得一個 enum 的成員數量。
+///
+/// 為什麼不直接寫 `@typeInfo(T).@"enum".fields.len`：這個欄位在 Zig 0.17-dev 期間
+/// 曾從 `fields` 改名為 `field_names`。用 `@hasField` 在編譯期偵測目前的標準庫是哪一種，
+/// 兩種版本都能編譯，升級 Zig 時不必回頭改這裡。
+///
+/// # Arguments
+/// * `T` - 要檢查的 enum 型別（編譯期參數）。
+///
+/// # Returns
+/// 該 enum 的成員數量。
 fn enumFieldCount(comptime T: type) usize {
     const enum_info = @typeInfo(T).@"enum";
     return if (comptime @hasField(@TypeOf(enum_info), "field_names"))
@@ -68,6 +120,10 @@ pub const RequestTimeouts = struct {
 /// `standard` 對應 Zig 標準庫的 overridable headers，
 /// `extra_headers` 會無條件附加，
 /// `privileged_headers` 則會在跨網域 redirect 時自動剝除。
+///
+/// 三者的差別在「跟著 redirect 走不走」：一般 header 會跟著跑到新網域，
+/// 認證類 header 若也跟著跑，等於把憑證送給一個非預期的伺服器。
+/// 需要保護的認證資訊放 `privileged_headers`，標準庫會在跨網域時自動拿掉。
 pub const HeaderPolicy = struct {
     /// Zig 標準庫內建的 overridable headers。
     ///
@@ -92,6 +148,9 @@ pub const HeaderPolicy = struct {
 };
 
 /// 單次 HTTP 文字 request 的完整選項。
+///
+/// 全部欄位都有預設值，所以最簡單的用法是傳一個空的 `.{}`，代表
+/// 「GET、沒有 body、不要壓縮、不設 connect timeout、開 keep-alive」。
 pub const RequestTextOptions = struct {
     /// HTTP method，例如 GET / POST。
     ///
@@ -123,6 +182,24 @@ pub const RequestJsonOptions = struct {
 };
 
 /// 發出單次 HTTP 文字 request，並把回應內容收成字串。
+///
+/// 這是本模組唯一真正組出 request 的對外入口，`fetchText` 與 `requestJson`
+/// 最後都會走到這裡。
+///
+/// # Arguments
+/// * `allocator` - 配置回應 body 用；回傳值裡的 `body` 由呼叫端負責釋放。
+/// * `client` - 共用的 HTTP client。可重複使用以沿用連線池。
+/// * `url` - 完整網址，例如 `https://api.example.com/update?x=1`。
+/// * `options` - method、body、headers、timeout 等設定，見 [`RequestTextOptions`]。
+///
+/// # Returns
+/// [`FetchTextResponse`]，包含狀態碼與完整回應內容。
+/// **注意：非 2xx 也算成功回傳**，因為對方確實回應了。要把非 2xx 當錯誤處理，
+/// 請接著呼叫 [`ensureSuccessStatus`]。
+///
+/// # Errors
+/// URL 解析、連線、送出、讀取回應任一階段失敗，或配置記憶體失敗。
+/// 失敗前都會先寫一筆帶遮罩 URL 的錯誤日誌。
 pub fn requestText(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
@@ -183,6 +260,16 @@ pub fn requestText(
 /// 發出單次 GET 請求並把回應內容收成字串。
 ///
 /// 這是為了沿用既有呼叫點而保留的相容 API。
+///
+/// # Arguments
+/// * `allocator` - 同 [`requestText`]。
+/// * `client` - 共用的 HTTP client。
+/// * `url` - 完整網址。
+/// * `extra_headers` - 附加 headers，會原樣帶著跟隨 redirect。
+/// * `options.connect_timeout` - connect 階段的 timeout。
+///
+/// # Returns
+/// 同 [`requestText`]；同樣不會因為非 2xx 而回傳錯誤。
 pub fn fetchText(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
@@ -204,6 +291,21 @@ pub fn fetchText(
 ///
 /// 預設會用 `POST`，並在沒有覆寫時自動補上
 /// `Content-Type: application/json`。
+///
+/// # Arguments
+/// * `allocator` - 配置 JSON 暫存字串與回應 body。JSON 暫存在函式結束前釋放，
+///   回應 body 則交給呼叫端。
+/// * `client` - 共用的 HTTP client。
+/// * `url` - 完整網址。
+/// * `value` - 任意可被 `std.json` 序列化的值（struct、slice、數字…）。
+///   型別是 `anytype`，代表編譯期才決定，呼叫端不必先手動轉成字串。
+/// * `options` - JSON 序列化選項與底層 request 選項。
+///
+/// # Returns
+/// 同 [`requestText`]。
+///
+/// # Errors
+/// JSON 序列化失敗，或底層 HTTP request 的任何錯誤。
 pub fn requestJson(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
@@ -241,6 +343,16 @@ pub fn requestJson(
 }
 
 /// 確認 HTTP 狀態碼是否為 2xx。
+///
+/// [`requestText`] 對於 404、500 這類回應仍視為「成功收到回應」，
+/// 因此需要把狀態碼當錯誤處理的呼叫端，要自己再呼叫這個函式檢查一次。
+///
+/// # Arguments
+/// * `status` - 回應的狀態碼。
+/// * `body` - 回應內容；只在失敗時取前面一小段寫進錯誤日誌，方便看出對方抱怨什麼。
+///
+/// # Errors
+/// * `error.UnexpectedHttpStatus` - 狀態碼不是 2xx。
 pub fn ensureSuccessStatus(status: std.http.Status, body: []const u8) !void {
     // 只有 2xx 會被視為成功。
     if (status.class() != .success) {
@@ -257,6 +369,22 @@ pub fn ensureSuccessStatus(status: std.http.Status, body: []const u8) !void {
 }
 
 /// 將 body 整理成一小段適合寫進 log 的預覽字串。
+///
+/// 會做三件事：
+/// 1. 換行與 tab 換成空白、不可列印字元換成 `?`，避免一筆 log 被撐成好幾行。
+/// 2. 超出 buffer 時截斷，並在尾端補上 `...` 表示還有內容。
+/// 3. 修掉尾端多餘的空白。
+///
+/// # Arguments
+/// * `buffer` - 呼叫端提供的暫存空間，通常是 `[body_preview_len]u8` 的 stack 陣列。
+///   結果會寫在這裡，所以它必須活得比回傳的 slice 久。
+/// * `body` - 原始回應內容。
+///
+/// # Returns
+/// 指向 `buffer` 前段的 slice。長度不會超過 `buffer.len`。
+///
+/// 長度安全性：需要補 `...` 時，可寫入內容的上限會先降成 `buffer.len - 3`，
+/// 因此最後補三個點剛好填滿，不會越界。`buffer.len < 3` 時則放棄補點，只做截斷。
 pub fn bodyPreviewForLog(buffer: []u8, body: []const u8) []const u8 {
     // 如果呼叫端給的 buffer 長度是 0，就根本不可能產生任何預覽。
     if (buffer.len == 0) return "";
@@ -286,6 +414,8 @@ pub fn bodyPreviewForLog(buffer: []u8, body: []const u8) []const u8 {
 
     // 如果尾端剛好是空白，就一路往回修掉，
     // 讓預覽字串更乾淨。
+    // 多數 DDNS 供應商的回應是 `nochg 1.2.3.4\r\n` 這種形式，
+    // 換行被換成空白後就會留在尾端，這一步正是為了修掉它。
     while (out_index > 0 and buffer[out_index - 1] == ' ') {
         out_index -= 1;
     }
@@ -305,6 +435,14 @@ pub fn bodyPreviewForLog(buffer: []u8, body: []const u8) []const u8 {
 }
 
 /// 在送出 request 前寫出一筆簡短的 HTTP request 日誌。
+///
+/// # Arguments
+/// * `method` - HTTP method。
+/// * `log_url` - **已經遮罩過**的網址；請勿傳原始 URL 進來。
+/// * `body` - request body，`null` 代表這次沒有 body。
+///
+/// 只記 body 的長度而不記內容，是因為 request body 常含帳密或 API token
+/// （例如 Cloudflare 的 record 更新）。長度足以判斷「有沒有送出東西」，又不外洩內容。
 fn logHttpRequest(method: std.http.Method, log_url: []const u8, body: ?[]const u8) void {
     // 如果這次 request 有 body，就把 body 長度也一起寫進 log。
     if (body) |request_body| {
@@ -321,6 +459,15 @@ fn logHttpRequest(method: std.http.Method, log_url: []const u8, body: ?[]const u
 }
 
 /// 產生適合寫進 log 的網址版本，並遮罩敏感值。
+///
+/// # Arguments
+/// * `buffer` - 呼叫端提供的暫存空間，通常是 `[log_url_buffer_len]u8`。
+///   遮罩必須在可修改的副本上做，所以原始 URL 會先複製到這裡。
+/// * `url` - 原始網址。
+///
+/// # Returns
+/// 遮罩後的網址（指向 `buffer`）。URL 長到放不進 `buffer` 時回傳
+/// `"<http-url-too-long>"`，寧可少記一筆資訊，也不要冒著寫出未遮罩內容的風險。
 fn urlForLog(buffer: []u8, url: []const u8) []const u8 {
     // 如果 URL 太長，連複製進 buffer 都放不下，
     // 就直接回傳固定提示字串，避免越界。
@@ -343,6 +490,15 @@ fn urlForLog(buffer: []u8, url: []const u8) []const u8 {
 }
 
 /// 根據 method、狀態碼與 body 內容寫出 HTTP response 日誌。
+///
+/// # Arguments
+/// * `method` - 這次請求用的 method。
+/// * `log_url` - **已經遮罩過**的網址。
+/// * `status` - 回應狀態碼。
+/// * `body` - 完整回應內容，會先縮成預覽再寫入。
+///
+/// 等級的選擇：2xx 走 `debug`（日常成功不需要佔用 info 版面），
+/// 非 2xx 走 `err` 並把 body 預覽一起寫出來——那時候「對方到底抱怨什麼」才是關鍵線索。
 fn logHttpResponse(
     method: std.http.Method,
     log_url: []const u8,
@@ -379,6 +535,26 @@ fn logHttpResponse(
 }
 
 /// 執行單次 HTTP request，並把回應內容寫到指定 writer。
+///
+/// 流程是：解析 URL → 準備 TLS → 建立連線 → 送出 → 收 head → 串流讀 body。
+/// 每一步失敗都會先寫一筆帶遮罩 URL 的錯誤日誌，再把原始錯誤往外拋，
+/// 這樣呼叫端的 `catch` 能拿到精確的錯誤型別，日誌也留下了是哪一階段失敗。
+///
+/// # Arguments
+/// * `allocator` - 只用於複製 request body（見下方說明），與回應無關。
+/// * `client` - 共用的 HTTP client。
+/// * `url` - 原始網址（需要完整值才能連線）。
+/// * `options` - 請求選項。
+/// * `log_url` - **已經遮罩過**的網址，只用於寫日誌。
+/// * `response_writer` - 回應內容會被串流寫進這裡，由呼叫端提供。
+///
+/// # Returns
+/// 只回傳狀態碼；body 已經寫進 `response_writer`。
+///
+/// # Errors
+/// * `error.UnsupportedUriScheme` - 不是 http/https。
+/// * `error.RequestBodyNotAllowed` - 這個 method 語義上不該帶 body。
+/// * 其他 - URL 解析、TLS 準備、連線、送出、接收階段的底層錯誤。
 fn executeRequest(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
@@ -408,6 +584,10 @@ fn executeRequest(
     };
     // 這裡用的是 Zig 的 method-call 語法糖：
     // `client.connectTcpOptions(x)` 等價於 `std.http.Client.connectTcpOptions(client, x)`。
+    //
+    // 為什麼要自己 connect，而不是讓 `client.request(...)` 自動處理：
+    // 只有這條路徑能傳入 connect timeout。代價是必須自己補上原本由 request()
+    // 順帶完成的 TLS 初始化，也就是上面那行 `ensureTlsClientReady`。
     const connection = client.connectTcpOptions(.{
         .host = host_name,
         .port = port,
@@ -491,6 +671,24 @@ fn executeRequest(
 }
 
 /// 顯式走 `connectTcpOptions(...)` 前，先補齊 request() 預設會做的 TLS 初始化。
+///
+/// 「初始化」指的是載入系統的 CA 憑證庫（用來驗證伺服器憑證）與記下目前時間
+/// （用來檢查憑證是否過期）。平常呼叫 `client.request(...)` 時標準庫會順手做掉，
+/// 但我們為了設定 connect timeout 而自己建立連線，就得自己補上這一步。
+///
+/// # Arguments
+/// * `client` - 要初始化的 HTTP client；成功後 `client.ca_bundle` 與 `client.now` 會被填好。
+/// * `protocol` - 這次連線的協定；`.plain`（純 HTTP）不需要 TLS，會直接返回。
+///
+/// # Errors
+/// * `error.TlsInitializationFailed` - 編譯時停用了 TLS，不可能建立 HTTPS 連線。
+/// * `error.CertificateBundleLoadFailure` - 掃描系統憑證失敗。
+/// * `error.Canceled` - 掃描過程被取消。
+///
+/// 鎖的用法：先用 shared（可多人同時讀）鎖檢查是否已初始化，需要初始化時才改拿獨占鎖。
+/// 兩段鎖之間有空隙，所以兩條 thread 同時第一次發 HTTPS 請求時，可能各自掃一次系統憑證。
+/// 這是刻意接受的取捨——結果一樣正確（後寫入者的 bundle 勝出，舊的由 `defer` 釋放），
+/// 代價只是啟動時多掃一次；換來的是後續每次請求都只需要一個成本極低的 shared 鎖。
 fn ensureTlsClientReady(
     client: *std.http.Client,
     protocol: std.http.Client.Protocol,
@@ -513,6 +711,9 @@ fn ensureTlsClientReady(
     // 建立一個暫時的 certificate bundle，準備掃描系統憑證。
     var bundle: std.crypto.Certificate.Bundle = .empty;
     // 這個暫時 bundle 用完要釋放。
+    //
+    // 注意最後那個 `swap`：交換之後，這個變數裡裝的是 client 原本持有的舊 bundle，
+    // 所以這行 defer 釋放的其實是舊資料，不是我們剛掃出來的新資料。
     defer bundle.deinit(client.allocator);
     // 取得目前時間，TLS 憑證驗證會需要它。
     const now = std.Io.Clock.real.now(io);
@@ -533,6 +734,21 @@ fn ensureTlsClientReady(
 }
 
 /// 遮罩 query string 裡某個 key 的值。
+///
+/// 例如把 `?username=demo&password=abcdef` 變成 `?username=****&password=******`。
+/// 直接改寫傳入的 slice（原地遮罩），因為 `*` 和原字元一樣寬，長度不會變。
+///
+/// # Arguments
+/// * `text` - 可修改的網址副本；函式會就地改寫它。
+/// * `key` - 要遮罩的參數名稱，例如 `"password"`。
+///
+/// 兩個容易忽略的邊界，程式碼裡各有一段判斷在處理：
+/// 1. **key 後面必須緊接 `=`**，否則 `tokenizer=x` 這種只是剛好包含 `token` 的字串會被誤判。
+/// 2. **key 前面必須是 `?` 或 `&`**（或位於字串開頭），否則 `?apitoken=x` 裡的 `token`
+///    會被當成獨立參數，遮到錯的位置。
+///
+/// 迴圈每輪都會把 `start_index` 往前推，即使這次沒有遮到任何東西也一樣，
+/// 因此不會在同一個位置反覆比對造成無限迴圈。
 fn maskQueryValue(text: []u8, key: []const u8) void {
     var start_index: usize = 0;
 
@@ -557,6 +773,14 @@ fn maskQueryValue(text: []u8, key: []const u8) void {
 }
 
 /// 遮罩像 `/dynamic/update.php?<token>` 這種 query 尾端 token。
+///
+/// Afraid.org 的更新網址沒有 `key=value` 結構，`?` 後面整段就是 token 本身，
+/// 所以 [`maskQueryValue`] 那套 key 比對在這裡派不上用場，需要這個專門的版本。
+///
+/// # Arguments
+/// * `text` - 可修改的網址副本；函式會就地改寫它。
+/// * `prefix` - 判斷用的路徑前綴，例如 `"/dynamic/update.php?"`。
+///   找不到這個前綴時什麼都不做（代表這不是該供應商的網址）。
 fn maskQueryTailAfterPrefix(text: []u8, prefix: []const u8) void {
     const prefix_index = std.mem.indexOf(u8, text, prefix) orelse return;
     const value_start = prefix_index + prefix.len;
@@ -567,18 +791,36 @@ fn maskQueryTailAfterPrefix(text: []u8, prefix: []const u8) void {
 }
 
 /// 把一段字串全部改成 `*`。
+///
+/// # Arguments
+/// * `text` - 要遮罩的區段；就地改寫。
+///
+/// `for (text) |*char|` 取的是每個元素的**指標**（注意 `*`），
+/// 因此 `char.* = '*'` 改到的是原本的資料。若寫成 `|char|` 拿到的是複本，改了不會生效。
 fn maskSlice(text: []u8) void {
     for (text) |*char| {
         char.* = '*';
     }
 }
 
+/// 產生 Accept-Encoding 預設開關表：只把 `identity` 設成 `true`。
+///
+/// 在編譯期執行（結果指定給 `const`），所以不會有執行期成本。
+///
+/// # Returns
+/// 長度等於 `std.http.ContentEncoding` 成員數的 bool 陣列。
+///
+/// `@splat(false)` 是把整個陣列一次填成 `false` 的寫法，等同於逐格設定但更精簡。
 fn initDefaultAcceptEncoding() [content_encoding_count]bool {
     var result: [content_encoding_count]bool = @splat(false);
     result[@backingInt(std.http.ContentEncoding.identity)] = true;
     return result;
 }
 
+// 驗證兩種不同格式的敏感網址都會被遮罩。
+//
+// 涵蓋 Afraid（`?` 之後整段是 token）與 Dynu（`username=` / `password=` 參數）兩種形式，
+// 同時確認非敏感參數 `myip` 保持原樣——遮太多會讓日誌失去排查價值。
 test "url for log masks afraid token and dynu password" {
     var afraid_buffer: [log_url_buffer_len]u8 = undefined;
     const afraid_url = urlForLog(&afraid_buffer, "https://freedns.afraid.org/dynamic/update.php?secret-token");
@@ -595,12 +837,20 @@ test "url for log masks afraid token and dynu password" {
     );
 }
 
+// 驗證回應預覽會把換行換成空白，並修掉尾端空白。
+//
+// `nochg 1.2.3.4\r\n` 是 DDNS 供應商最典型的回應格式；
+// 若不處理，每筆回應日誌都會多出一個換行，把單行日誌撐成兩行。
 test "body preview for log removes line breaks" {
     var buffer: [32]u8 = undefined;
     const preview = bodyPreviewForLog(&buffer, "nochg 1.2.3.4\r\n");
     try std.testing.expectEqualStrings("nochg 1.2.3.4", preview);
 }
 
+// 驗證 JSON 請求的兩個預設值：method 是 POST、Content-Type 尚未被指定。
+//
+// 後半段重現 `requestJson` 內「呼叫端沒指定就補上 application/json」那段邏輯，
+// 確認補值之後真的讀得到覆寫值。
 test "request json defaults to post and json content type" {
     var options = RequestJsonOptions{};
     try std.testing.expectEqual(std.http.Method.POST, options.request.method);
@@ -615,6 +865,11 @@ test "request json defaults to post and json content type" {
     );
 }
 
+// 驗證 `RequestTextOptions` 的預設值就是「單純的 GET」。
+//
+// 這些預設值是本模組所有呼叫端的共同起點，改動任何一個都會影響全部請求，
+// 所以用測試把它們釘住：GET、沒有 body、不送 Accept-Encoding、但仍接受未壓縮回應、
+// 不設 connect timeout。
 test "request text options keep get bodiless by default" {
     const options = RequestTextOptions{};
     try std.testing.expectEqual(std.http.Method.GET, options.method);

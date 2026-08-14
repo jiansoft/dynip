@@ -80,7 +80,10 @@ This project now follows a more typical Zig application layout:
 - `src/core/ddns.zig`: the main DDNS workflow. It fetches the current public IP, reconciles provider state, and updates enabled providers.
 - `src/io/redis.zig`: the Redis integration layer used by DDNS provider state and legacy observer keys.
 - `src/core/scheduler.zig`: the fixed-interval background loop that repeatedly triggers refresh work.
-- `src/io/logging.zig`: the structured logging layer that handles console and file logging behavior.
+- `src/io/logging.zig`: the logging assembly layer that owns logger state, level filtering, and the public API. The implementation is split into three focused submodules:
+  - `src/io/logging/format.zig`: local time lookup, log line formatting, console output.
+  - `src/io/logging/rotate.zig`: date- and size-based log file rotation plus cleanup.
+  - `src/io/logging/seq.zig`: shipping the same entry to Seq in CLEF format.
 - `src/io/http.zig`: shared HTTP fetch and response logging helpers.
 - `build.zig`: the Zig build definition. It wires together the executable, the `run` step, and the test step.
 - `build.ps1` / `build.bat`: Windows-oriented helper scripts for local build flows.
@@ -161,6 +164,8 @@ Later sources override earlier ones.
   "logging": {
     "console_level": "info",
     "file_level": "info",
+    "max_age_days": 7,
+    "max_size_mb": 10,
     "seq": {
       "enabled": false,
       "level": "warn",
@@ -277,6 +282,8 @@ When `ddns.redis.enabled = false`:
 - `DDNS_IPV6_PROVIDER`
 - `LOG_CONSOLE_LEVEL`
 - `LOG_FILE_LEVEL`
+- `LOG_MAX_AGE_DAYS`
+- `LOG_MAX_SIZE_MB`
 - `LOG_SEQ_ENABLED`
 - `LOG_SEQ_LEVEL`
 - `LOG_SEQ_SERVER_URL`
@@ -320,6 +327,8 @@ DDNS_IPV6_PROVIDER=auto
 
 LOG_CONSOLE_LEVEL=info
 LOG_FILE_LEVEL=info
+LOG_MAX_AGE_DAYS=7
+LOG_MAX_SIZE_MB=10
 LOG_SEQ_ENABLED=false
 LOG_SEQ_LEVEL=warn
 ```
@@ -448,7 +457,17 @@ Current logging behavior includes:
 
 - one log file per level per day
 - daily rotation
-- cleanup for logs older than `7` days
+- size-based rotation once a file exceeds `max_size_mb` (default `10` MB, disabled if `<= 0`),
+  using **rename-on-rollover**:
+  - the **active file never carries a timestamp**, so the newest log always lives at
+    `log/YYYY-MM-DD_dynip_info.log` — tail it or point a log shipper at that single path.
+  - when the cap is hit, the active file is renamed to `log/YYYY-MM-DD_dynip_info.09-06-56.log`
+    (the timestamp is that file's **last** log entry, i.e. the content cut-off), and a fresh
+    file with the plain name is opened.
+  - rotating twice within the same second appends a sequence suffix (`.09-06-56-1.log`), so no
+    archived file is ever overwritten.
+  - after a restart the service appends to the existing active file for that date.
+- cleanup for logs older than `max_age_days` (default `7` days, disabled if `<= 0`)
 - formatted dump of the loaded runtime config on service startup
 - provider response summaries
 - HTTP request/response logs
@@ -504,3 +523,54 @@ Default names:
 
 - image: `dynip-image`
 - container: `dynip-container`
+
+## Host-Mode Deployment And Updates
+
+When running the binary directly on the host instead of Docker, `control.sh` offers:
+
+```bash
+bash control.sh start     # pick the binary by uname -m and start it with nohup
+bash control.sh stop      # stop via the pid file and wait for the old process to exit
+bash control.sh restart
+bash control.sh move      # stage a new binary without restarting
+bash control.sh update    # full update: stop -> move -> start
+```
+
+The update flow deliberately separates "upload" from "stage":
+
+1. Cross-compile on the dev machine and `scp` the binary to the device's `/tmp`
+   (override with `UPLOAD_BIN_DIR`). Do **not** overwrite the running file directly —
+   Linux rejects that with `Text file busy` (ETXTBSY).
+2. Run `bash control.sh update` on the device: it stops the service and waits for it to exit,
+   renames the current binary to a timestamped backup (and drops its execute bit), moves the new
+   binary in from `/tmp`, marks it executable, and starts the service again.
+
+Backing up before moving in means the new binary is a fresh inode, so even a not-yet-finished old
+process cannot trigger ETXTBSY.
+
+Whoever runs `control.sh` must be able to write to the directory it lives in — staging the binary,
+the pid file, and `log/` all land there. Use the same identity every time, or the pid file and log
+files end up with mixed owners.
+
+Environment variables:
+
+- `UPLOAD_BIN_DIR`: upload directory, default `/tmp`
+- `UPLOAD_BIN_FILE`: explicit full path to the new binary, takes precedence over `UPLOAD_BIN_DIR`
+- `STOP_WAIT_SECONDS`: upper bound in seconds for `stop` to wait for the old process, default `60`
+- `STDOUT_LOG_MAX_SIZE_MB`: size threshold for rotating `log/general_stdout.log` before `start`, default `10` (`0` disables it)
+- `STDOUT_LOG_KEEP`: how many `log/general_stdout.log` backups to keep, default `3`
+
+### Why `log/general_stdout.log` keeps growing
+
+That file captures the process stdout/stderr (the `nohup ... >>` redirection in `start`), which
+largely duplicates `log/*.log` — console output and file logs are the same messages. The difference
+is that `log/*.log` is rotated and cleaned up by the program itself, while nothing manages this
+file, so it only ever grows; after a few weeks it reaches tens of megabytes.
+
+`control.sh start` checks it before launching: past `STDOUT_LOG_MAX_SIZE_MB` it is renamed to a
+timestamped backup and only the newest `STDOUT_LOG_KEEP` backups are kept. This can only happen
+before launch — once the service is running, the redirection is bound to an already-open fd
+(inode), so renaming or deleting the file does not redirect the running process.
+
+To write less at the source, set `LOG_CONSOLE_LEVEL` to `warn` or `error` in `.env`; file logs and
+Seq are unaffected and stay controlled by `LOG_FILE_LEVEL` and `LOG_SEQ_LEVEL`.

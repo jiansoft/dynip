@@ -80,7 +80,10 @@ No-IP  current_ip = 5.6.7.8  -> 更新或重試
 - `src/core/ddns.zig`：DDNS 主流程。包含取得公開 IP、比對 provider 狀態，以及更新各家已啟用的 DDNS 供應商。
 - `src/io/redis.zig`：Redis 整合層，負責 DDNS provider 狀態與相容觀察 key。
 - `src/core/scheduler.zig`：固定間隔的背景排程器，會持續觸發每一輪更新工作。
-- `src/io/logging.zig`：結構化日誌層，負責 console 與檔案日誌行為。
+- `src/io/logging.zig`：日誌組裝層，負責 logger 狀態、等級過濾與對外 API。實作依職責拆成三個子模組：
+  - `src/io/logging/format.zig`：本地時間取得、log 行格式化、console 輸出。
+  - `src/io/logging/rotate.zig`：依日期與大小輪轉日誌檔、清除過期日誌。
+  - `src/io/logging/seq.zig`：把同一筆 log 以 CLEF 格式送到 Seq。
 - `src/io/http.zig`：共用 HTTP 請求與回應日誌輔助。
 - `build.zig`：Zig 的建置腳本，負責把 executable、`run` step 與 `test` step 串起來。
 - `build.ps1` / `build.bat`：偏向 Windows 使用情境的建置輔助腳本。
@@ -161,6 +164,8 @@ No-IP  current_ip = 5.6.7.8  -> 更新或重試
   "logging": {
     "console_level": "info",
     "file_level": "info",
+    "max_age_days": 7,
+    "max_size_mb": 10,
     "seq": {
       "enabled": false,
       "level": "warn",
@@ -277,6 +282,8 @@ DDNS:Provider:noip
 - `DDNS_IPV6_PROVIDER`
 - `LOG_CONSOLE_LEVEL`
 - `LOG_FILE_LEVEL`
+- `LOG_MAX_AGE_DAYS`
+- `LOG_MAX_SIZE_MB`
 - `LOG_SEQ_ENABLED`
 - `LOG_SEQ_LEVEL`
 - `LOG_SEQ_SERVER_URL`
@@ -320,6 +327,8 @@ DDNS_IPV6_PROVIDER=auto
 
 LOG_CONSOLE_LEVEL=info
 LOG_FILE_LEVEL=info
+LOG_MAX_AGE_DAYS=7
+LOG_MAX_SIZE_MB=10
 LOG_SEQ_ENABLED=false
 LOG_SEQ_LEVEL=warn
 ```
@@ -448,7 +457,14 @@ next_retry_at 是未來時間
 
 - 每日依等級分檔
 - 換日輪替
-- 自動清除超過 `7` 天的舊日誌
+- 單檔超過 `max_size_mb`（預設 `10` MB，設為 `<= 0` 代表不依大小輪轉）時輪轉，採 **rename-on-rollover**：
+  - **正在寫入的檔案永遠不帶時間戳**，最新日誌固定在 `log/YYYY-MM-DD_dynip_info.log`，
+    tail 或 log 收集器只要盯這一個路徑。
+  - 超過上限時，先把它改名成 `log/YYYY-MM-DD_dynip_info.09-06-56.log`
+    （時間戳是該檔**最後一筆**日誌的時間，代表內容截止到幾點幾分），再開一個同名空檔繼續寫。
+  - 同一秒內連續輪轉會加序號（`.09-06-56-1.log`），不會覆蓋既有封存檔。
+  - 服務重啟後會接續寫入當天既有的活躍檔，不會另開新檔。
+- 自動清除超過 `max_age_days`（預設 `7` 天，設為 `<= 0` 代表不自動刪除）的舊日誌
 - 服務啟動時輸出實際載入的設定 JSON
 - 記錄各 DDNS 供應商回應摘要
 - 記錄 HTTP 請求 / 回應
@@ -504,3 +520,48 @@ bash control.sh docker_update
 
 - image: `dynip-image`
 - container: `dynip-container`
+
+## 一般模式部署與更新
+
+不使用 Docker、直接在主機上背景執行 binary 時，`control.sh` 提供這幾個指令：
+
+```bash
+bash control.sh start     # 依 uname -m 選對應 binary，nohup 背景啟動
+bash control.sh stop      # 依 pid file 停止，並等舊程序真的退出
+bash control.sh restart
+bash control.sh move      # 只把新執行檔就位，不重啟
+bash control.sh update    # 完整更新：stop -> move -> start
+```
+
+更新流程刻意分成「上傳」與「就位」兩步：
+
+1. 在開發機交叉編譯後，把執行檔 `scp` 到裝置的 `/tmp`（可用 `UPLOAD_BIN_DIR` 改路徑）。
+   **不要**直接覆蓋正在執行的檔案，Linux 會回 `Text file busy`（ETXTBSY）。
+2. 在裝置上執行 `bash control.sh update`：先停止服務並等它結束，接著把同層的舊執行檔
+   改名備份（帶時間戳、並拿掉執行權限），再從 `/tmp` 把新檔搬過來、加上執行權限，最後啟動。
+
+先備份再搬入是為了讓新檔案是全新的 inode，就算舊程序尚未完全結束也不會踩到 ETXTBSY。
+
+執行 `control.sh` 的身分要能寫入它所在的目錄（搬執行檔、寫 pid file 與 `log/` 都在那裡），
+且每次都用同一種身分，否則 pid file 與日誌檔的擁有者會混亂。
+
+相關環境變數：
+
+- `UPLOAD_BIN_DIR`：上傳目錄，預設 `/tmp`
+- `UPLOAD_BIN_FILE`：直接指定新執行檔的完整路徑，優先於 `UPLOAD_BIN_DIR`
+- `STOP_WAIT_SECONDS`：`stop` 等待舊程序結束的秒數上限，預設 `60`
+- `STDOUT_LOG_MAX_SIZE_MB`：`start` 前輪轉 `log/general_stdout.log` 的大小門檻，預設 `10`（`0` 停用）
+- `STDOUT_LOG_KEEP`：`log/general_stdout.log` 保留的備份份數，預設 `3`
+
+### `log/general_stdout.log` 為什麼會變大
+
+這個檔收的是程式的 stdout/stderr（`start` 的 `nohup ... >>` 重導向），內容和 `log/*.log`
+幾乎重複——程式的 console 輸出與檔案日誌本來就是同一批訊息。差別在於 `log/*.log` 由程式
+自己輪轉與清理，而這個檔沒有任何人管，只會一直 append，跑幾週就會累積到數十 MB。
+
+`control.sh start` 會在啟動前檢查它，超過 `STDOUT_LOG_MAX_SIZE_MB` 就改名備份，
+並只保留最近 `STDOUT_LOG_KEEP` 份。只能在啟動前處理：服務跑起來後，重導向綁的是已開啟的
+fd（inode），改名或刪檔都不會讓執行中的程序改寫到新檔。
+
+想從源頭少寫一點，把 `.env` 的 `LOG_CONSOLE_LEVEL` 調成 `warn` 或 `error`；
+檔案日誌與 Seq 不受影響，仍由 `LOG_FILE_LEVEL` 與 `LOG_SEQ_LEVEL` 各自控制。
