@@ -1,0 +1,32 @@
+# Dependabot 設定。
+#
+# 這裡只管 GitHub Actions 的版本更新，理由：
+# - Zig 的 `build.zig.zon` 依賴 Dependabot 目前並不支援。
+# - 本專案唯一的第三方依賴 okredis 是 vendored 在 `vendor/okredis`（path 依賴），
+#   本來就不會自動更新，要換版本是人為決定。
+#
+# 所以實際受益的是 workflow 裡用到的 action（checkout、setup-zig、upload-artifact）。
+# 這些 action 的舊 major 版本會隨著 runner 環境汰換而失效（例如 Node 版本淘汰），
+# 交給 Dependabot 盯著，比等到 CI 某天突然變紅再來查省事。
+version: 2
+
+updates:
+  - package-ecosystem: "github-actions"
+    # workflow 檔案放在 `.github/workflows/`，但這裡固定填 repo 根目錄 `/`。
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      # 星期一早上檢查，這樣一週的開始就能順手處理掉。
+      day: "monday"
+      time: "09:00"
+      timezone: "Asia/Taipei"
+    # 把當週所有 action 更新合併成一個 PR，避免每個 action 各開一條。
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    # 同時最多開幾個 PR；配合上面的 grouping，實際上通常只會有一個。
+    open-pull-requests-limit: 3
+    # 沿用本專案的 Conventional Commits 慣例。
+    commit-message:
+      prefix: "chore"

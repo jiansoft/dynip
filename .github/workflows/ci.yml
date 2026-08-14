@@ -1,0 +1,92 @@
+# dynip 的持續整合流程。
+#
+# 這個 workflow 只做「驗證」，不會發布任何東西：
+#   1. zig fmt --check   格式檢查
+#   2. zig build test    單元測試（需要外網的測試預設會自己 skip）
+#   3. 交叉編譯 aarch64 / armv7 兩份 Linux binary，並上傳成 artifact
+#
+# 刻意不做的事：
+#   - 不需要 `.env`。設定層找不到 `.env` 會直接跳過，不視為錯誤。
+#   - 不跑 live 測試。連外網與 Redis 的測試由 `DYNIP_LIVE_TESTS=1` 控制，
+#     預設回傳 `error.SkipZigTest`，所以 CI 不會依賴網路或雲端 Redis。
+#   - 不碰 `dashboard/`。那是一個有自己 build.zig 的獨立專案，主 build.zig 沒有引用它。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# 同一個分支連續推送時，取消還在跑的舊工作，只留最新一次。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # 本專案使用 Zig nightly。版本集中在這裡管理，升級時只要改這一行。
+  #
+  # 注意：官方下載站只保留較新的 nightly，舊版本會被移除。
+  # `mlugg/setup-zig` 會在官方站失效時改用社群 mirror，但若哪天真的取不到，
+  # 就把這裡更新成目前開發用的版本（`zig version` 的輸出）。
+  ZIG_VERSION: 0.17.0-dev.1745+ac8a8d0c5
+
+jobs:
+  check:
+    name: 格式與測試
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      # 只檢查本專案自己的程式碼。
+      # `vendor/` 是第三方 vendored 原始碼，不該因為它的排版而讓我們的 CI 變紅。
+      - name: zig fmt --check
+        run: zig fmt --check build.zig src
+
+      - name: zig build test
+        run: zig build test --summary all
+
+  build:
+    name: 交叉編譯 ${{ matrix.name }}
+    needs: check
+    runs-on: ubuntu-latest
+    strategy:
+      # 一個 target 失敗時，另一個仍然跑完，方便一次看到兩邊的狀況。
+      fail-fast: false
+      matrix:
+        include:
+          # 對應 build.ps1 的兩個目標與 control.sh 依 `uname -m` 選用的檔名。
+          - target: aarch64-linux
+            name: dynip_linux_arm64
+          - target: arm-linux-musleabihf
+            name: dynip_linux_armv7
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: 建置
+        run: |
+          zig build \
+            -Dtarget=${{ matrix.target }} \
+            -Doptimize=ReleaseFast \
+            -Dstrip=true
+          mv zig-out/bin/dynip "${{ matrix.name }}"
+
+      # 印出實際的檔案格式，確認交叉編譯真的產出目標架構的執行檔，
+      # 而不是不小心編成 runner 自己的 x86_64。
+      - name: 確認產物架構
+        run: file "${{ matrix.name }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.name }}
+          if-no-files-found: error
+          retention-days: 14
