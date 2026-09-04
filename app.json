@@ -33,7 +33,7 @@
     "refresh_interval_seconds": 60,
     "dedupe_ttl_seconds": 86400,
     "ipv4_provider": "auto",
-    "ipv6_provider": "auto",
+    "ipv6_provider": "none",
     "redis": {
       "enabled": false,
       "addr": "localhost:6379",
