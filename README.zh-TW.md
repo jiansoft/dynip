@@ -485,7 +485,7 @@ next_retry_at 是未來時間
 
 ```bat
 cd /d C:\dynip
-scriptsuild.bat
+scripts\build.bat
 ```
 
 在 PowerShell：

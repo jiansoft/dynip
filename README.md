@@ -488,7 +488,7 @@ From `cmd.exe`:
 
 ```bat
 cd /d C:\dynip
-scriptsuild.bat
+scripts\build.bat
 ```
 
 From PowerShell:
