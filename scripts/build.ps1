@@ -4,15 +4,16 @@ $ErrorActionPreference = 'Stop'
 # 開啟較嚴格的語法檢查，像是未宣告變數等問題會更早被抓到。
 Set-StrictMode -Version Latest
 
-# `$MyInvocation.MyCommand.Path` 是目前這支 ps1 的完整路徑。
-# `Split-Path -Parent` 取出它所在的資料夾，也就是專案根目錄。
-$ProjectDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+# 這支腳本放在 scripts\ 底下，專案根目錄是它的上一層。
+# `$PSScriptRoot` 就是腳本所在資料夾，再往上一層取得專案根目錄；
+# 用絕對路徑組出來，不論從哪個工作目錄呼叫都指得到同一個地方。
+$ProjectDir = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 
 # 這裡把建置常用設定集中放在前面，後面比較好維護。
 $BinName = 'dynip'
 $OutDir = Join-Path $ProjectDir 'zig-out\bin'
 $Optimize = 'ReleaseFast'
-$FallbackZig = 'D:\Runtime\zig\0.17.0\zig.exe'
+$FallbackZig = 'zig.exe'
 
 function Resolve-ZigCommand {
     # `Get-Command zig` 會去找目前環境能不能執行 `zig`。
@@ -51,31 +52,17 @@ function Build-Target {
     # 在主控台印出目前進度與 target 名稱。
     Write-Host "[$Step] Building $Target..."
 
-    # Windows + Zig 0.17-dev 在某些 locale 下會先碰到 Perl / libc 偵測問題。
+    # `&` 是 PowerShell 的呼叫運算子。
+    # 這裡代表「執行 `$ZigCmd` 這個外部程式」，後面接它的參數。
+    # `-Dstrip=true` 代表 release 產物要移除 debug symbols，
+    # 讓正式部署用的檔案體積更小。
     #
-    # build.zig 裡有一層 locale-normalized wrapper，給一般 `zig build run/test` 使用。
-    # 但這支發版腳本已經明確知道 target / optimize / strip，最好直接用安全 locale
-    # 執行真正的 build，避免 wrapper 重新呼叫 `zig build install` 時漏掉這些 -D 參數。
-    $oldLcAll = [Environment]::GetEnvironmentVariable('LC_ALL', 'Process')
-    $oldLcCtype = [Environment]::GetEnvironmentVariable('LC_CTYPE', 'Process')
-    $oldLang = [Environment]::GetEnvironmentVariable('LANG', 'Process')
-    [Environment]::SetEnvironmentVariable('LC_ALL', 'C', 'Process')
-    [Environment]::SetEnvironmentVariable('LC_CTYPE', 'C', 'Process')
-    [Environment]::SetEnvironmentVariable('LANG', 'C', 'Process')
-    try {
-        # `&` 是 PowerShell 的呼叫運算子。
-        # 這裡代表「執行 `$ZigCmd` 這個外部程式」，後面接它的參數。
-        # `-Dlocale-normalized=true` 告訴 build.zig：
-        # 「這次已經是安全 locale，不要再包一層 zig build」。
-        # `-Dstrip=true` 代表 release 產物要移除 debug symbols，
-        # 讓正式部署用的檔案體積更小。
-        & $ZigCmd 'build' '-Dlocale-normalized=true' "-Dtarget=$Target" "-Doptimize=$Optimize" '-Dstrip=true'
-    }
-    finally {
-        [Environment]::SetEnvironmentVariable('LC_ALL', $oldLcAll, 'Process')
-        [Environment]::SetEnvironmentVariable('LC_CTYPE', $oldLcCtype, 'Process')
-        [Environment]::SetEnvironmentVariable('LANG', $oldLang, 'Process')
-    }
+    # 註：先前這裡會先把 LC_ALL / LC_CTYPE / LANG 改成 `C`，並傳
+    # `-Dlocale-normalized=true`。那是為了迴避「Windows Perl 不認得 CP950」的問題，
+    # 而 Perl 之所以會被叫起來，是因為 build.zig 連結 ws2_32 時讓 Zig 去跑 pkg-config。
+    # build.zig 現在對 ws2_32 明確指定 `.use_pkg_config = .no`，Perl 完全不會被啟動，
+    # 因此 locale 的前置處理與那個內部旗標都已移除。
+    & $ZigCmd 'build' "-Dtarget=$Target" "-Doptimize=$Optimize" '-Dstrip=true'
 
     # 外部程式執行完後，可用 `$LASTEXITCODE` 取得上一個 process 的結束碼。
     # 非 0 一般代表失敗。

@@ -247,7 +247,10 @@ pub const ProcessProviderState = struct {
 /// 同一個行程內最近一次成功處理過的 public IP。
 pub const ProcessPublicIpState = struct {
     /// 保護本 struct 其餘欄位的 mutex；讀寫必須先 lock。
-    mutex: std.atomic.Mutex = .unlocked,
+    ///
+    /// `std.Io.Mutex` 的 `lock` 走 futex，等不到鎖的執行緒會真的睡著並由 unlock
+    /// 喚醒；`std.atomic.Mutex` 只有 `tryLock`，當通用鎖用時得自己忙等空轉。
+    mutex: std.Io.Mutex = .init,
     /// 是否已有最近一次成功處理的 IP。
     initialized: bool = false,
     /// buffer 的有效長度。

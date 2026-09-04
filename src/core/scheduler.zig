@@ -68,7 +68,7 @@ pub fn runForever(
     //   後續所有 Redis 操作都會被跳過，改走本機記憶體快取。
     // - 這樣 Redis 掛掉時，DDNS 更新仍然可以正常運作，
     //   只是失去了跨行程防重複更新的能力。
-    ddns.checkRedisAvailability(allocator, io, config.ddns.redis);
+    ddns.checkRedisAvailability(io, config.ddns.redis);
 
     // 建立一個 HTTP 客戶端，整個服務生命週期重複使用它。
     // 這可以避免每一輪 refresh 都重新初始化 TLS 狀態（rescanning CA certificates）。

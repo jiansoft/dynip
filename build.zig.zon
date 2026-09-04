@@ -13,17 +13,22 @@
     // 本專案可建置的最低 Zig 版本。
     //
     // 為什麼要寫：這份程式碼用到多個仍在變動中的 0.17-dev API，
-    // 例如 `std.Io`、`std.process.Init` 形式的 main、`std.Io.Writer.Allocating`。
+    // 例如 `std.Io`、`std.process.Init` 形式的 main、`std.Io.Writer.Allocating`、
+    // `std.Io.Mutex`、`std.builtin.Type.Enum.field_names`。
     // 用較舊的 Zig 建置只會得到一長串難以判讀的編譯錯誤，
     // 這個欄位讓「需要哪個版本」有一個明確、可查的出處。
     //
-    // 注意：Zig 0.17.0-dev.1282 只會「解析」這個欄位，**不會對本專案強制檢查**。
-    // （實測把它設成 `99.0.0`，`zig build` 仍然成功且沒有任何警告。）
+    // 注意：Zig 0.17.0-dev 只會「解析」這個欄位，**不會對本專案強制檢查**。
     // 所以目前它的作用是文件與前瞻性宣告，不是一道真正的關卡；
     // 若日後 Zig 開始強制檢查，這裡已經是正確的值。
     //
-    // 這裡填的是目前實際驗證過可通過 `zig build` 與 `zig build test` 的版本。
-    .minimum_zig_version = "0.17.0-dev.1282+c0f9b51d8",
+    // 這裡填的是目前實際驗證過的版本：可通過 `zig build`、`zig build test`，
+    // 以及 `build.ps1` 對 aarch64-linux 與 arm-linux-musleabihf 的交叉編譯。
+    // 專案先前為了同時相容多個 0.17-dev snapshot，散落了幾處 `@hasField` /
+    // `@hasDecl` 分支（timeval 的 tv_sec、Type.Enum 的 fields/field_names 等）；
+    // 那些分支已經移除，因此這個版本號現在是真正的下限，請與
+    // `.github/workflows/ci.yml` 的 ZIG_VERSION 保持一致。
+    .minimum_zig_version = "0.17.0-dev.1818+7051f8e73",
 
     // `.dependencies` 用來列出這個專案依賴的其他 package。
     // 如果專案沒有任何第三方依賴，這裡就可以是空的。

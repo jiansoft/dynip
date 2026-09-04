@@ -413,10 +413,8 @@ pub fn fetchStunIp(allocator: std.mem.Allocator, io: std.Io, stun_endpoint: []co
     });
     defer utils.closeSocket(socket);
 
-    const timeout = if (comptime @hasField(std.posix.timeval, "tv_sec"))
-        std.posix.timeval{ .tv_sec = 2, .tv_usec = 0 }
-    else
-        std.posix.timeval{ .sec = 2, .usec = 0 };
+    // 欄位名在 Windows 與 Linux 都是 `sec`/`usec`，不需要相容分支。
+    const timeout: std.posix.timeval = .{ .sec = 2, .usec = 0 };
     try utils.setSocketTimeout(socket, timeout);
 
     var request: [20]u8 = undefined;

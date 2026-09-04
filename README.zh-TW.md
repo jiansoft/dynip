@@ -86,7 +86,8 @@ No-IP  current_ip = 5.6.7.8  -> 更新或重試
   - `src/io/logging/seq.zig`：把同一筆 log 以 CLEF 格式送到 Seq。
 - `src/io/http.zig`：共用 HTTP 請求與回應日誌輔助。
 - `build.zig`：Zig 的建置腳本，負責把 executable、`run` step 與 `test` step 串起來。
-- `build.ps1` / `build.bat`：偏向 Windows 使用情境的建置輔助腳本。
+- `scripts/build.ps1` / `scripts/build.bat`：偏向 Windows 使用情境的建置輔助腳本。
+- `scripts/deploy-armv7.ps1`：把 ARMv7 執行檔一鍵部署到 Raspberry Pi（`/opt/dynip`）。
 - `control.sh`：比較偏容器或部署流程的輔助腳本。
 - `Dockerfile`：容器映像建置定義。
 
@@ -484,14 +485,14 @@ next_retry_at 是未來時間
 
 ```bat
 cd /d C:\dynip
-build.bat
+scriptsuild.bat
 ```
 
 在 PowerShell：
 
 ```powershell
 Set-Location C:\dynip
-powershell.exe -ExecutionPolicy Bypass -File .\build.ps1
+powershell.exe -ExecutionPolicy Bypass -File .\scripts\build.ps1
 ```
 
 目前 PowerShell 建置會把經過 `strip` 的 ARM64 與 ARMv7 Linux 執行檔輸出到 `zig-out\bin\`。

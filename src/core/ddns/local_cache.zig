@@ -10,11 +10,24 @@ const LocalDedupeEntry = struct {
     expires_at: i64,
 };
 
-/// 保護 entries 的自旋鎖。ArrayList 不是 thread-safe，不能省略此鎖。
-var local_dedupe_mutex: std.atomic.Mutex = .unlocked;
+/// 保護 entries 的鎖。ArrayList 不是 thread-safe，不能省略此鎖。
+///
+/// 用 `std.Io.Mutex` 而不是 `std.atomic.Mutex`：後者只提供 `tryLock`
+/// （它的定位是「lock-free single-owner resource」），要當通用鎖用就得自己寫
+/// `while (!tryLock()) yield()` 的忙等迴圈——競爭時空轉燒 CPU，且 `yield` 對
+/// 排程器只是建議。`std.Io.Mutex` 的 `lock` 走 futex，等待中的執行緒會真的睡著，
+/// 由 unlock 喚醒。本專案的 `io/logging.zig` 已經是這個用法。
+var local_dedupe_mutex: std.Io.Mutex = .init;
 /// 目前活著的本機去重項目；`std.ArrayList` 本身就是 unmanaged 版本，
 /// 所以每次配置都要明確傳入 allocator。
 var local_dedupe_entries: std.ArrayList(LocalDedupeEntry) = .empty;
+
+/// 本快取自有資料使用的 allocator。
+///
+/// 先前用的是 `std.heap.page_allocator`：它每次配置都至少取一整個 page，而這裡
+/// 配置的是 25 bytes 上下的 cache key，等於每筆浪費一個 page。`smp_allocator`
+/// 是 thread-safe 的通用 allocator，適合這種「長壽命行程、小配置、多執行緒」的場景。
+const cache_allocator = std.heap.smp_allocator;
 
 /// 容量未達此值時不縮小，避免少量項目反覆 realloc。
 const local_dedupe_shrink_min_capacity: usize = 32;
@@ -27,19 +40,19 @@ fn currentUnixSeconds() i64 {
 }
 
 /// 以目前時間查詢 key 是否仍在有效期限內。
-pub fn localDedupeContains(key: []const u8) bool {
-    return localDedupeContainsAt(key, currentUnixSeconds());
+pub fn localDedupeContains(io: std.Io, key: []const u8) bool {
+    return localDedupeContainsAt(io, key, currentUnixSeconds());
 }
 
 /// 以目前時間寫入或更新一筆 key；key 的內容會被複製並由本模組管理。
-pub fn localDedupeSet(key: []const u8, ttl_seconds: u64) !void {
-    try localDedupeSetAt(key, ttl_seconds, currentUnixSeconds());
+pub fn localDedupeSet(io: std.Io, key: []const u8, ttl_seconds: u64) !void {
+    try localDedupeSetAt(io, key, ttl_seconds, currentUnixSeconds());
 }
 
 /// 可注入時間的查詢版本，主要讓單元測試不依賴系統時鐘。
-pub fn localDedupeContainsAt(key: []const u8, now_seconds: i64) bool {
-    lockLocalDedupe();
-    defer unlockLocalDedupe();
+pub fn localDedupeContainsAt(io: std.Io, key: []const u8, now_seconds: i64) bool {
+    local_dedupe_mutex.lockUncancelable(io);
+    defer local_dedupe_mutex.unlock(io);
 
     pruneExpiredLocalDedupeLocked(now_seconds);
 
@@ -50,9 +63,9 @@ pub fn localDedupeContainsAt(key: []const u8, now_seconds: i64) bool {
 }
 
 /// 可注入時間的寫入版本。若 key 已存在，只延長期限，不會重複配置 key。
-pub fn localDedupeSetAt(key: []const u8, ttl_seconds: u64, now_seconds: i64) !void {
-    lockLocalDedupe();
-    defer unlockLocalDedupe();
+pub fn localDedupeSetAt(io: std.Io, key: []const u8, ttl_seconds: u64, now_seconds: i64) !void {
+    local_dedupe_mutex.lockUncancelable(io);
+    defer local_dedupe_mutex.unlock(io);
 
     pruneExpiredLocalDedupeLocked(now_seconds);
 
@@ -64,8 +77,8 @@ pub fn localDedupeSetAt(key: []const u8, ttl_seconds: u64, now_seconds: i64) !vo
         }
     }
 
-    try local_dedupe_entries.append(std.heap.page_allocator, .{
-        .key = try std.heap.page_allocator.dupe(u8, key),
+    try local_dedupe_entries.append(cache_allocator, .{
+        .key = try cache_allocator.dupe(u8, key),
         .expires_at = expires_at,
     });
 }
@@ -80,7 +93,7 @@ fn pruneExpiredLocalDedupeLocked(now_seconds: i64) void {
             continue;
         }
 
-        std.heap.page_allocator.free(local_dedupe_entries.items[index].key);
+        cache_allocator.free(local_dedupe_entries.items[index].key);
         _ = local_dedupe_entries.orderedRemove(index);
     }
 
@@ -94,28 +107,16 @@ fn maybeShrinkLocalDedupeLocked() void {
     if (capacity < local_dedupe_shrink_min_capacity) return;
     if (len != 0 and capacity < len * local_dedupe_shrink_slack_factor) return;
 
-    local_dedupe_entries.shrinkAndFree(std.heap.page_allocator, len);
+    local_dedupe_entries.shrinkAndFree(cache_allocator, len);
 }
 
 /// 清空全部項目，供測試或受控重設使用；保留 ArrayList 配置的容量以利重用。
-pub fn resetLocalDedupeState() void {
-    lockLocalDedupe();
-    defer unlockLocalDedupe();
+pub fn resetLocalDedupeState(io: std.Io) void {
+    local_dedupe_mutex.lockUncancelable(io);
+    defer local_dedupe_mutex.unlock(io);
 
     for (local_dedupe_entries.items) |entry| {
-        std.heap.page_allocator.free(entry.key);
+        cache_allocator.free(entry.key);
     }
     local_dedupe_entries.clearRetainingCapacity();
-}
-
-/// 以 tryLock + yield 實作簡單自旋鎖。等待時讓出 CPU，避免忙等完全占滿核心。
-fn lockLocalDedupe() void {
-    while (!local_dedupe_mutex.tryLock()) {
-        std.Thread.yield() catch {};
-    }
-}
-
-/// 配對 lockLocalDedupe；必須只在成功取得鎖後呼叫。
-fn unlockLocalDedupe() void {
-    local_dedupe_mutex.unlock();
 }

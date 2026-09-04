@@ -252,6 +252,8 @@ pub fn redactedForLog(app_config: AppConfig) AppConfig {
     // 先把整份設定做一次值複製，
     // 這樣後面改的是副本，不會動到原本真的要拿來跑服務的設定。
     var redacted = app_config;
+    // Cloudflare API token 是完整的 zone 寫入憑證，外洩後果最嚴重，因此第一個遮。
+    redactIfPresent(&redacted.cloudflare.api_token);
     // 如果 Afraid token 不是空字串，就把它換成固定遮罩字串。
     redactIfPresent(&redacted.afraid.token);
     // 如果 Dynu 密碼不是空字串，就把它換成固定遮罩字串。
@@ -700,16 +702,26 @@ test "load config ignores unrelated rust settings" {
 
 test "redacted config masks secrets only when present" {
     const redacted = redactedForLog(.{
+        .cloudflare = .{ .api_token = "cf-secret", .zone_id = "zone-a" },
         .afraid = .{ .token = "afraid-secret" },
         .dynu = .{ .password = "dynu-secret" },
         .noip = .{ .password = "noip-secret" },
         .ddns = .{ .redis = .{ .password = "redis-secret" } },
+        .logging = .{ .seq = .{ .api_key = "seq-secret" } },
+        .notifications = .{ .webhook_url = "https://hooks.example.com/abc123" },
     });
 
+    try std.testing.expectEqualStrings(masked_secret, redacted.cloudflare.api_token);
     try std.testing.expectEqualStrings(masked_secret, redacted.afraid.token);
     try std.testing.expectEqualStrings(masked_secret, redacted.dynu.password);
     try std.testing.expectEqualStrings(masked_secret, redacted.noip.password);
     try std.testing.expectEqualStrings(masked_secret, redacted.ddns.redis.password);
+    try std.testing.expectEqualStrings(masked_secret, redacted.logging.seq.api_key);
+    try std.testing.expectEqualStrings(masked_secret, redacted.notifications.webhook_url);
+
+    // zone_id 不是密鑰，遮掉反而讓日誌難以對帳；空值也不該變成看似有秘密。
+    try std.testing.expectEqualStrings("zone-a", redacted.cloudflare.zone_id);
+    try std.testing.expectEqualStrings("", redacted.notifications.healthchecks_url);
 }
 
 test "parse noip hostnames from env style json" {

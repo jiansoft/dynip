@@ -163,45 +163,25 @@ pub const Session = struct {
     }
 
     /// 同一條 Redis 連線上執行多欄位 `HSET key field value ...`。
-    pub fn hSetFields(self: *Session, fields: []const HashField) !void {
-        const key = fields[0].key;
-        _ = switch (fields.len) {
-            6 => try self.client.send(i64, .{
-                "HSET",
-                key,
-                fields[0].field,
-                fields[0].value,
-                fields[1].field,
-                fields[1].value,
-                fields[2].field,
-                fields[2].value,
-                fields[3].field,
-                fields[3].value,
-                fields[4].field,
-                fields[4].value,
-                fields[5].field,
-                fields[5].value,
-            }),
-            7 => try self.client.send(i64, .{
-                "HSET",
-                key,
-                fields[0].field,
-                fields[0].value,
-                fields[1].field,
-                fields[1].value,
-                fields[2].field,
-                fields[2].value,
-                fields[3].field,
-                fields[3].value,
-                fields[4].field,
-                fields[4].value,
-                fields[5].field,
-                fields[5].value,
-                fields[6].field,
-                fields[6].value,
-            }),
-            else => return error.UnsupportedRedisHashFieldCount,
-        };
+    ///
+    /// 先前這裡把 6 欄與 7 欄各展開成一組硬編 tuple，欄位數只要不是這兩個值就回
+    /// `error.UnsupportedRedisHashFieldCount`。現在改成先攤平成 `[]const []const u8`
+    /// 再送出：okredis 的序列化器遇到「元素型別不是 u8 的 slice」會把它展開成多個
+    /// bulk string 參數（見 vendor/okredis/src/serializer.zig），因此仍然是單一 HSET
+    /// 命令、單次來回，但欄位數不再寫死，也少掉三十多行重複程式碼。
+    pub fn hSetFields(self: *Session, key: []const u8, fields: []const HashField) !void {
+        if (fields.len == 0) return;
+        if (fields.len > max_hash_fields) return error.TooManyRedisHashFields;
+
+        // 攤平成 field/value 交錯排列，正好是 HSET 期望的參數順序。
+        // 用 stack 陣列而不是配置：欄位數有上限，而且這些 slice 只在本次 send 期間有效。
+        var flat: [max_hash_fields * 2][]const u8 = undefined;
+        for (fields, 0..) |field, index| {
+            flat[index * 2] = field.field;
+            flat[index * 2 + 1] = field.value;
+        }
+
+        _ = try self.client.send(i64, .{ "HSET", key, flat[0 .. fields.len * 2] });
     }
 
     /// 同一條 Redis 連線上執行 `SETEX key ttl value`。
@@ -212,125 +192,34 @@ pub const Session = struct {
     }
 };
 
-/// Redis Hash 欄位寫入項目。
+/// Redis Hash 的單一欄位名稱與值。
+///
+/// key 由 `hSetFields` 的參數統一指定，因此不必每個欄位各帶一份 key，
+/// 也就不需要再於執行期檢查「所有欄位是否共用同一個 key」。
 pub const HashField = struct {
-    key: []const u8,
     field: []const u8,
     value: []const u8,
 };
 
-/// 對外提供的 `EXISTS` 包裝。
-///
-/// `ddns.zig` 只需要知道 key 是否存在，
-/// 不需要碰到底層 `okredis.Client`。
-pub fn containsKey(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    config: config_mod.Redis,
-    key: []const u8,
-) !bool {
-    // 這個函式本身不需要 allocator，
-    // 但保留同樣的參數形狀，能讓外部 API 不必改。
-    _ = allocator;
+/// 單次 `hSetFields` 可寫入的欄位數上限，決定攤平用 stack 陣列的大小。
+/// 目前欄位最多的呼叫端是 provider state（7 欄），這裡留足餘裕。
+const max_hash_fields = 32;
 
-    var session: Session = undefined;
-    try session.init(io, config);
-    defer session.deinit();
-
-    // `EXISTS key` 會回整數：
-    // - 1 代表存在
-    // - 0 代表不存在
-    return session.containsKey(key);
-}
-
-/// 對外提供的 `GET` 包裝。
-///
-/// key 不存在時回傳 `null`；有值時回傳配置在 `allocator` 上的字串。
-pub fn get(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    config: config_mod.Redis,
-    key: []const u8,
-) !?[]u8 {
-    var session: Session = undefined;
-    try session.init(io, config);
-    defer session.deinit();
-
-    return session.get(allocator, key);
-}
-
-/// 對外提供的 `HGET` 包裝。
-pub fn hGet(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    config: config_mod.Redis,
-    key: []const u8,
-    field: []const u8,
-) !?[]u8 {
-    var session: Session = undefined;
-    try session.init(io, config);
-    defer session.deinit();
-
-    return session.hGet(allocator, key, field);
-}
-
-/// 對外提供的多欄位 `HSET` 包裝。
-pub fn hSetFields(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    config: config_mod.Redis,
-    fields: []const HashField,
-) !void {
-    _ = allocator;
-    if (fields.len == 0) return;
-
-    const key = fields[0].key;
-    for (fields) |field| {
-        if (!std.mem.eql(u8, key, field.key)) return error.RedisHashFieldsMustShareKey;
-    }
-
-    var session: Session = undefined;
-    try session.init(io, config);
-    defer session.deinit();
-
-    try session.hSetFields(fields);
-}
-
-/// 對外提供的 `SETEX` 包裝。
-///
-/// 成功時 Redis 會回 `OK`。
-///
-/// 雖然程式裡呼叫的是 `client.send(void, ...)`，
-/// 但只要沒有錯誤或 nil，就會直接通過。
-pub fn setEx(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    config: config_mod.Redis,
-    key: []const u8,
-    value: []const u8,
-    ttl_seconds: u64,
-) !void {
-    _ = allocator;
-
-    var session: Session = undefined;
-    try session.init(io, config);
-    defer session.deinit();
-
-    try session.setEx(key, value, ttl_seconds);
-}
+// 註：先前這裡還有 containsKey / get / hGet / hSetFields / setEx 五個模組層包裝，
+// 每一個都自己 `Session.init` → TCP 連線 + AUTH + SELECT → 用完就關。DDNS 的降級
+// 路徑一輪會連續呼叫 setEx 三次以上，等於一輪 refresh 付三次以上完整握手。
+// 這些包裝與 `Session` 上的同名方法完全重複，因此直接移除；呼叫端改為自行開一條
+// `Session` 並在整段流程中重用（見 core/ddns.zig）。
 
 /// 以單一 Redis session 完成 DDNS dedupe：
 /// 1. `EXISTS MyPublicIP:{ip}`
 /// 2. 沒命中時寫回 `MyPublicIP:{ip}`
 /// 3. 再更新固定 key `MyPublicIP`
 pub fn ddnsDedupeCheckAndRemember(
-    allocator: std.mem.Allocator,
     io: std.Io,
     config: config_mod.Redis,
     params: DdnsDedupeParams,
 ) !DdnsDedupeResult {
-    _ = allocator;
-
     var session: Session = undefined;
     try session.init(io, config);
     defer session.deinit();

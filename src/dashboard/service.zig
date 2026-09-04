@@ -40,11 +40,11 @@ pub const ProviderDisplayData = struct {
 };
 
 /// 從 process-level DDNS snapshot 與 AppConfig 組出 Dashboard 展示資料。
-pub fn readDisplayData(config: config_mod.AppConfig) [8]ProviderDisplayData {
+pub fn readDisplayData(io: std.Io, config: config_mod.AppConfig) [8]ProviderDisplayData {
     // ddns.getProviderSnapshots() 以「provider、family」排列固定八格：
     // [0..1] cloudflare、[2..3] afraid、[4..5] dynu、[6..7] noip；
     // 每一對的偶數索引是 IPv4/A，奇數索引是 IPv6/AAAA。
-    const snapshots = ddns.getProviderSnapshots();
+    const snapshots = ddns.getProviderSnapshots(io);
     // 狀態分類需要拿現在時間，才能判斷 next_retry_at 是否還在未來。
     const now = currentUnixSeconds();
 

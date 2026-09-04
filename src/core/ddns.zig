@@ -56,7 +56,6 @@ const provider_status_failed = "failed";
 
 /// 啟動時檢查 Redis 連線狀況。
 pub fn checkRedisAvailability(
-    allocator: std.mem.Allocator,
     io: std.Io,
     redis_config: config_mod.Redis,
 ) void {
@@ -74,7 +73,7 @@ pub fn checkRedisAvailability(
     };
 
     // 這只是啟動期 TCP 可達性探測，不會驗證 Redis 帳密或執行 Redis 命令。
-    utils.checkTcpPortReachable(allocator, io, host_port.host, host_port.port) catch |err| {
+    utils.checkTcpPortReachable(io, host_port.host, host_port.port) catch |err| {
         redis_available = false;
         std.log.warn(
             "redis is not reachable at startup, falling back to local dedup: addr={s}, error={s}",
@@ -167,8 +166,8 @@ fn refreshSingle(
 
     // 這層是最快的 process-local 短路；即使 Redis TTL 已失效，只要此行程剛剛
     // 成功處理同一 IP 仍不重複更新。仍更新來源診斷資訊，因本次來源可能不同。
-    if (shared_state.isSameAsLastProcessedIp(ip_now)) {
-        shared_state.rememberLastProcessedIp(ip_now, ip_source, public_ip_lookup.stun_error);
+    if (shared_state.isSameAsLastProcessedIp(io, ip_now)) {
+        shared_state.rememberLastProcessedIp(io, ip_now, ip_source, public_ip_lookup.stun_error);
         std.log.info(
             "skip ddns refresh because public ip is unchanged in current process: {s}",
             .{ip_now},
@@ -211,11 +210,11 @@ fn refreshSingle(
     if (summary.attempted == 0) return error.NoEnabledDdnsService;
     if (summary.succeeded == 0) return error.AllDdnsUpdatesFailed;
 
-    try rememberDedupe(scratch, io, effective_redis, cache_key, ip_now, ttl_seconds, summary.successes);
+    try rememberDedupe(io, effective_redis, cache_key, ip_now, ttl_seconds, summary.successes);
     // 只有每個已嘗試 provider 都成功，才把 IP 標為此行程「完整處理」；
     // 若部分失敗，下輪仍應有機會補上失敗者。
     if (summary.succeeded == summary.attempted) {
-        shared_state.rememberLastProcessedIp(ip_now, ip_source, public_ip_lookup.stun_error);
+        shared_state.rememberLastProcessedIp(io, ip_now, ip_source, public_ip_lookup.stun_error);
     }
 
     std.log.info(
@@ -255,7 +254,6 @@ fn refreshWithRedisProviderState(
         client,
         config,
         ip,
-        ttl_seconds,
         now_seconds,
     );
     if (summary.configured == 0) return error.NoEnabledDdnsService;
@@ -273,7 +271,7 @@ fn refreshWithRedisProviderState(
 
     // configured 是所有已設定服務數；全部「已正確或本輪成功」才可更新 process-local 去重狀態。
     if (summary.already_current + summary.succeeded == summary.configured) {
-        shared_state.rememberLastProcessedIp(ip, ip_source, stun_error);
+        shared_state.rememberLastProcessedIp(io, ip, ip_source, stun_error);
     }
 
     if (summary.attempted == 0 and summary.failed == 0 and summary.retry_deferred == 0) {
@@ -403,18 +401,11 @@ fn providerName(provider: DdnsProvider) []const u8 {
     };
 }
 
-/// 將 enum 映射到固定順序的陣列 slot；目前保留給需要批次索引的呼叫端。
-fn providerSlot(provider: DdnsProvider) usize {
-    return switch (provider) {
-        .cloudflare => 0,
-        .afraid => 1,
-        .dynu => 2,
-        .noip => 3,
-    };
-}
-
 /// 判斷此 IP 是否可跳過更新。無 Redis 時查本機 TTL 快取；有 Redis 時還要確認
 /// 每個已啟用 provider 的 current-IP key 都正確，避免一個 provider 漏更新。
+///
+/// Redis 分支只開一條連線並貫穿整段檢查（EXISTS + 每個 provider 各一次 GET）。
+/// 先前每個查詢都走模組層包裝，各自建一條 TCP 連線並重跑 AUTH/SELECT。
 fn isDedupeHit(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -425,7 +416,7 @@ fn isDedupeHit(
 ) !bool {
     // Local cache 的 key 會隨 TTL 自動失效；此分支完全沒有 I/O。
     if (!redis_config.enabled) {
-        if (local_cache.localDedupeContains(cache_key)) {
+        if (local_cache.localDedupeContains(io, cache_key)) {
             std.log.info(
                 "skip ddns refresh because local cache key already exists: {s}",
                 .{cache_key},
@@ -435,9 +426,19 @@ fn isDedupeHit(
         return false;
     }
 
-    // Redis 去重檢查讀取失敗時採「視為未命中」的安全策略：寧可多做一次 DDNS 更新，
-    // 也不因暫時的 Redis 問題而錯過 IP 變更。
-    const cache_hit = redis.containsKey(allocator, io, redis_config, cache_key) catch |err| blk: {
+    // 連線失敗一樣採「視為未命中」：寧可多做一次 DDNS 更新，也不因暫時的 Redis
+    // 問題錯過 IP 變更。
+    var session: redis.Session = undefined;
+    session.init(io, redis_config) catch |err| {
+        std.log.warn(
+            "failed to open redis session before ddns refresh: key={s}, error={}",
+            .{ cache_key, err },
+        );
+        return false;
+    };
+    defer session.deinit();
+
+    const cache_hit = session.containsKey(cache_key) catch |err| blk: {
         std.log.warn(
             "failed to check redis key before ddns refresh: key={s}, error={}",
             .{ cache_key, err },
@@ -446,7 +447,7 @@ fn isDedupeHit(
     };
     if (!cache_hit) return false;
 
-    if (try allEnabledProvidersAlreadyRecorded(allocator, io, redis_config, app_config, ip)) {
+    if (try allEnabledProvidersAlreadyRecorded(allocator, &session, app_config, ip)) {
         std.log.info(
             "skip ddns refresh because redis cache key already exists and provider ip keys are current: {s}",
             .{cache_key},
@@ -464,28 +465,17 @@ fn isDedupeHit(
 /// 確認所有「已設定」provider 都已在 Redis 記錄為指定 IP；沒有任何 provider 時回傳 false。
 fn allEnabledProvidersAlreadyRecorded(
     allocator: std.mem.Allocator,
-    io: std.Io,
-    redis_config: config_mod.Redis,
+    session: *redis.Session,
     app_config: config_mod.AppConfig,
     ip: []const u8,
 ) !bool {
+    const providers_list = [_]DdnsProvider{ .cloudflare, .afraid, .dynu, .noip };
     var checked: usize = 0;
 
-    if (isProviderConfigured(app_config, .afraid)) {
+    for (providers_list) |provider| {
+        if (!isProviderConfigured(app_config, provider)) continue;
         checked += 1;
-        if (!try providerCurrentIpMatches(allocator, io, redis_config, .afraid, ip)) return false;
-    }
-    if (isProviderConfigured(app_config, .cloudflare)) {
-        checked += 1;
-        if (!try providerCurrentIpMatches(allocator, io, redis_config, .cloudflare, ip)) return false;
-    }
-    if (isProviderConfigured(app_config, .dynu)) {
-        checked += 1;
-        if (!try providerCurrentIpMatches(allocator, io, redis_config, .dynu, ip)) return false;
-    }
-    if (isProviderConfigured(app_config, .noip)) {
-        checked += 1;
-        if (!try providerCurrentIpMatches(allocator, io, redis_config, .noip, ip)) return false;
+        if (!try providerCurrentIpMatches(allocator, session, provider, ip)) return false;
     }
 
     return checked != 0;
@@ -494,20 +484,19 @@ fn allEnabledProvidersAlreadyRecorded(
 /// 讀取單一 provider 的 legacy current-IP key，並與本輪 IP 做精確位元組比較。
 fn providerCurrentIpMatches(
     allocator: std.mem.Allocator,
-    io: std.Io,
-    redis_config: config_mod.Redis,
+    session: *redis.Session,
     provider: DdnsProvider,
     ip: []const u8,
 ) !bool {
     const key = providerCurrentIpRedisKey(provider, ip);
-    const stored_ip = redis.get(allocator, io, redis_config, key) catch |err| {
+    const stored_ip = session.get(allocator, key) catch |err| {
         std.log.warn(
             "failed to read provider redis ip key: provider={s}, key={s}, error={}",
             .{ providerName(provider), key, err },
         );
         return false;
     };
-    // redis.get 成功取得的 value 是 allocator 配置；optional 為 null 時不做任何釋放。
+    // session.get 成功取得的 value 是 allocator 配置；optional 為 null 時不做任何釋放。
     defer if (stored_ip) |value| allocator.free(value);
 
     if (stored_ip) |value| {
@@ -528,8 +517,10 @@ fn isProviderConfigured(app_config: config_mod.AppConfig, provider: DdnsProvider
 
 /// 在更新成功後寫入去重資訊；依 Redis 是否啟用選擇遠端 TTL key 或本機快取。
 /// successes 確保 provider-current-IP 只寫給本輪真正成功的 provider。
+///
+/// Redis 分支同樣只開一條連線：這裡最多要寫 2 + N 個 key（N = 本輪成功的 provider
+/// 數），先前每個 SETEX 都自建連線，等於一輪 refresh 付 3 次以上完整握手。
 fn rememberDedupe(
-    allocator: std.mem.Allocator,
     io: std.Io,
     redis_config: config_mod.Redis,
     cache_key: []const u8,
@@ -539,58 +530,17 @@ fn rememberDedupe(
 ) !void {
     // SETEX 將值與 TTL 一次寫入；這些 key 到期後會自然允許下一輪完整更新。
     if (!redis_config.enabled) {
-        try local_cache.localDedupeSet(cache_key, ttl_seconds);
+        try local_cache.localDedupeSet(io, cache_key, ttl_seconds);
         std.log.info("ddns local cache updated: key={s}, ttl={d}s", .{ cache_key, ttl_seconds });
         return;
     }
 
-    // 第二筆 key 是方便外部觀察目前 IP 的索引；同樣必須帶上 family，
-    // 否則稍後寫入 IPv6 時會蓋掉 IPv4 的觀察值。
-    try redis.setEx(
-        allocator,
-        io,
-        redis_config,
-        cache_key,
-        ip,
-        ttl_seconds,
-    );
-    try redis.setEx(
-        allocator,
-        io,
-        redis_config,
-        currentPublicIpRedisKey(ip),
-        ip,
-        ttl_seconds,
-    );
-    try rememberProviderCurrentIps(allocator, io, redis_config, successes, ip, ttl_seconds);
-    std.log.info("ddns redis cache updated: key={s}, ttl={d}s", .{ cache_key, ttl_seconds });
-    std.log.info(
-        "ddns redis current public ip updated: key={s}, ip={s}, ttl={d}s",
-        .{ currentPublicIpRedisKey(ip), ip, ttl_seconds },
-    );
-}
+    var session: redis.Session = undefined;
+    try session.init(io, redis_config);
+    defer session.deinit();
 
-/// 將成功 provider 的 current-IP key 寫入 Redis，供下輪 dedupe 做完整性檢查。
-fn rememberProviderCurrentIps(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    redis_config: config_mod.Redis,
-    successes: ProviderSuccesses,
-    ip: []const u8,
-    ttl_seconds: u64,
-) !void {
-    const providers_list = [_]DdnsProvider{ .cloudflare, .afraid, .dynu, .noip };
-    for (providers_list) |provider| {
-        // `continue` 是關鍵：不為本輪失敗 provider 假裝寫入成功 IP。
-        if (!successes.includes(provider)) continue;
-
-        const key = providerCurrentIpRedisKey(provider, ip);
-        try redis.setEx(allocator, io, redis_config, key, ip, ttl_seconds);
-        std.log.info(
-            "ddns redis provider ip updated: provider={s}, key={s}, ip={s}, ttl={d}s",
-            .{ providerName(provider), key, ip, ttl_seconds },
-        );
-    }
+    // 寫入的 key 規則必須和 reconcile 流程完全一致，因此兩條路徑共用同一個實作。
+    try rememberDedupeWithSession(&session, cache_key, ip, ttl_seconds, successes);
 }
 
 /// 與 rememberDedupe 相同，但重用已開啟的 Redis Session，避免重複建立連線。
@@ -642,20 +592,19 @@ fn rememberDesiredIpWithSession(
     try redis_session.setEx(desiredPublicIpRedisKey(ip), ip, ttl_seconds);
 }
 
-/// 依固定順序 reconcile 全部 provider，並累積統計；ttl 目前由呼叫鏈保留作 API 穩定性。
+/// 依固定順序 reconcile 全部 provider，並累積統計。
+///
+/// provider state hash 不帶 TTL（它要跨 dedupe 週期保留 retry/backbeat 狀態），
+/// 所以這裡不需要 ttl_seconds；先前那個參數只是被 `_ =` 丟掉的擺設。
 fn updateDdnsServicesReconciled(
     allocator: std.mem.Allocator,
     redis_session: *redis.Session,
     client: *std.http.Client,
     config: config_mod.AppConfig,
     ip: []const u8,
-    ttl_seconds: u64,
     now_seconds: i64,
 ) !ServiceSummary {
     var summary = ServiceSummary{};
-    // 此參數暫未在 provider state hash 使用，但先保留在介面中，讓未來 state TTL
-    // 與 caller 的 dedupe TTL 能同步擴充而不破壞呼叫端。
-    _ = ttl_seconds;
 
     try reconcileProvider(&summary, allocator, redis_session, client, config, .cloudflare, ip, now_seconds);
     try reconcileProvider(&summary, allocator, redis_session, client, config, .afraid, ip, now_seconds);
@@ -695,7 +644,7 @@ fn reconcileProvider(
         .already_current => {
             // 也同步行程 snapshot，讓本次啟動的 dashboard 立即顯示已確認成功。
             summary.already_current += 1;
-            shared_state.memoryWriteProviderSuccess(provider, desired_ip, now_seconds);
+            shared_state.memoryWriteProviderSuccess(redis_session.io, provider, desired_ip, now_seconds);
             std.log.debug("skip ddns provider because it is already current: provider={s}, ip={s}", .{
                 providerName(provider),
                 desired_ip,
@@ -722,7 +671,6 @@ fn reconcileProvider(
         const next_retry_at = now_seconds + shared_state.retryDelaySeconds(state.retry_count + 1);
         // 儲存失敗本身也可能出錯；原始更新錯誤已在 log 留下，故只警告，不覆蓋它。
         saveProviderFailure(
-            allocator,
             redis_session,
             provider,
             desired_ip,
@@ -747,7 +695,7 @@ fn reconcileProvider(
     // 狀態無法可靠保存，即使 HTTP 更新本身已成功。
     summary.succeeded += 1;
     summary.successes.mark(provider);
-    try saveProviderSuccess(allocator, redis_session, provider, desired_ip, now_seconds);
+    try saveProviderSuccess(redis_session, provider, desired_ip, now_seconds);
 }
 
 /// 依 provider enum 分派到對應 HTTP 實作。呼叫前已由 isProviderConfigured 驗證必要設定。
@@ -844,7 +792,6 @@ fn loadProviderStateI64(
 
 /// 原子批次（在同一 hSetFields 命令）保存成功狀態，並同步更新行程內 snapshot。
 fn saveProviderSuccess(
-    allocator: std.mem.Allocator,
     redis_session: *redis.Session,
     provider: DdnsProvider,
     ip: []const u8,
@@ -857,23 +804,20 @@ fn saveProviderSuccess(
     const key = providerStateRedisKey(provider, ip);
 
     const fields = [_]redis.HashField{
-        .{ .key = key, .field = "current_ip", .value = ip },
-        .{ .key = key, .field = "desired_ip", .value = ip },
-        .{ .key = key, .field = "status", .value = provider_status_success },
-        .{ .key = key, .field = "retry_count", .value = "0" },
-        .{ .key = key, .field = "next_retry_at", .value = "0" },
-        .{ .key = key, .field = "last_error", .value = "" },
-        .{ .key = key, .field = "updated_at", .value = now_text },
+        .{ .field = "current_ip", .value = ip },
+        .{ .field = "desired_ip", .value = ip },
+        .{ .field = "status", .value = provider_status_success },
+        .{ .field = "retry_count", .value = "0" },
+        .{ .field = "next_retry_at", .value = "0" },
+        .{ .field = "last_error", .value = "" },
+        .{ .field = "updated_at", .value = now_text },
     };
-    // allocator 屬於統一的儲存函式簽名，目前成功寫入只需 stack buffer。
-    _ = allocator;
-    shared_state.memoryWriteProviderSuccess(provider, ip, now_seconds);
-    try redis_session.hSetFields(&fields);
+    shared_state.memoryWriteProviderSuccess(redis_session.io, provider, ip, now_seconds);
+    try redis_session.hSetFields(key, &fields);
 }
 
 /// 保存失敗狀態、錯誤名稱與下一次重試時間；刻意不覆蓋 current_ip，保留最後成功值。
 fn saveProviderFailure(
-    allocator: std.mem.Allocator,
     redis_session: *redis.Session,
     provider: DdnsProvider,
     desired_ip: []const u8,
@@ -892,16 +836,15 @@ fn saveProviderFailure(
     const key = providerStateRedisKey(provider, desired_ip);
 
     const fields = [_]redis.HashField{
-        .{ .key = key, .field = "desired_ip", .value = desired_ip },
-        .{ .key = key, .field = "status", .value = provider_status_failed },
-        .{ .key = key, .field = "retry_count", .value = retry_text },
-        .{ .key = key, .field = "next_retry_at", .value = next_retry_text },
-        .{ .key = key, .field = "last_error", .value = last_error },
-        .{ .key = key, .field = "updated_at", .value = now_text },
+        .{ .field = "desired_ip", .value = desired_ip },
+        .{ .field = "status", .value = provider_status_failed },
+        .{ .field = "retry_count", .value = retry_text },
+        .{ .field = "next_retry_at", .value = next_retry_text },
+        .{ .field = "last_error", .value = last_error },
+        .{ .field = "updated_at", .value = now_text },
     };
-    _ = allocator;
-    shared_state.memoryWriteProviderFailure(provider, desired_ip, retry_count, next_retry_at, last_error, now_seconds);
-    try redis_session.hSetFields(&fields);
+    shared_state.memoryWriteProviderFailure(redis_session.io, provider, desired_ip, retry_count, next_retry_at, last_error, now_seconds);
+    try redis_session.hSetFields(key, &fields);
 }
 
 /// 不使用 Redis 時的直接更新流程。各 provider 獨立嘗試，單一失敗不阻止其餘 provider。
@@ -920,10 +863,10 @@ fn updateDdnsServices(
         if (cloudflare.update(allocator, client, config.cloudflare, ip)) {
             summary.succeeded += 1;
             summary.successes.mark(.cloudflare);
-            shared_state.memoryWriteProviderSuccess(.cloudflare, ip, now_seconds);
+            shared_state.memoryWriteProviderSuccess(client.io, .cloudflare, ip, now_seconds);
         } else |err| {
             summary.failed += 1;
-            shared_state.memoryWriteProviderAttemptFailure(.cloudflare, ip, err, now_seconds);
+            shared_state.memoryWriteProviderAttemptFailure(client.io, .cloudflare, ip, err, now_seconds);
             std.log.err("cloudflare update failed: {}", .{err});
         }
     }
@@ -935,12 +878,12 @@ fn updateDdnsServices(
         if (providers.updateAfraid(allocator, client, config.afraid)) {
             summary.succeeded += 1;
             summary.successes.mark(.afraid);
-            shared_state.memoryWriteProviderSuccess(.afraid, ip, now_seconds);
+            shared_state.memoryWriteProviderSuccess(client.io, .afraid, ip, now_seconds);
         } else |err| {
             // local 模式仍寫入 shared_state，讓 dashboard 能顯示失敗與下一次退避時間；
             // 但不寫 Redis，因為本路徑代表 Redis 未啟用或不可用。
             summary.failed += 1;
-            shared_state.memoryWriteProviderAttemptFailure(.afraid, ip, err, now_seconds);
+            shared_state.memoryWriteProviderAttemptFailure(client.io, .afraid, ip, err, now_seconds);
             std.log.err("afraid update failed: {}", .{err});
         }
     }
@@ -951,10 +894,10 @@ fn updateDdnsServices(
         if (providers.updateDynu(allocator, client, config.dynu, ip)) {
             summary.succeeded += 1;
             summary.successes.mark(.dynu);
-            shared_state.memoryWriteProviderSuccess(.dynu, ip, now_seconds);
+            shared_state.memoryWriteProviderSuccess(client.io, .dynu, ip, now_seconds);
         } else |err| {
             summary.failed += 1;
-            shared_state.memoryWriteProviderAttemptFailure(.dynu, ip, err, now_seconds);
+            shared_state.memoryWriteProviderAttemptFailure(client.io, .dynu, ip, err, now_seconds);
             std.log.err("dynu update failed: {}", .{err});
         }
     }
@@ -965,10 +908,10 @@ fn updateDdnsServices(
         if (providers.updateNoIp(allocator, client, config.noip, ip)) {
             summary.succeeded += 1;
             summary.successes.mark(.noip);
-            shared_state.memoryWriteProviderSuccess(.noip, ip, now_seconds);
+            shared_state.memoryWriteProviderSuccess(client.io, .noip, ip, now_seconds);
         } else |err| {
             summary.failed += 1;
-            shared_state.memoryWriteProviderAttemptFailure(.noip, ip, err, now_seconds);
+            shared_state.memoryWriteProviderAttemptFailure(client.io, .noip, ip, err, now_seconds);
             std.log.err("no-ip update failed: {}", .{err});
         }
     }
@@ -1192,31 +1135,39 @@ test "retry delay backs off with cap" {
 }
 
 test "process local public ip state skips unchanged ip" {
-    shared_state.resetProcessPublicIpState();
-    defer shared_state.resetProcessPublicIpState();
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
 
-    try std.testing.expect(!shared_state.isSameAsLastProcessedIp("1.2.3.4"));
-    shared_state.rememberLastProcessedIp("1.2.3.4", "stun", null);
-    try std.testing.expect(shared_state.isSameAsLastProcessedIp("1.2.3.4"));
-    try std.testing.expect(!shared_state.isSameAsLastProcessedIp("5.6.7.8"));
+    shared_state.resetProcessPublicIpState(io);
+    defer shared_state.resetProcessPublicIpState(io);
 
-    const snapshot = getPublicIpSnapshot();
+    try std.testing.expect(!shared_state.isSameAsLastProcessedIp(io, "1.2.3.4"));
+    shared_state.rememberLastProcessedIp(io, "1.2.3.4", "stun", null);
+    try std.testing.expect(shared_state.isSameAsLastProcessedIp(io, "1.2.3.4"));
+    try std.testing.expect(!shared_state.isSameAsLastProcessedIp(io, "5.6.7.8"));
+
+    const snapshot = getPublicIpSnapshot(io);
     try std.testing.expect(snapshot.initialized);
     try std.testing.expectEqualStrings("1.2.3.4", snapshot.ipSlice());
     try std.testing.expectEqualStrings("stun", snapshot.sourceSlice());
     try std.testing.expectEqualStrings("", snapshot.stunErrorSlice());
 
-    shared_state.rememberLastProcessedIp("1.2.3.4", "cloudflare", "ReceiveFailed");
-    const fallback_snapshot = getPublicIpSnapshot();
+    shared_state.rememberLastProcessedIp(io, "1.2.3.4", "cloudflare", "ReceiveFailed");
+    const fallback_snapshot = getPublicIpSnapshot(io);
     try std.testing.expectEqualStrings("cloudflare", fallback_snapshot.sourceSlice());
     try std.testing.expectEqualStrings("ReceiveFailed", fallback_snapshot.stunErrorSlice());
 }
 
 test "provider snapshots expose fixed provider slots before initialization" {
-    shared_state.resetProcessProviderStates();
-    defer shared_state.resetProcessProviderStates();
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
 
-    const snapshots = getProviderSnapshots();
+    shared_state.resetProcessProviderStates(io);
+    defer shared_state.resetProcessProviderStates(io);
+
+    const snapshots = getProviderSnapshots(io);
 
     try std.testing.expectEqualStrings("cloudflare", snapshots[0].nameSlice());
     try std.testing.expectEqualStrings("cloudflare", snapshots[1].nameSlice());
@@ -1230,11 +1181,15 @@ test "provider snapshots expose fixed provider slots before initialization" {
 }
 
 test "provider success snapshot copies status by value" {
-    shared_state.resetProcessProviderStates();
-    defer shared_state.resetProcessProviderStates();
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
 
-    shared_state.memoryWriteProviderSuccess(.dynu, "1.2.3.4", 100);
-    var snapshots = getProviderSnapshots();
+    shared_state.resetProcessProviderStates(io);
+    defer shared_state.resetProcessProviderStates(io);
+
+    shared_state.memoryWriteProviderSuccess(io, .dynu, "1.2.3.4", 100);
+    var snapshots = getProviderSnapshots(io);
 
     try std.testing.expect(snapshots[4].initialized);
     try std.testing.expectEqualStrings("dynu", snapshots[4].nameSlice());
@@ -1245,21 +1200,25 @@ test "provider success snapshot copies status by value" {
     try std.testing.expectEqual(@as(i64, 0), snapshots[4].next_retry_at);
     try std.testing.expectEqual(@as(i64, 100), snapshots[4].updated_at);
 
-    shared_state.memoryWriteProviderSuccess(.dynu, "5.6.7.8", 200);
+    shared_state.memoryWriteProviderSuccess(io, .dynu, "5.6.7.8", 200);
     try std.testing.expectEqualStrings("1.2.3.4", snapshots[4].currentIpSlice());
 
-    snapshots = getProviderSnapshots();
+    snapshots = getProviderSnapshots(io);
     try std.testing.expectEqualStrings("5.6.7.8", snapshots[4].currentIpSlice());
 }
 
 test "provider failure snapshot preserves last successful current ip" {
-    shared_state.resetProcessProviderStates();
-    defer shared_state.resetProcessProviderStates();
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
 
-    shared_state.memoryWriteProviderSuccess(.noip, "1.2.3.4", 100);
-    shared_state.memoryWriteProviderFailure(.noip, "5.6.7.8", 2, 300, "UnexpectedNoIpResponse", 200);
+    shared_state.resetProcessProviderStates(io);
+    defer shared_state.resetProcessProviderStates(io);
 
-    const snapshots = getProviderSnapshots();
+    shared_state.memoryWriteProviderSuccess(io, .noip, "1.2.3.4", 100);
+    shared_state.memoryWriteProviderFailure(io, .noip, "5.6.7.8", 2, 300, "UnexpectedNoIpResponse", 200);
+
+    const snapshots = getProviderSnapshots(io);
     try std.testing.expect(snapshots[6].initialized);
     try std.testing.expectEqualStrings("1.2.3.4", snapshots[6].currentIpSlice());
     try std.testing.expectEqualStrings("5.6.7.8", snapshots[6].desiredIpSlice());
@@ -1283,23 +1242,30 @@ test "redis dedupe params use family-isolated redis cache key" {
 }
 
 test "local dedupe cache respects ttl" {
-    local_cache.resetLocalDedupeState();
-    defer local_cache.resetLocalDedupeState();
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
 
-    try std.testing.expect(!local_cache.localDedupeContainsAt("MyPublicIP:1.2.3.4", 100));
-    try local_cache.localDedupeSetAt("MyPublicIP:1.2.3.4", 60, 100);
-    try std.testing.expect(local_cache.localDedupeContainsAt("MyPublicIP:1.2.3.4", 120));
-    try std.testing.expect(!local_cache.localDedupeContainsAt("MyPublicIP:1.2.3.4", 160));
+    local_cache.resetLocalDedupeState(io);
+    defer local_cache.resetLocalDedupeState(io);
+
+    try std.testing.expect(!local_cache.localDedupeContainsAt(io, "MyPublicIP:1.2.3.4", 100));
+    try local_cache.localDedupeSetAt(io, "MyPublicIP:1.2.3.4", 60, 100);
+    try std.testing.expect(local_cache.localDedupeContainsAt(io, "MyPublicIP:1.2.3.4", 120));
+    try std.testing.expect(!local_cache.localDedupeContainsAt(io, "MyPublicIP:1.2.3.4", 160));
 }
 
 test "local dedupe hit is checked before provider updates" {
-    local_cache.resetLocalDedupeState();
-    defer local_cache.resetLocalDedupeState();
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    local_cache.resetLocalDedupeState(io);
+    defer local_cache.resetLocalDedupeState(io);
 
     const key = "MyPublicIP:1.2.3.4";
-    try local_cache.localDedupeSet(key, 60);
+    try local_cache.localDedupeSet(io, key, 60);
 
-    const io: std.Io = undefined;
     try std.testing.expect(try isDedupeHit(
         std.testing.allocator,
         io,
@@ -1311,17 +1277,21 @@ test "local dedupe hit is checked before provider updates" {
 }
 
 test "local dedupe cache shrinks after pruning many expired entries" {
-    local_cache.resetLocalDedupeState();
-    defer local_cache.resetLocalDedupeState();
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    local_cache.resetLocalDedupeState(io);
+    defer local_cache.resetLocalDedupeState(io);
 
     // Directly test logic to avoid triggering allocator requirements of internal state
     var key_buffer: [64]u8 = undefined;
     for (0..40) |index| {
         const key = try std.fmt.bufPrint(&key_buffer, "MyPublicIP:10.0.0.{d}", .{index});
-        try local_cache.localDedupeSetAt(key, 10, 100);
+        try local_cache.localDedupeSetAt(io, key, 10, 100);
     }
 
-    try std.testing.expect(!local_cache.localDedupeContainsAt("MyPublicIP:missing", 1000));
+    try std.testing.expect(!local_cache.localDedupeContainsAt(io, "MyPublicIP:missing", 1000));
 }
 
 test "parseStunResponse decodes valid ipv4 xor-mapped-address" {

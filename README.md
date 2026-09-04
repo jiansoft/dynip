@@ -86,7 +86,8 @@ This project now follows a more typical Zig application layout:
   - `src/io/logging/seq.zig`: shipping the same entry to Seq in CLEF format.
 - `src/io/http.zig`: shared HTTP fetch and response logging helpers.
 - `build.zig`: the Zig build definition. It wires together the executable, the `run` step, and the test step.
-- `build.ps1` / `build.bat`: Windows-oriented helper scripts for local build flows.
+- `scripts/build.ps1` / `scripts/build.bat`: Windows-oriented helper scripts for local build flows.
+- `scripts/deploy-armv7.ps1`: one-shot deployment of the ARMv7 binary to the Raspberry Pi (`/opt/dynip`).
 - `control.sh`: a helper script used mainly for container or deployment-oriented workflows.
 - `Dockerfile`: the container image build definition.
 
@@ -487,14 +488,14 @@ From `cmd.exe`:
 
 ```bat
 cd /d C:\dynip
-build.bat
+scriptsuild.bat
 ```
 
 From PowerShell:
 
 ```powershell
 Set-Location C:\dynip
-powershell.exe -ExecutionPolicy Bypass -File .\build.ps1
+powershell.exe -ExecutionPolicy Bypass -File .\scripts\build.ps1
 ```
 
 The PowerShell build currently emits stripped ARM64 and ARMv7 Linux binaries into `zig-out\bin\`.

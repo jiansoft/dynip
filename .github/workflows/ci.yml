@@ -29,7 +29,7 @@ env:
   # 注意：官方下載站只保留較新的 nightly，舊版本會被移除。
   # `mlugg/setup-zig` 會在官方站失效時改用社群 mirror，但若哪天真的取不到，
   # 就把這裡更新成目前開發用的版本（`zig version` 的輸出）。
-  ZIG_VERSION: 0.17.0-dev.1745+ac8a8d0c5
+  ZIG_VERSION: 0.17.0-dev.1818+7051f8e73
 
 jobs:
   check:
@@ -59,7 +59,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # 對應 build.ps1 的兩個目標與 control.sh 依 `uname -m` 選用的檔名。
+          # 對應 scripts/build.ps1 的兩個目標與 control.sh 依 `uname -m` 選用的檔名。
           - target: aarch64-linux
             name: dynip_linux_arm64
           - target: arm-linux-musleabihf

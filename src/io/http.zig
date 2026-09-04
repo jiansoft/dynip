@@ -57,9 +57,9 @@ const default_accept_encoding: [content_encoding_count]bool = initDefaultAcceptE
 
 /// 取得一個 enum 的成員數量。
 ///
-/// 為什麼不直接寫 `@typeInfo(T).@"enum".fields.len`：這個欄位在 Zig 0.17-dev 期間
-/// 曾從 `fields` 改名為 `field_names`。用 `@hasField` 在編譯期偵測目前的標準庫是哪一種，
-/// 兩種版本都能編譯，升級 Zig 時不必回頭改這裡。
+/// `std.builtin.Type.Enum` 在 Zig 0.17-dev 期間把 `fields` 改名為 `field_names`，
+/// 這裡原本用 `@hasField` 同時支援兩種寫法。`build.zig.zon` 既然已經釘住
+/// `minimum_zig_version`，就沒有理由再維護一條永遠走不到的分支。
 ///
 /// # Arguments
 /// * `T` - 要檢查的 enum 型別（編譯期參數）。
@@ -67,11 +67,7 @@ const default_accept_encoding: [content_encoding_count]bool = initDefaultAcceptE
 /// # Returns
 /// 該 enum 的成員數量。
 fn enumFieldCount(comptime T: type) usize {
-    const enum_info = @typeInfo(T).@"enum";
-    return if (comptime @hasField(@TypeOf(enum_info), "field_names"))
-        enum_info.field_names.len
-    else
-        enum_info.fields.len;
+    return @typeInfo(T).@"enum".field_names.len;
 }
 
 /// 建立 HTTP 專用的日誌分類。

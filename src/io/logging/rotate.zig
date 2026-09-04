@@ -147,6 +147,14 @@ pub const Rotate = struct {
     ///
     /// `?std.Io.File` 是 optional，`null` 代表還沒有開檔。
     file: ?std.Io.File = null,
+    /// `file` 目前的位元組長度，由本結構自行維護。
+    ///
+    /// 為什麼要自己記：先前每寫一行 log 都會呼叫兩次 `getFileLength`（各一次
+    /// `lseek`）——一次判斷是否該輪轉，一次決定寫入位置。日誌是高頻路徑，
+    /// 這等於每行都付兩個 syscall。而這個檔案只會被「持有 logger mutex 的這條
+    /// 路徑」寫入，長度因此可以完全在行程內推算：開檔時量一次，之後每成功寫入
+    /// 一行就累加該行長度。輪轉或跨日重新開檔時再由 `openCurrentFile` 量準。
+    current_size: u64 = 0,
     /// 組檔名用的固定 buffer。
     ///
     /// 這樣每次組路徑時不用額外配置 heap 記憶體。
@@ -188,36 +196,29 @@ pub const Rotate = struct {
         // 把時間、等級、scope 和訊息組成真正要寫入檔案的一行文字。
         const line = try format.formatLogLine(&line_buffer, now, level, scope_name, message);
 
-        // 再次確認檔案存在。理論上 ensureReady 成功後一定有檔案，但 optional 還是要安全處理。
-        if (self.file) |file| {
-            // 取得目前檔案長度，這就是「檔尾」的位置。
-            //
-            // 為什麼每次寫入前都重新取長度：
-            // - 服務重啟後，檔案本來就已經有舊內容。
-            // - 每次寫入前把「邏輯寫入位置」設到最新檔尾，就能保證 log 是 append，不會寫到檔案最上面。
-            const size = try getFileLength(io, file);
-
-            // 寫下去會超過上限就先輪轉：把目前這個檔改名封存，再開一個同名空檔。
-            if (self.shouldRotateBySize(size, line.len)) {
-                try self.rotateBySize(io, now);
-            }
+        // 寫下去會超過上限就先輪轉：把目前這個檔改名封存，再開一個同名空檔。
+        // `current_size` 由本結構維護（開檔時量、寫入後累加），因此這裡不必再問作業系統。
+        if (self.file != null and self.shouldRotateBySize(self.current_size, line.len)) {
+            try self.rotateBySize(io, now);
         }
 
-        // 輪轉可能換過 handle，這裡重新取出目前的活躍檔；
-        // 長度也一律重新取，不能假設輪轉後就是 0（改名失敗時會續寫原檔，
-        // 從檔頭寫會蓋掉既有內容）。
+        // 輪轉可能換過 handle，所以重新取出目前的活躍檔。
+        // 寫入位置一律取自 `current_size`：不能假設輪轉後就是 0，改名失敗時會續寫
+        // 原檔，從檔頭寫會蓋掉既有內容。
         if (self.file) |file| {
-            const size = try getFileLength(io, file);
             // 使用 positional writer，而不是 streaming writer。
             // positional writer 會把 offset 明確交給底層寫入 API，不依賴作業系統目前的檔案游標。
             var write_buffer: [1024]u8 = undefined;
             var writer = file.writer(io, &write_buffer);
             // 把這次 writer 的邏輯寫入位置移到檔尾。
-            try writer.seekTo(size);
+            // positional 模式下這只是設定結構內的 offset，不會產生 syscall。
+            try writer.seekTo(self.current_size);
             // 透過同一個 writer 寫入，這樣 seek 位置和真正寫入位置會一致。
             try writer.interface.writeAll(line);
             // flush 確保 buffer 裡的資料真的送到底層檔案。
             try writer.flush();
+            // 只有整行確實落地後才推進長度，中途失敗時 `current_size` 仍與檔案一致。
+            self.current_size += line.len;
             // 記住這一筆的時間，下次輪轉時會拿它當封存檔名的時間戳。
             self.last_write = now;
         }
@@ -327,8 +328,15 @@ pub const Rotate = struct {
         });
 
         // 開檔成功後才放回狀態裡。
-        // 真正寫入時會再次 seek 到檔尾，確保重啟服務後一定是 append。
         self.file = file;
+        // 這是整個 Rotate 唯一會問作業系統檔案長度的地方（每天/每次輪轉一次）。
+        // 服務重啟後檔案可能已有舊內容，量準它，後續寫入才會是 append 而非覆寫檔頭。
+        self.current_size = getFileLength(io, file) catch |err| {
+            // 量不到長度就不能安全 append，寧可讓開檔失敗，也不要從檔頭蓋掉既有日誌。
+            file.close(io);
+            self.file = null;
+            return err;
+        };
     }
 
     /// 依目前日期與等級組出 log 檔案路徑。

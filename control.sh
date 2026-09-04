@@ -106,7 +106,7 @@ docker_update() {
 }
 
 # 依 `uname -m` 判斷這台機器該用哪一份 binary。
-# 對應 build.ps1 產出的檔名：dynip_linux_arm64 / dynip_linux_armv7。
+# 對應 scripts/build.ps1 產出的檔名：dynip_linux_arm64 / dynip_linux_armv7。
 general_detect_binary_name() {
   case "$(uname -m)" in
     aarch64) echo "dynip_linux_arm64" ;;

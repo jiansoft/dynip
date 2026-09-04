@@ -118,6 +118,27 @@ pub fn run(
         app_config.dashboard.port,
     });
 
+    // `accept` 會一直阻塞到有連線進來，所以光靠迴圈條件檢查 stop_token 是不夠的：
+    // 沒有人連進來時，這條 thread 會永遠停在 accept 裡面，看不到停止旗標。
+    //
+    // 標準庫在 `Server.AcceptError.SocketNotListening` 的說明中明確指出，
+    // `shutdown` 可以當作 accept 的並行取消機制。因此另外跑一個小任務：
+    // 等 stop_token 被設起來後對 listening socket 做 shutdown，
+    // 阻塞中的 accept 就會立刻返回 SocketNotListening。
+    //
+    // 用 `io.concurrent` 而不是 `io.async`：`async` 允許實作直接就地同步執行傳入的
+    // 函式，而這個 watcher 本身是個等待迴圈，就地執行等於永遠不會回到 accept。
+    // `concurrent` 保證拿到真正的並行單位，拿不到時回 error 讓我們降級處理。
+    var shutdown_watcher = io.concurrent(shutdownServerOnStop, .{ io, stop_token, &server });
+    // defer 的執行順序是後進先出，所以這個 cancel 會排在上面 `server.deinit(io)` 之前，
+    // watcher 一定在 server 記憶體失效前就結束，不會拿到已 undefined 的指標。
+    defer if (shutdown_watcher) |*watcher| watcher.cancel(io) else |_| {};
+
+    if (shutdown_watcher) |_| {} else |err| {
+        // 沒有並行單位時退回舊行為：仍然可以服務請求，只是停止要等到 process 結束。
+        std.log.debug("dashboard shutdown watcher unavailable, falling back to blocking accept: {}", .{err});
+    }
+
     // Dashboard 和 DDNS scheduler 同 process，但在不同 thread。
     // 這個 while loop 會一直等瀏覽器連線，直到 stop_token 要求停止。
     while (!isStopRequested(stop_token)) {
@@ -126,8 +147,8 @@ pub fn run(
         var stream = server.accept(io) catch |err| switch (err) {
             // 非阻塞 socket 沒有連線時可能會回 WouldBlock；這裡直接繼續等。
             error.WouldBlock => continue,
-            // listening socket 被關閉時，server 可以自然停止。
-            error.SocketNotListening => return,
+            // listening socket 被關閉或 shutdown 時（正常停止路徑）自然結束。
+            error.SocketNotListening, error.Canceled => return,
             // 其他錯誤交給呼叫端，由 runAndLog 記錄。
             else => return err,
         };
@@ -140,6 +161,32 @@ pub fn run(
         // `Stream` 是 OS socket 包裝；用完要關。
         stream.close(io);
     }
+}
+
+/// 等到 stop_token 被設起來後，對 listening socket 做 shutdown，
+/// 讓阻塞在 `accept` 的主迴圈立刻返回。
+///
+/// 這個任務只做等待與一次 shutdown，不碰任何共享狀態。
+fn shutdownServerOnStop(
+    io: std.Io,
+    stop_token: ?scheduler.StopToken,
+    server: *std.Io.net.Server,
+) void {
+    // 沒有 stop_token 就沒有停止來源（例如測試路徑），這個任務沒有工作可做。
+    if (stop_token == null) return;
+
+    while (!isStopRequested(stop_token)) {
+        // 分段 sleep，讓停止旗標最多延遲一個間隔就被看到。
+        // 被 `run` 的 defer cancel 時，sleep 會回 error.Canceled，
+        // 代表 accept 迴圈已經自行結束，不需要再 shutdown。
+        io.sleep(.fromMilliseconds(200), .awake) catch return;
+    }
+
+    // `Stream` 只是 `Socket` 的薄包裝，listening socket 也適用同一個 shutdown。
+    const listening: std.Io.net.Stream = .{ .socket = server.socket };
+    listening.shutdown(io, .both) catch |err| {
+        std.log.debug("dashboard listening socket shutdown failed: {}", .{err});
+    };
 }
 
 /// 讀取一條 TCP connection 上的 HTTP request，並交給 router。
@@ -172,7 +219,7 @@ fn handleConnection(
         else => return err,
     };
     // 依 URL path 產生 HTML/JSON/404。
-    try handleRequest(allocator, &request, app_config);
+    try handleRequest(allocator, io, &request, app_config);
 }
 
 /// Dashboard 的極簡 router。
@@ -183,6 +230,7 @@ fn handleConnection(
 /// - GET `/api/status` / `/api/status.json`：JSON API。
 fn handleRequest(
     allocator: std.mem.Allocator,
+    io: std.Io,
     request: *std.http.Server.Request,
     app_config: config_mod.AppConfig,
 ) !void {
@@ -213,7 +261,7 @@ fn handleRequest(
     // 首頁和 /dashboard 都導到同一個 HTML。
     if (std.mem.eql(u8, target_path, "/") or std.mem.eql(u8, target_path, "/dashboard")) {
         // render function 會配置一段完整 HTML 字串；回應後要 free。
-        const body = try renderDashboardPage(allocator, app_config);
+        const body = try renderDashboardPage(allocator, io, app_config);
         defer allocator.free(body);
         try request.respond(body, .{ .extra_headers = &html_headers, .keep_alive = false });
         return;
@@ -231,7 +279,7 @@ fn handleRequest(
     if (std.mem.eql(u8, target_path, "/api/status") or
         std.mem.eql(u8, target_path, "/api/status.json"))
     {
-        const body = try renderStatusJson(allocator, app_config);
+        const body = try renderStatusJson(allocator, io, app_config);
         defer allocator.free(body);
         try request.respond(body, .{ .extra_headers = &json_headers, .keep_alive = false });
         return;
@@ -278,11 +326,11 @@ fn clientHasFreshEtag(request: *std.http.Server.Request, etag: []const u8) bool 
 /// 這裡沒有使用模板引擎，原因是 Jetzig 相依目前和本機 Zig nightly 不相容。
 /// 實作上採用 `std.Io.Writer.Allocating` 逐段寫入 ArrayList，最後轉成
 /// `[]u8` 回傳給 HTTP response。
-fn renderDashboardPage(allocator: std.mem.Allocator, app_config: config_mod.AppConfig) ![]u8 {
+fn renderDashboardPage(allocator: std.mem.Allocator, io: std.Io, app_config: config_mod.AppConfig) ![]u8 {
     // 讀出三個 provider 的「展示用資料」。
-    const data = service.readDisplayData(app_config);
+    const data = service.readDisplayData(io, app_config);
     // 取得實際 Public IP 快照。
-    const ip_snap = ddns.getPublicIpSnapshot();
+    const ip_snap = ddns.getPublicIpSnapshot(io);
     const public_ip = if (ip_snap.initialized) ip_snap.ipSlice() else "—";
     // Public IP 來源，例如 "stun" / "cloudflare"。
     //
@@ -441,9 +489,9 @@ fn renderConfigPage(allocator: std.mem.Allocator, app_config: config_mod.AppConf
 }
 
 /// 產生 `/api/status.json` 的 JSON response body。
-fn renderStatusJson(allocator: std.mem.Allocator, app_config: config_mod.AppConfig) ![]u8 {
-    const data = service.readDisplayData(app_config);
-    const ip_snap = ddns.getPublicIpSnapshot();
+fn renderStatusJson(allocator: std.mem.Allocator, io: std.Io, app_config: config_mod.AppConfig) ![]u8 {
+    const data = service.readDisplayData(io, app_config);
+    const ip_snap = ddns.getPublicIpSnapshot(io);
     const public_ip = if (ip_snap.initialized) ip_snap.ipSlice() else "";
     const public_ip_source = if (ip_snap.initialized and ip_snap.source_len != 0) ip_snap.sourceSlice() else "";
     const public_ip_stun_status = publicIpStunStatus(&ip_snap);
@@ -672,7 +720,10 @@ fn publicIpStunStatus(snapshot: *const ddns.PublicIpSnapshot) []const u8 {
 
 test "dashboard json exposes providers" {
     const allocator = std.testing.allocator;
-    const json = try renderStatusJson(allocator, .{});
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+
+    const json = try renderStatusJson(allocator, threaded.io(), .{});
     defer allocator.free(json);
 
     try std.testing.expect(std.mem.indexOf(u8, json, "\"providers\"") != null);
@@ -686,7 +737,10 @@ test "dashboard json exposes providers" {
 
 test "dashboard groups A and AAAA status in each provider card" {
     const allocator = std.testing.allocator;
-    const html = try renderDashboardPage(allocator, .{});
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+
+    const html = try renderDashboardPage(allocator, threaded.io(), .{});
     defer allocator.free(html);
 
     try std.testing.expect(std.mem.indexOf(u8, html, "A / IPv4") != null);

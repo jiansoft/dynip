@@ -15,7 +15,7 @@ const api_base_url = "https://api.cloudflare.com/client/v4";
 /// 使用短時間快取能減少 API 呼叫，同時仍能在合理時間內發現人工 DNS 修改。
 const record_cache_ttl_seconds: i64 = 60;
 
-/// 一筆已存在 record 的快取。所有 slice 都由 page allocator 擁有並存活到行程結束；
+/// 一筆已存在 record 的快取。所有 slice 都由 `cache_allocator` 擁有並存活到行程結束；
 /// 設定的 DDNS record 數量通常很少，因此以設定數量為上限的簡單快取已足夠。
 const CachedRecord = struct {
     key: []u8,
@@ -26,8 +26,18 @@ const CachedRecord = struct {
 
 /// 排程工作可能呼叫 Cloudflare provider，同時 dashboard 會讀取 snapshot。
 /// 若未來 refresh 改為並行執行，這把 mutex 仍可讓快取讀寫保持安全。
-var record_cache_mutex: std.atomic.Mutex = .unlocked;
+/// 用 `std.Io.Mutex` 而不是 `std.atomic.Mutex`：後者只有 `tryLock`，當通用鎖用就得
+/// 自己寫 `while (!tryLock()) yield()` 的忙等迴圈。`std.Io.Mutex.lock` 走 futex，
+/// 等不到鎖的執行緒會真的睡著，由 unlock 喚醒。
+var record_cache_mutex: std.Io.Mutex = .init;
 var record_cache: std.ArrayList(CachedRecord) = .empty;
+
+/// 快取自有資料使用的 allocator。
+///
+/// 先前用 `std.heap.page_allocator` 配置 record id / content 這類幾十位元組的字串，
+/// 每筆至少佔一整個 page。`smp_allocator` 是 thread-safe 的通用 allocator，
+/// 適合這種「長壽命行程、小配置、多執行緒」的用途。
+const cache_allocator = std.heap.smp_allocator;
 
 /// DNS record 對應的位址家族。
 pub const IpFamily = enum {
@@ -139,7 +149,7 @@ fn findRecord(
     family: IpFamily,
 ) !?Record {
     const cache_key = try makeCacheKey(allocator, config.zone_id, hostname, family);
-    if (cacheLookup(cache_key)) |cached| return cached;
+    if (cacheLookup(client.io, cache_key)) |cached| return cached;
 
     const url = try listRecordUrl(allocator, config.zone_id, hostname, family);
     const response = try send(allocator, client, url, config.api_token, .GET, null, config.http_retry_count);
@@ -152,7 +162,7 @@ fn findRecord(
     if (!parsed.success) return reportApiFailure(parsed.errors);
     const record = try selectManagedRecord(parsed.result, config.managed_record_comment);
     if (record == null) return null;
-    cacheStore(cache_key, record.?);
+    cacheStore(client.io, cache_key, record.?);
     return record;
 }
 
@@ -184,7 +194,7 @@ fn patchRecord(
     const response = try sendJson(allocator, client, url, config.api_token, .PATCH, PatchBody{ .content = ip }, config.http_retry_count);
     defer allocator.free(response.body);
     try ensureSuccessfulResponse(allocator, response);
-    cacheUpdateContent(record_id, ip);
+    cacheUpdateContent(client.io, record_id, ip);
 }
 
 /// 建立不易碰撞的行程內快取 key。必須包含 zone ID 與 record type，
@@ -222,12 +232,12 @@ fn listRecordUrl(allocator: std.mem.Allocator, zone_id: []const u8, hostname: []
 }
 
 /// 回傳未過期項目的值複本。回傳 slice 屬於行程快取，呼叫端不可釋放它們。
-fn cacheLookup(key: []const u8) ?Record {
+fn cacheLookup(io: std.Io, key: []const u8) ?Record {
     // 新增項目時 ArrayList 可能重新配置記憶體，因此讀寫都必須取得同一把鎖。
-    // 回傳的 Record 是小型值複本，內含由 page allocator 擁有的穩定 slice；
+    // 回傳的 Record 是小型值複本，內含由 `cache_allocator` 擁有的穩定 slice；
     // 鎖釋放後它仍然有效。
-    lockRecordCache();
-    defer record_cache_mutex.unlock();
+    record_cache_mutex.lockUncancelable(io);
+    defer record_cache_mutex.unlock(io);
     // 快取策略刻意採粗粒度的 60 秒，因此 Unix 秒已足夠。
     const now: i64 = @intCast(c.time(null));
     for (record_cache.items) |entry| {
@@ -240,14 +250,14 @@ fn cacheLookup(key: []const u8) ?Record {
     return null;
 }
 
-/// 新增或取代既有 record 快取項目。必須由 page allocator 複製資料，
+/// 新增或取代既有 record 快取項目。必須由 `cache_allocator` 複製資料，
 /// 因為 JSON 回應記憶體屬於呼叫端 arena，refresh 結束後就會消失。
-fn cacheStore(key: []const u8, record: Record) void {
-    // JSON parser 產生的 slice 借用 refresh arena。一定要複製到 page allocator，
+fn cacheStore(io: std.Io, key: []const u8, record: Record) void {
+    // JSON parser 產生的 slice 借用 refresh arena。一定要複製到 `cache_allocator`，
     // 因為 arena 會在 refresh 後 deinit，而快取的生命週期比它長。
-    lockRecordCache();
-    defer record_cache_mutex.unlock();
-    const allocator = std.heap.page_allocator;
+    record_cache_mutex.lockUncancelable(io);
+    defer record_cache_mutex.unlock(io);
+    const allocator = cache_allocator;
     const now: i64 = @intCast(c.time(null));
     for (record_cache.items) |*entry| {
         if (!std.mem.eql(u8, entry.key, key)) continue;
@@ -271,12 +281,12 @@ fn cacheStore(key: []const u8, record: Record) void {
 
 /// PATCH 以 record ID 識別目標，所以成功後更新同 ID 的全部快取項目。
 /// 這可避免下一輪 refresh 拿舊 content 比較後，發出不必要的第二次 PATCH。
-fn cacheUpdateContent(record_id: []const u8, content: []const u8) void {
+fn cacheUpdateContent(io: std.Io, record_id: []const u8, content: []const u8) void {
     // 呼叫此函式前 PATCH 已成功；更新快取值可避免下次排程以舊 IP content 比較，
     // 進而重複發送 PATCH。
-    lockRecordCache();
-    defer record_cache_mutex.unlock();
-    const allocator = std.heap.page_allocator;
+    record_cache_mutex.lockUncancelable(io);
+    defer record_cache_mutex.unlock(io);
+    const allocator = cache_allocator;
     const now: i64 = @intCast(c.time(null));
     for (record_cache.items) |*entry| {
         if (!std.mem.eql(u8, entry.id, record_id)) continue;
@@ -284,15 +294,6 @@ fn cacheUpdateContent(record_id: []const u8, content: []const u8) void {
         allocator.free(entry.content);
         entry.content = replacement;
         entry.expires_at = now + record_cache_ttl_seconds;
-    }
-}
-
-/// Zig 0.17 的 atomic.Mutex 提供 tryLock，而非阻塞式 lock 方法。
-/// 每次失敗後 yield 可避免緊密忙等，並與本專案 local_cache.zig、
-/// shared_state.zig 已採用的鎖定慣例一致。
-fn lockRecordCache() void {
-    while (!record_cache_mutex.tryLock()) {
-        std.Thread.yield() catch {};
     }
 }
 

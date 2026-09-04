@@ -123,12 +123,9 @@ pub fn createUdpSocket(family: std.posix.sa_family_t) !std.posix.socket_t {
     // 在 Windows 上，任何 socket 系統呼叫前都必須完成 WSAStartup。
     try ensureWindowsSocketsStarted();
 
-    const cloexec: u32 = if (comptime builtin.os.tag == .windows)
-        0
-    else if (comptime @hasDecl(std.posix.SOCK, "CLOEXEC"))
-        std.posix.SOCK.CLOEXEC
-    else
-        0;
+    // Winsock 的 SOCK 沒有 CLOEXEC（Windows 用 handle 繼承旗標，不是這個機制）；
+    // 其餘 POSIX 平台一律有。原本第三層 `else 0` 的 fallback 走不到，已移除。
+    const cloexec: u32 = if (comptime builtin.os.tag == .windows) 0 else std.posix.SOCK.CLOEXEC;
     // DGRAM = UDP；CLOEXEC 讓 exec 後的子行程不會意外繼承此 socket。
     const flags: u32 = std.posix.SOCK.DGRAM | cloexec;
     const rc = std.posix.system.socket(family, flags, std.posix.IPPROTO.UDP);
@@ -144,12 +141,9 @@ pub fn createUdpSocket(family: std.posix.sa_family_t) !std.posix.socket_t {
 pub fn createTcpSocket(family: std.posix.sa_family_t) !std.posix.socket_t {
     try ensureWindowsSocketsStarted();
 
-    const cloexec: u32 = if (comptime builtin.os.tag == .windows)
-        0
-    else if (comptime @hasDecl(std.posix.SOCK, "CLOEXEC"))
-        std.posix.SOCK.CLOEXEC
-    else
-        0;
+    // Winsock 的 SOCK 沒有 CLOEXEC（Windows 用 handle 繼承旗標，不是這個機制）；
+    // 其餘 POSIX 平台一律有。原本第三層 `else 0` 的 fallback 走不到，已移除。
+    const cloexec: u32 = if (comptime builtin.os.tag == .windows) 0 else std.posix.SOCK.CLOEXEC;
     // STREAM = TCP 的位元組串流 socket。
     const flags: u32 = std.posix.SOCK.STREAM | cloexec;
     const rc = std.posix.system.socket(family, flags, std.posix.IPPROTO.TCP);
@@ -235,10 +229,9 @@ test "socket receive timeout is applied with the platform's expected unit" {
     const socket = try createUdpSocket(std.posix.AF.INET);
     defer closeSocket(socket);
 
-    const timeout = if (comptime @hasField(std.posix.timeval, "tv_sec"))
-        std.posix.timeval{ .tv_sec = 2, .tv_usec = 0 }
-    else
-        std.posix.timeval{ .sec = 2, .usec = 0 };
+    // `std.posix.timeval` 的欄位在本專案支援的所有平台（Windows / Linux）都是
+    // `sec`/`usec`；先前的 `tv_sec` 相容分支已經沒有任何平台會走到。
+    const timeout: std.posix.timeval = .{ .sec = 2, .usec = 0 };
     try setSocketTimeout(socket, timeout);
 
     if (comptime builtin.os.tag != .windows) return;
@@ -385,14 +378,12 @@ pub fn parseHostPort(addr: []const u8) !struct { host: []const u8, port: u16 } {
 /// 若傳入主機名 (Host)，會先使用 `std.Io.net.HostName` 透過背景佇列異步解析 DNS，
 /// 接著嘗試連接，確保若連接埠不通時，不會阻斷主排程器載入。
 ///
-/// - `allocator`: 用於 DNS 解析時需要的記憶體分配器 (在此由介面傳入，暫不分配)。
 /// - `io`: 執行異步操作所需的 I/O 引擎。
 /// - `host`: 伺服器主機名或 IP 地址。
 /// - `port`: 目標 TCP 連接埠。
-pub fn checkTcpPortReachable(allocator: std.mem.Allocator, io: std.Io, host: []const u8, port: u16) !void {
-    // 目前 API 保留 allocator，以便日後 DNS 流程需要配置時不必改動呼叫端。
-    // `_ = allocator` 明確告訴 Zig：此版本刻意尚未使用該參數。
-    _ = allocator;
+pub fn checkTcpPortReachable(io: std.Io, host: []const u8, port: u16) !void {
+    // DNS 解析全程使用 stack 上的固定 buffer（見下方 canonical_name_buffer /
+    // lookup_buffer），因此不需要 allocator。
     try ensureWindowsSocketsStarted();
 
     // 優先嘗試解析成 IP，若解析失敗則代表是域名，進入 DNS Lookup
