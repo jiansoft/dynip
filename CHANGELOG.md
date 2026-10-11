@@ -31,6 +31,33 @@
     `std.time.timestamp()` 不存在、有號整數格式化成 `+2026`、Jetzig scaffold 相依無法編譯，
     在 0.18 仍然成立，因此對應的寫法維持不變。
 
+### 修正
+
+- **armv7（Raspberry Pi）上所有 Unix 時間戳都是錯的。**
+
+  `src/c.zig` 直接宣告 `extern "c" fn time(...) i64`。但 32-bit musl 的 `time` symbol
+  只是回傳 32-bit 的相容版本（`__time32`），真正的 64-bit 版本是 `__time64`，
+  一般 C 程式是靠 header 的 `__REDIR` 轉過去。我們沒有走 C header，結果高 32 位元
+  讀到的是暫存器垃圾值，正式機的 log 出現 `next_retry_at=-2503822690` 這種負數。
+  受影響的有 provider 失敗後的 retry backoff、寫進 Redis 的 `updated_at` / `next_retry_at`、
+  dashboard 顯示的時間與 local cache TTL；log 時間戳與 02:00 維護時段判斷走 `localtime`，
+  在 little-endian 上恰好只讀低 32 位元，所以沒有受影響。
+
+  現在 32-bit Linux + musl 改用 `__time64` / `__localtime64`，其他平台維持原 symbol，
+  並新增 `c.time` / `c.localtime_r` 單元測試。這個測試在 Pi 上用修正前的程式碼
+  （`-Doptimize=fast`）會失敗，修正後通過。
+
+- **換 IP 後第一次 DDNS 更新必定失敗（`error.HttpConnectionClosing`）。**
+
+  `src/io/http.zig` 的 `RequestTextOptions.keep_alive` 預設由 `true` 改為 `false`。
+  `std.http.Client.connectTcpOptions` 會優先重用連線池裡的連線，但本程式的 request
+  間隔至少 60 秒、DDNS 更新一天一次，池裡的連線到下次使用時多半已被伺服器關閉，
+  或因撥號換 IP 而失效。正式機過去 7 天每次換 IP，afraid 與 no-ip 第一次更新都失敗，
+  要等下一輪 retry 才成功。
+
+- 升級到 Zig 0.18 後，`https://one.one.one.one/cdn-cgi/trace` 每 2 分鐘一次的
+  `error.WriteFailed`（0.17 時每天約 720 筆）在正式機上已不再出現，不需另外修改。
+
 ---
 
 ## [26.8.14]

@@ -147,7 +147,7 @@ pub const HeaderPolicy = struct {
 /// 單次 HTTP 文字 request 的完整選項。
 ///
 /// 全部欄位都有預設值，所以最簡單的用法是傳一個空的 `.{}`，代表
-/// 「GET、沒有 body、不要壓縮、不設 connect timeout、開 keep-alive」。
+/// 「GET、沒有 body、不要壓縮、不設 connect timeout、不重用連線」。
 pub const RequestTextOptions = struct {
     /// HTTP method，例如 GET / POST。
     ///
@@ -163,8 +163,14 @@ pub const RequestTextOptions = struct {
     timeouts: RequestTimeouts = .{},
     /// 是否重用連線。
     ///
-    /// 預設開啟 keep-alive，讓同一個 client 可以重複利用連線。
-    keep_alive: bool = true,
+    /// 預設關閉。這個程式的 request 彼此至少間隔一個 refresh 週期（60 秒以上），
+    /// DDNS 更新更是一天才一次；放回連線池的連線等到下次要用時，多半已被伺服器
+    /// 因閒置而關閉，或因撥號換 IP 而失效。`connectTcpOptions` 會優先拿池裡的舊連線，
+    /// 結果就是換 IP 後第一次更新必定失敗（`error.HttpConnectionClosing`），
+    /// 要等下一輪 retry 才成功。每次重新連線只多一次 TLS handshake，換來第一次就成功。
+    ///
+    /// 同一輪內需要連續打同一台主機好幾次的呼叫端，可以自行傳 `true`。
+    keep_alive: bool = false,
 };
 
 /// 送出 JSON request body 時的選項。

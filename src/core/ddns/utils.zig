@@ -571,3 +571,26 @@ pub fn buildBasicAuthorization(
     _ = std.base64.standard.Encoder.encode(encoded, raw);
     return std.fmt.allocPrint(allocator, "Basic {s}", .{encoded});
 }
+
+test "c.time returns a plausible 64-bit unix timestamp" {
+    // 防止 32-bit musl（Raspberry Pi armv7）再次呼叫到 32-bit 相容版 `time` symbol：
+    // 那時高 32 位元是垃圾值，會得到 `-2503822750` 這種負數。
+    const now = c.time(null);
+    try std.testing.expect(now > 1_700_000_000); // 2023-11 之後
+    try std.testing.expect(now < 4_102_444_800); // 2100-01-01 之前
+
+    var out: c.time_t = 0;
+    const returned = c.time(&out);
+    try std.testing.expectEqual(returned, out);
+}
+
+test "c.localtime_r converts a 64-bit timestamp to the expected calendar year" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    // 2026-07-01 00:00:00 UTC；任何時區換算後都仍落在 2026 年 6 月或 7 月。
+    const timestamp: c.time_t = 1_782_864_000;
+    var local_tm: c.struct_tm = undefined;
+    _ = c.localtime_r(&timestamp, &local_tm) orelse return error.LocalTimeUnavailable;
+    try std.testing.expectEqual(@as(c_int, 2026 - 1900), local_tm.tm_year);
+    try std.testing.expect(local_tm.tm_mon == 5 or local_tm.tm_mon == 6);
+}
