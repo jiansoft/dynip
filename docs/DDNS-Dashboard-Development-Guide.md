@@ -52,7 +52,7 @@ ProviderState:
 
 開發一個 Web Dashboard，整合在 `dynip` 單一 process 內。
 
-目前已完成的 runtime 版本使用 `src/dashboard/server.zig` 直接以 Zig 標準庫 HTTP server 提供頁面與 JSON API；`dashboard/` Jetzig scaffold 已建立，但本機 Zig 0.17 與 Jetzig 產生的相依目前存在編譯相容性問題，因此暫不把 Jetzig app 接進主 build。
+目前已完成的 runtime 版本使用 `src/dashboard/server.zig` 直接以 Zig 標準庫 HTTP server 提供頁面與 JSON API；`dashboard/` Jetzig scaffold 已建立，但本機 Zig 0.18 與 Jetzig 產生的相依目前存在編譯相容性問題，因此暫不把 Jetzig app 接進主 build。
 
 ### 1.4 設計原則（v1.1 更新）
 
@@ -372,7 +372,7 @@ fn classifyDisplayStatus(snapshot, now) -> DisplayStatus {
 
 目前主程式已在 `src/cli.zig` 啟動 `dashboard_server.runAndLog()`，並與 DDNS scheduler 共用同一個 `dynip` process。Dashboard 監聽由 `app.json` 的 `dashboard.enabled` / `dashboard.host` / `dashboard.port` 控制。
 
-`dashboard/` 子目錄已用 Jetzig CLI 初始化，作為後續切換 Jetzig views/templates 的 scaffold；但在本機 `D:\Runtime\zig\0.17.0` 測試時，Jetzig 相依套件仍有 Zig 語法相容性錯誤，因此目前 runtime 採用內建 HTTP server。
+`dashboard/` 子目錄已用 Jetzig CLI 初始化，作為後續切換 Jetzig views/templates 的 scaffold；但在本機 Zig `0.18.0-dev.146` 測試時，Jetzig 相依套件（zmd、zmpl）仍有 Zig 語法相容性錯誤，因此目前 runtime 採用內建 HTTP server。
 
 ### 5.1 路由對應表
 
@@ -709,7 +709,7 @@ setInterval(fetchStatus, REFRESH_INTERVAL_MS);
 
 ### Phase 0：環境準備（先決條件）
 
-- [x] 確認 Zig 版本與 Jetzig 相容性：本機 Zig 0.17 與目前 Jetzig scaffold 相依暫不相容
+- [x] 確認 Zig 版本與 Jetzig 相容性：本機 Zig 0.18 與目前 Jetzig scaffold 相依暫不相容
 - [x] 安裝/取得 `jetzig` CLI 工具（已用官方 Windows build 產生 scaffold）
 - [x] 決定 Dashboard 整合方式：使用獨立子目錄 `dashboard/`
 - [x] 確認 Dashboard 監聽設定：由 `app.json` 的 `dashboard.host` / `dashboard.port` 控制，預設 `0.0.0.0:9003`
@@ -808,7 +808,7 @@ setInterval(fetchStatus, REFRESH_INTERVAL_MS);
 **ADR-002：先用內建 HTTP server 完成 runtime Dashboard**
 
 - **決策**：`dynip` runtime 先使用 `src/dashboard/server.zig` 的 `std.http.Server` 實作 Dashboard；`dashboard/` Jetzig app 保留為 scaffold。
-- **理由**：本機 Zig 0.17 可編譯主專案，但 Jetzig 產生的相依目前有語法相容性錯誤；內建 server 可先滿足「單一 process 內 DDNS service + Web 狀態呈現」目標。
+- **理由**：本機 Zig 0.18 可編譯主專案，但 Jetzig 產生的相依目前有語法相容性錯誤；內建 server 可先滿足「單一 process 內 DDNS service + Web 狀態呈現」目標。
 - **取捨**：短期少了 Jetzig view/template 分層；後續待 Jetzig 相依與 Zig 版本對齊後，可把 `server.zig` render 邏輯搬到 Jetzig views/templates。
 
 ### B. 目錄結構（完整）

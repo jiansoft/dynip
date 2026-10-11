@@ -276,4 +276,3 @@ pub fn resetProcessPublicIpState(io: std.Io) void {
     process_public_ip_state.source_len = 0;
     process_public_ip_state.stun_error_len = 0;
 }
-

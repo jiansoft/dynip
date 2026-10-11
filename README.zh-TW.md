@@ -100,7 +100,7 @@ No-IP  current_ip = 5.6.7.8  -> 更新或重試
 
 ## 執行需求
 
-- Zig `0.17.0-dev` 或更高版本
+- Zig `0.18.0-dev` 或更高版本（確切下限見 `build.zig.zon` 的 `minimum_zig_version`）
 - 可連線到公開 IP 查詢服務
 - 可連線到你啟用的 DDNS 供應商
 - 只有在你要用 Redis 避免重複更新時，才需要 Redis

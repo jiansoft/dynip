@@ -22,9 +22,14 @@ pub fn build(b: *std.Build) void {
 
     // `optimize` 代表最佳化等級。
     // 常見值像：
-    // - Debug: 最適合除錯
-    // - ReleaseSafe: 兼顧速度與安全檢查
-    // - ReleaseFast: 追求速度
+    // - debug: 最適合除錯
+    // - safe: 兼顧速度與安全檢查
+    // - fast: 追求速度
+    // - small: 追求最小體積
+    //
+    // Zig 0.18 把列舉值改成小寫（`std.lang.Optimize`），命令列也改用
+    // `-Doptimize=fast` 這類新名稱；舊的 `ReleaseFast` 等寫法已標記 deprecated，
+    // 會在 0.18.0 之後移除。
     //
     // 這一行同樣會讓使用者可以用 `-Doptimize=...` 來覆寫。
     const optimize = b.standardOptimizeOption(.{});
@@ -137,37 +142,16 @@ pub fn build(b: *std.Build) void {
     //
     // 這時 `service --config app.json` 會原封不動轉給程式本身。
     //
-    // Zig 0.17-dev 的 build API 正在變動：
-    // - 較舊 snapshot 還有 `Build.args`
-    // - 較新 snapshot 移除 `Build.args`，改用 `Run.addPassthruArgs`
+    // Zig 0.18 的 build API 已移除 `Build.args`，改由 `Run.addPassthruArgs` 宣告
+    // run step 願意接收 `zig build run -- ...` 的參數。
     //
-    // `comptime @hasField(...)` 和 `comptime @hasDecl(...)` 是編譯期檢查：
-    // - `@hasField(std.Build, "args")`：檢查這版標準庫的 Build struct 是否還有 args 欄位
-    // - `@hasDecl(std.Build.Step.Run, "addPassthruArgs")`：檢查 Run step 是否有這個函式
+    // 因為這個 API 無法在 build.zig 裡判斷「沒帶參數時補 service」，
+    // 空參數預設值改放在 CLI 層處理，見 `src/cli.zig` 的
+    // `commandArgsOrDefault(...)`。
     //
-    // 這樣同一份 build script 可以跨幾個 Zig 0.17-dev snapshot 編譯。
-    if (comptime @hasField(std.Build, "args")) {
-        // 舊 API：build system 會在 configure 階段把 `--` 後面的參數放進 b.args。
-        if (b.args) |args| {
-            // 使用者有明確帶參數時，全部轉送給 dynip。
-            run_cmd.addArgs(args);
-        } else {
-            // 使用者只輸入 `zig build run` 時，預設啟動 service。
-            run_cmd.addArg("service");
-        }
-    } else if (comptime @hasDecl(std.Build.Step.Run, "addPassthruArgs")) {
-        // 新 API：build script 不再直接讀得到「是否有 passthrough args」。
-        // 這裡只宣告 run step 願意接收 `zig build run -- ...` 的參數。
-        //
-        // 因為這個 API 無法在 build.zig 裡判斷「沒帶參數時補 service」，
-        // 空參數預設值改放在 CLI 層處理，見 `src/cli.zig` 的
-        // `commandArgsOrDefault(...)`。
-        run_cmd.addPassthruArgs();
-    } else {
-        // 更舊或不同的 API 沒有 passthrough 支援時，至少讓 `zig build run`
-        // 仍然能用預設 service 啟動。
-        run_cmd.addArg("service");
-    }
+    // 先前這裡用 `@hasField` / `@hasDecl` 同時支援多個 0.17-dev snapshot；
+    // `build.zig.zon` 已經釘住 `minimum_zig_version`，那些分支永遠走不到，因此移除。
+    run_cmd.addPassthruArgs();
 
     // 建立一個名字叫 `run` 的 build step。
     // 使用者在命令列輸入 `zig build run` 時，找的就是這個名字。

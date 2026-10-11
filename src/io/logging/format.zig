@@ -20,7 +20,7 @@ const c = @import("c");
 pub const LocalDateTime = struct {
     /// Unix epoch 秒數，主要拿來判斷舊檔是否超過保留天數。
     unix_seconds: i64,
-    /// 年份使用 unsigned，避免 Zig 0.16 格式化 `{d:0>4}` 時把正數印成 `+2026`。
+    /// 年份使用 unsigned，避免 Zig 格式化 `{d:0>4}` 時把正數印成 `+2026`（0.16 起即如此，0.18 仍是）。
     year: u32,
     /// 月份，範圍是 1 到 12。
     month: u8,
@@ -57,7 +57,7 @@ pub fn localNow() !LocalDateTime {
 
         // 把 Win32 API 包在區域 struct 裡，避免污染整個檔案的命名空間。
         const kernel32 = struct {
-            // `callconv(.winapi)` 是 Zig 0.16 呼叫 Win32 API 時應使用的 calling convention。
+            // `callconv(.winapi)` 是 Zig 0.18 呼叫 Win32 API 時應使用的 calling convention。
             extern "kernel32" fn GetLocalTime(lpSystemTime: *SYSTEMTIME) callconv(.winapi) void;
         };
 

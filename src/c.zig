@@ -14,8 +14,9 @@ const builtin = @import("builtin");
 
 /// C `time_t` 的專案內部表示。
 ///
-/// 本專案目前支援的執行環境使用 64-bit Unix seconds。
-/// 直接固定成 `i64` 可以避免引入 `translate-c` 只為了取得 typedef。
+/// 專案內部一律用 64-bit Unix seconds。
+/// 直接固定成 `i64` 可以避免引入 `translate-c` 只為了取得 typedef；
+/// 和 libc 實際 `time_t` 寬度的差異由下方 `LibcTime` 與 `posix` 宣告吸收。
 pub const time_t = i64;
 
 /// Ctrl+C 對應的 C signal 編號。
@@ -66,7 +67,9 @@ pub const SignalHandler = ?*const fn (c_int) callconv(.c) void;
 /// Windows 分支不用 C runtime 的 `time()`，改用 Win32 `GetSystemTimeAsFileTime()`。
 /// 這樣可以保持 shim 自己掌控平台差異。
 pub fn time(timer: ?*time_t) time_t {
-    const now = if (builtin.os.tag == .windows) windowsTime() else posix.time(timer);
+    // 這裡刻意傳 null 給 libc：libc 的 `time_t` 寬度可能和本專案的 `time_t`（i64）不同，
+    // 寫回 caller 指標的工作統一由下面的 `if (timer)` 處理。
+    const now: time_t = if (builtin.os.tag == .windows) windowsTime() else posix.time(null);
     // C `time()` 的語意是：如果 caller 有傳 output pointer，就順手寫入。
     // Zig 的 `if (optional) |value|` 是解開 optional 的常見寫法。
     if (timer) |out| out.* = now;
@@ -98,7 +101,9 @@ pub fn exit(status: c_int) noreturn {
 /// 目前只有非 Windows 分支真的會呼叫這個函式；Windows 取得本地時間的邏輯
 /// 在 `logging.zig` / `ddns.zig` 裡使用 Win32 `GetLocalTime()`。
 pub fn localtime_r(timer: *const time_t, result: *struct_tm) ?*struct_tm {
-    const local_time = posix.localtime(timer) orelse return null;
+    // 轉成 libc 自己的 `time_t` 寬度再傳指標，不能直接把 `*i64` 交給 32-bit `time_t` 的 libc。
+    const libc_timer: LibcTime = std.math.cast(LibcTime, timer.*) orelse return null;
+    const local_time = posix.localtime(&libc_timer) orelse return null;
     // C `localtime()` 回傳的是指向靜態記憶體的 pointer。
     // 為了模擬 `localtime_r()`，我們把內容 copy 到 caller 提供的 result。
     result.* = local_time.*;
@@ -181,16 +186,45 @@ fn handleWindowsConsoleSignal(ctrl_type: u32) callconv(.winapi) c_int {
     return 0;
 }
 
+/// 32-bit Linux + musl 是否要改用 64-bit time 的 symbol。
+///
+/// musl 1.2 起，32-bit 平台的 `time_t` 一律是 64-bit，但 C header 會用
+/// `__REDIR(time, __time64)` 把呼叫「轉址」到 `__time64` / `__localtime64`。
+/// 原本的 `time` / `localtime` symbol 只是給舊程式用的 32-bit 相容版本：
+/// `time` 只回傳 32-bit，若照 `i64` 宣告去接，高 32 位元會是暫存器裡的垃圾值。
+///
+/// 我們沒有走 C header（沒有 translate-c），所以要自己做同樣的轉址。
+/// 這個問題實際發生在 Raspberry Pi（`arm-linux-musleabihf`）上：
+/// `next_retry_at` 等時間戳變成 `-2503822690` 這種負數。
+const use_musl_time64 = builtin.os.tag == .linux and
+    builtin.abi.isMusl() and
+    @bitSizeOf(usize) == 32;
+
+/// libc 自己的 `time_t` 寬度。
+///
+/// - 64-bit 平台：`long` 本來就是 64-bit。
+/// - 32-bit musl：走 `__time64` 系列 symbol，是 64-bit。
+/// - 其他 32-bit libc（例如舊版 glibc）：`time` 回傳 32-bit 的 `long`。
+const LibcTime = if (use_musl_time64) i64 else c_long;
+
 /// POSIX / libc declarations。
 ///
 /// `extern "c"` 告訴 Zig：
 /// - 這些函式不是 Zig 實作的。
 /// - linker 需要去 C runtime 裡找 symbol。
 /// - 呼叫時使用 C ABI。
+///
+/// `time` / `localtime` 用 `@extern` 依平台選 symbol 名稱，原因見 `use_musl_time64`。
 const posix = struct {
-    extern "c" fn time(timer: ?*time_t) time_t;
+    const time = @extern(*const fn (timer: ?*LibcTime) callconv(.c) LibcTime, .{
+        .name = if (use_musl_time64) "__time64" else "time",
+        .library_name = "c",
+    });
+    const localtime = @extern(*const fn (timer: *const LibcTime) callconv(.c) ?*struct_tm, .{
+        .name = if (use_musl_time64) "__localtime64" else "localtime",
+        .library_name = "c",
+    });
     extern "c" fn signal(sig: c_int, handler: SignalHandler) SignalHandler;
-    extern "c" fn localtime(timer: *const time_t) ?*struct_tm;
 };
 
 /// Win32 `FILETIME` layout。

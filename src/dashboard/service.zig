@@ -146,7 +146,7 @@ fn buildDisplayData(
 /// 取得 Unix timestamp 秒數。
 ///
 /// 專案目前已經透過 C import 使用 `time()`；這裡沿用同一套方式，
-/// 避免依賴 Zig 0.17 已移除/變動中的 `std.time.timestamp()`。
+/// 避免依賴 Zig 0.18 標準庫已移除的 `std.time.timestamp()`。
 fn currentUnixSeconds() i64 {
     return @intCast(c.time(null));
 }

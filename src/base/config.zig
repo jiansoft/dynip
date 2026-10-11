@@ -586,7 +586,8 @@ fn resolveFieldType(comptime T: type, comptime path: []const u8) type {
 
 /// `resolveField` 的指標層實作：逐層解引用到最終欄位的可寫指標。
 ///
-/// Zig 0.17 的 `orelse` block 內若有 `return`，有時會被編譯器誤判為 comptime context。
+/// Zig 0.18 的 `orelse` block 內若有 `return`，有時會被編譯器誤判為 comptime context
+/// （0.17 起即如此，0.18.0-dev.146 驗證仍會報錯）。
 /// 這裡改用 comptime `if/else` 取代 `orelse {...}`，避免誤判。
 fn resolveFieldImpl(ptr: anytype, comptime path: []const u8) *resolveFieldType(
     @typeInfo(@TypeOf(ptr)).pointer.child,

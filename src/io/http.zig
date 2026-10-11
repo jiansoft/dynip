@@ -57,7 +57,8 @@ const default_accept_encoding: [content_encoding_count]bool = initDefaultAcceptE
 
 /// 取得一個 enum 的成員數量。
 ///
-/// `std.builtin.Type.Enum` 在 Zig 0.17-dev 期間把 `fields` 改名為 `field_names`，
+/// `std.lang.Type.Enum`（Zig 0.18 的 `std.builtin` 已改名為 `std.lang`）
+/// 在 0.17-dev 期間把 `fields` 改名為 `field_names`，
 /// 這裡原本用 `@hasField` 同時支援兩種寫法。`build.zig.zon` 既然已經釘住
 /// `minimum_zig_version`，就沒有理由再維護一條永遠走不到的分支。
 ///

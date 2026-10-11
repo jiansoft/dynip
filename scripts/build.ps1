@@ -12,7 +12,9 @@ $ProjectDir = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 # 這裡把建置常用設定集中放在前面，後面比較好維護。
 $BinName = 'dynip'
 $OutDir = Join-Path $ProjectDir 'zig-out\bin'
-$Optimize = 'ReleaseFast'
+# Zig 0.18 的最佳化等級改用小寫新名稱（debug / safe / fast / small），
+# 舊的 `ReleaseFast` 已標記 deprecated，會在 0.18.0 之後移除。
+$Optimize = 'fast'
 $FallbackZig = 'zig.exe'
 
 function Resolve-ZigCommand {

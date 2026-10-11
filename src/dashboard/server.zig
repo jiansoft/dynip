@@ -93,7 +93,7 @@ pub fn runAndLog(
 ///
 /// 參數說明：
 /// - `allocator`：用來配置每次 HTML/JSON response body。
-/// - `io`：Zig 0.17 的 I/O 介面，負責 listen/accept/read/write。
+/// - `io`：Zig 的 `std.Io` 介面，負責 listen/accept/read/write。
 /// - `app_config`：已載入的 app.json/.env/env 合併設定。
 /// - `stop_token`：主程式收到 shutdown signal 時會被設成 true。
 pub fn run(

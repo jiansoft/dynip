@@ -17,7 +17,7 @@
 //! - 依日誌等級分成 `info`、`warn`、`error`、`debug` 四個檔案，各自一個 `Rotate`。
 //! - 用 runtime 等級分別過濾 console、檔案與 Seq 輸出。
 //! - 同一筆 log 同時寫入檔案與 console，方便開發時直接看終端機。
-//! - 使用 Zig 0.16 的 `std.Io` API，不再使用舊版 std.fs API。
+//! - 使用 Zig 0.18 的 `std.Io` API（0.16 起引入），不再使用舊版 std.fs API。
 
 const std = @import("std");
 
@@ -73,7 +73,7 @@ const RuntimeLogLevel = enum {
 ///
 /// 一個 `Logger` 持有四個 `Rotate`，也就是四種 log level 各一個檔案輪替器。
 const Logger = struct {
-    /// Zig 0.16 的 IO 介面。
+    /// Zig 0.18 的 IO 介面。
     ///
     /// 檔案讀寫、sleep、網路等操作都會透過它執行。
     io: std.Io,

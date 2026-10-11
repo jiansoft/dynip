@@ -34,7 +34,7 @@
 //!
 //! 這些東西在下面每個函式的參數列都會看到，先在這裡解釋一次：
 //!
-//! - **`io`**（`std.Io`）：Zig 0.16 之後的 IO 介面。檔案讀寫、stderr、sleep、網路
+//! - **`io`**（`std.Io`）：Zig 0.16 起引入、目前（0.18）使用的 IO 介面。檔案讀寫、stderr、sleep、網路
 //!   都要透過它，而不是直接呼叫作業系統。好處是同一份程式碼可以換不同的 IO 實作
 //!   （例如測試時換成假的），也讓「這個函式會不會碰 IO」從型別上就看得出來。
 //! - **`allocator` 與 `arena_allocator`**：兩個都是記憶體配置器，差別在回收方式。
@@ -103,7 +103,7 @@ var shutdown_requested: std.atomic.Value(bool) = .init(false);
 
 /// 空 CLI 參數時要套用的預設子命令。
 ///
-/// `zig build run` 在 Zig 0.17-dev 的新 build API 裡，通常會把程式本體
+/// `zig build run` 在 Zig 0.18 的 build API（`Run.addPassthruArgs`）裡，通常會把程式本體
 /// 啟動成「沒有任何 app 參數」的狀態。也就是說，`runCommand(...)` 收到的
 /// `args` 會是空 slice。
 ///

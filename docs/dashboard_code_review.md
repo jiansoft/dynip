@@ -40,7 +40,7 @@
 
 ## 3. Jetzig 架構 Review
 
-由於 Zig 0.17 與 Jetzig 現行相依版本的編譯相容性限制，本專案在 `dashboard/` 下保留了 Jetzig scaffold，但實際運行是採用主專案中內建的 `std.http.Server`（即 `src/dashboard/server.zig`）。
+由於 Zig 0.18 與 Jetzig 現行相依版本的編譯相容性限制，本專案在 `dashboard/` 下保留了 Jetzig scaffold，但實際運行是採用主專案中內建的 `std.http.Server`（即 `src/dashboard/server.zig`）。
 
 ### Good Practices
 1. **Service 層職責明確**：`src/dashboard/service.zig` 的 `readDisplayData` 和 `classifyDisplayStatus` 成功將「核心 Snapshot」轉換為「UI 顯示狀態」，不與 HTTP Server 的 Request/Response 邏輯混雜。

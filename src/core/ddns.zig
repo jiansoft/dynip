@@ -114,7 +114,7 @@ pub fn refresh(
     const primary: types.PublicIpService = if (round % 2 == 0) .stun else .cloudflare_trace;
 
     // 明確標註 optional 型別：catch 分支的 `null` 代表「此 family 沒有結果」，
-    // Zig 0.17 無法僅從 runtime catch flow 推導出 null 對應的 optional payload。
+    // Zig 0.18 仍無法僅從 runtime catch flow 推導出 null 對應的 optional payload。
     const ipv4_status: ?RefreshStatus = refreshSingle(allocator, io, client, config, .ipv4, primary) catch |err| blk: {
         // `none` 是使用者明確停用該 family，不是網路故障，因此不寫 warning。
         if (err == error.PublicIpFamilyDisabled) break :blk null;

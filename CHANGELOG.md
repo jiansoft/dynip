@@ -7,6 +7,32 @@
 
 ---
 
+## [26.10.11]
+
+建置基準：Zig `0.18.0-dev.146+35accc06e`，`x86_64-windows.win11_br-gnu`。
+
+### 變更
+
+- **升級建置基準至 Zig 0.18.0-dev。**
+
+  主程式與測試在 0.18 下不需修改即可編譯；這次調整的是版本宣告與即將被移除的舊寫法：
+
+  - `build.zig.zon` 的 `minimum_zig_version` 與 `.github/workflows/ci.yml` 的 `ZIG_VERSION`
+    同步改為 `0.18.0-dev.146+35accc06e`。
+  - 最佳化等級改用 0.18 的新名稱：`scripts/build.ps1` 與 CI 由 `-Doptimize=ReleaseFast`
+    改為 `-Doptimize=fast`。舊名稱在 0.18 仍可用，但已標記 deprecated，會在 0.18.0 之後移除。
+  - `build.zig` 移除為了相容舊 0.17-dev snapshot 而保留的 `Build.args` 分支，
+    `zig build run` 一律走 `Run.addPassthruArgs`（空參數仍由 `src/cli.zig` 補成 `service`）。
+  - `src/core/ddns/ip_lookup.zig` 改用標準庫的 `std.mem.cutPrefix`，
+    移除當初因 0.17.0 缺少對應 API 而自行實作的 `stripProviderPrefix`。
+  - `src/core/ddns/shared_state.zig` 移除檔尾多餘空行，讓 `zig fmt --check` 通過。
+  - 原始碼註解與 `docs/` 中描述「目前 Zig 版本」的地方改為 0.18。相關限制都先在 0.18 實測過：
+    `orelse` 內 `return` 的 comptime 誤判、catch 分支 `null` 無法推導 optional、
+    `std.time.timestamp()` 不存在、有號整數格式化成 `+2026`、Jetzig scaffold 相依無法編譯，
+    在 0.18 仍然成立，因此對應的寫法維持不變。
+
+---
+
 ## [26.8.14]
 
 建置基準：Zig `0.17.0-dev.1745+ac8a8d0c5`，`x86_64-windows.win11_br-gnu`。

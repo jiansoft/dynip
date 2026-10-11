@@ -466,7 +466,7 @@ pub fn resolveMaxSizeBytes(max_size_mb: i64) u64 {
 }
 
 test "log timestamp and filename do not prefix positive year with plus" {
-    // 這個測試是為了防止 Zig 0.16 的有號整數格式化再次把年份印成 `+2026`。
+    // 這個測試是為了防止 Zig（0.16 起至 0.18）的有號整數格式化再次把年份印成 `+2026`。
     var rotate = Rotate.init("info");
     const now = format.LocalDateTime{
         .unix_seconds = 0,

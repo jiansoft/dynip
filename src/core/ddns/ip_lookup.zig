@@ -191,27 +191,19 @@ fn getPublicIpFromConfiguredProvider(
         return .{ .ip = ip, .service = service, .family = family };
     }
 
-    if (stripProviderPrefix(provider, "static:")) |ip_text| {
+    if (std.mem.cutPrefix(u8, provider, "static:")) |ip_text| {
         return configuredTextLookup(allocator, ip_text, family, .cloudflare_trace);
     }
-    if (stripProviderPrefix(provider, "file:")) |path| {
+    if (std.mem.cutPrefix(u8, provider, "file:")) |path| {
         // `readFileAlloc` 限制為 4 KiB，因為這不是一般資料檔，而是一個小型測試/注入介面。
         const text = try std.Io.Dir.cwd().readFileAlloc(client.io, path, allocator, .limited(4096));
         return configuredTextLookup(allocator, firstIpLine(text), family, .cloudflare_trace);
     }
-    if (stripProviderPrefix(provider, "url:")) |url| {
+    if (std.mem.cutPrefix(u8, provider, "url:")) |url| {
         const ip = try fetchPlainTextIp(allocator, client, url, family);
         return .{ .ip = ip, .service = .cloudflare_trace, .family = family };
     }
     return error.InvalidPublicIpProvider;
-}
-
-/// Zig 0.17.0 尚未提供 `std.mem.stripIfStartsWith`，因此在此集中實作
-/// 相同語意：前綴相符時回傳剩餘字串，不相符則回傳 null。
-/// 把版本相容細節留在這個小 helper，可讓上方 provider parser 維持易讀。
-fn stripProviderPrefix(value: []const u8, prefix: []const u8) ?[]const u8 {
-    if (!std.mem.startsWith(u8, value, prefix)) return null;
-    return value[prefix.len..];
 }
 
 /// 從 static 或 file 的文字取得 IP，並保證它符合被要求的 family。
@@ -471,9 +463,4 @@ test "configured static provider isolates the requested family" {
 
 test "file provider text accepts first non-comment ip line" {
     try std.testing.expectEqualStrings("203.0.113.42", firstIpLine("# test fixture\n\n 203.0.113.42\r\n"));
-}
-
-test "provider prefix helper returns only matching suffix" {
-    try std.testing.expectEqualStrings("203.0.113.42", stripProviderPrefix("static:203.0.113.42", "static:").?);
-    try std.testing.expect(stripProviderPrefix("stun", "static:") == null);
 }

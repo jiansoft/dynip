@@ -100,7 +100,7 @@ If you are coming from other ecosystems, the rough mental model is:
 
 ## Requirements
 
-- Zig `0.17.0-dev` or later
+- Zig `0.18.0-dev` or later (see `minimum_zig_version` in `build.zig.zon`)
 - Network access to public IP sources
 - Network access to the DDNS providers you enable
 - Redis only if you want Redis-backed duplicate prevention
