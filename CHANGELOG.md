@@ -31,6 +31,22 @@
     `std.time.timestamp()` 不存在、有號整數格式化成 `+2026`、Jetzig scaffold 相依無法編譯，
     在 0.18 仍然成立，因此對應的寫法維持不變。
 
+- **stdout / stderr 改為依日期寫檔：`log/YYYY-MM-DD_dynip_stdout.log`。**
+
+  原本 `control.sh start` 用 `nohup ... >>log/general_stdout.log` 啟動，shell 重導向在啟動時就
+  綁死同一個檔案，服務久不重啟就會無限長大（正式機已累積 3.8 MB），`control.sh` 只能在下次
+  `start` 前依大小輪轉。
+
+  - 新增 `src/io/logging/stdio.zig`：設定 `logging.stdio_to_file`（環境變數 `LOG_STDIO_TO_FILE`）
+    為 true 時，程式在讀完設定後與每次跨日時，用 `dup2` 把 fd 1 / 2 換到當天的檔案。
+    panic 這類直接寫 stderr 的輸出也會落在當天的檔案。
+  - 檔名沿用 `log/*.log` 的日期規則，過期檔案由既有的清理機制依 `max_age_days` 一併刪除。
+  - `control.sh start` 帶 `LOG_STDIO_TO_FILE=true` 啟動，並移除原本的 `rotate_stdout_log`
+    與 `STDOUT_LOG_MAX_SIZE_MB` / `STDOUT_LOG_KEEP`。預設關閉，Docker 模式不受影響。
+  - `scripts/deploy-armv7.ps1` 的驗證步驟改看當天的 info / stdout log。
+  - 已在 Raspberry Pi 上實測跨日換檔：模擬兩個日期，輸出分別落在兩個日期的檔案。
+  - 舊的 `log/general_stdout.log` 不再寫入，可手動刪除。
+
 ### 修正
 
 - **armv7（Raspberry Pi）上所有 Unix 時間戳都是錯的。**

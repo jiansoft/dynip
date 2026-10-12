@@ -27,10 +27,19 @@ export docker_container_name="dynip-container"
 # 背景執行中程序的 pid，`stop`/`restart` 靠這個檔案找到程序。
 export general_pid_file="$script_dir/dynip.pid"
 
-# 一般模式下 binary 自己的 stdout/stderr 導向的檔案。
-# 注意：程式本身的日誌另外寫在 `log/*.log`（見 src/io/logging.zig），
-# 這裡只是保留 panic 或啟動失敗時來不及進 logger 的輸出。
-export general_stdout_log="$script_dir/log/general_stdout.log"
+# 一般模式下 binary 自己的 stdout/stderr 依日期寫在 `log/YYYY-MM-DD_dynip_stdout.log`。
+#
+# 程式本身的日誌另外寫在 `log/*.log`（見 src/io/logging.zig）；這個檔收的是 console 輸出
+# （受 `.env` 的 LOG_CONSOLE_LEVEL 過濾），以及 panic、logger 初始化前的錯誤。
+#
+# 跨日換檔由程式自己處理：start 時帶 `LOG_STDIO_TO_FILE=true`，程式每到新的一天就用
+# dup2 把 fd 1/2 換到新日期的檔案。shell 的 `>>` 重導向只能在啟動當下綁定一個檔案，
+# 做不到這件事。過期的檔案和其他 `log/*.log` 一樣，依 LOG_MAX_AGE_DAYS 自動刪除。
+#
+# 舊版的單一檔 `log/general_stdout.log` 已不再寫入，確認不需要後可直接刪除。
+general_stdout_log_path() {
+  printf '%s/log/%s_dynip_stdout.log' "$script_dir" "$(date +%F)"
+}
 
 # 開發機交叉編譯好的執行檔上傳到這裡（scp 到 /tmp），`move` 再從這裡搬到 script_dir。
 #
@@ -118,43 +127,6 @@ general_detect_binary_name() {
   esac
 }
 
-# 啟動前輪轉 general_stdout.log，避免它無上限成長。
-#
-# 這個檔收的是程式的 stdout/stderr（下面 nohup 的重導向），內容和 `log/*.log`
-# 幾乎重複 —— 程式的 console 輸出與檔案日誌是同一批訊息。差別在於 `log/*.log`
-# 由程式自己輪轉與清理，這個檔卻沒有任何人管，只會一直 append。
-#
-# 只能在啟動前處理：服務跑起來之後，重導向綁的是已開啟的 fd（inode），
-# 這裡改名或刪檔都不會讓執行中的程序改寫到新檔。
-# 想從源頭少寫一點，請把 `.env` 的 LOG_CONSOLE_LEVEL 調成 warn 或 error。
-rotate_stdout_log() {
-  local max_mb="${STDOUT_LOG_MAX_SIZE_MB:-10}"
-  local keep="${STDOUT_LOG_KEEP:-3}"
-  local max_bytes size backup old
-
-  # 0 或負數代表停用這個輪轉。
-  [ "$max_mb" -gt 0 ] 2>/dev/null || return 0
-  [ -f "$general_stdout_log" ] || return 0
-
-  max_bytes=$((max_mb * 1024 * 1024))
-  size="$(stat -c %s "$general_stdout_log" 2>/dev/null || echo 0)"
-  [ "$size" -gt "$max_bytes" ] || return 0
-
-  backup="$general_stdout_log.$(date "+%Y%m%d-%H%M%S")"
-  mv "$general_stdout_log" "$backup"
-  log "general_stdout.log 已達 $((size / 1024 / 1024)) MB，備份為 $(basename "$backup")"
-
-  # 只保留最近 $keep 份備份，其餘刪掉。
-  #
-  # 依「檔名的時間戳」排序而不是 mtime：備份是用 mv 改名，mtime 保留的是原檔
-  # 最後一次寫入的時間，不是備份當下的時間，拿 mtime 排會把剛備份的檔排錯位置。
-  # 檔名格式 %Y%m%d-%H%M%S 單調遞增，字典序反排即是由新到舊。
-  ls -1 "$general_stdout_log".* 2>/dev/null | sort -r | tail -n "+$((keep + 1))" | while read -r old; do
-    rm -f "$old"
-    log "已刪除過舊的 stdout 備份: $(basename "$old")"
-  done
-}
-
 start() {
   # pid file 存在且該 pid 還活著，代表服務已經在跑，不用重複啟動。
   if [ -f "$general_pid_file" ] && kill -0 "$(cat "$general_pid_file")" 2>/dev/null; then
@@ -171,13 +143,13 @@ start() {
   fi
   chmod +x "$bin_path"
   mkdir -p "$script_dir/log"
-  rotate_stdout_log
 
   log "啟動服務（背景執行，登出後不會中止）: $bin_path"
   cd "$script_dir"
   # `nohup` 讓程序忽略登出時的 SIGHUP；`</dev/null` 避免它嘗試讀取已經消失的終端機輸入；
   # `disown` 把它從目前 shell 的 job table 移除，雙重保險避免登出時被牽連關閉。
-  nohup "$bin_path" service --config app.json >>"$general_stdout_log" 2>&1 </dev/null &
+  # 啟動當下先導向當天的檔案，接住程式讀完設定前的輸出；之後的跨日換檔由程式負責。
+  LOG_STDIO_TO_FILE=true nohup "$bin_path" service --config app.json >>"$(general_stdout_log_path)" 2>&1 </dev/null &
   local pid=$!
   disown "$pid" 2>/dev/null || true
   echo "$pid" > "$general_pid_file"
@@ -305,8 +277,6 @@ help() {
   echo "  UPLOAD_BIN_DIR      - 上傳目錄，預設 /tmp"
   echo "  UPLOAD_BIN_FILE     - 直接指定新執行檔的完整路徑（優先於 UPLOAD_BIN_DIR）"
   echo "  STOP_WAIT_SECONDS   - stop 等待舊程序結束的秒數上限，預設 60"
-  echo "  STDOUT_LOG_MAX_SIZE_MB - start 前輪轉 general_stdout.log 的大小門檻，預設 10（0 停用）"
-  echo "  STDOUT_LOG_KEEP     - general_stdout.log 保留的備份份數，預設 3"
   echo
   echo "Dashboard 環境變數:"
   echo "  DASHBOARD_HOST_PORT - host 對外 port，預設 9003"

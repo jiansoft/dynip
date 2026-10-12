@@ -12,7 +12,7 @@
          檔名不對只會回報「找不到可部署的執行檔」。
       3. -WithConfig 時另外同步 app.json 與 .env（move 只搬執行檔）。
       4. ssh 執行 control.sh update（stop → 等待舊程序結束 → move → start）。
-      5. 驗證：pid file 指向的程序活著、dashboard 埠有回應、stdout log 尾巴。
+      5. 驗證：pid file 指向的程序活著、dashboard 埠有回應、當天 info / stdout log 尾巴。
 
     這支腳本不建置，要連建置一起做請加 -Build（會呼叫同目錄的 build.ps1）。
     回滾：move 會把舊執行檔備份成 <名稱>.<時間戳> 並拿掉執行權限，
@@ -215,8 +215,10 @@ if [ "$DashboardPort" -gt 0 ]; then
 else
   echo 'skipped'
 fi
+echo "--- info log ---"
+tail -n 5 $RemoteBase/log/`$(date +%F)_dynip_info.log 2>/dev/null
 echo "--- stdout log ---"
-tail -n 5 $RemoteBase/log/general_stdout.log 2>/dev/null
+tail -n 5 $RemoteBase/log/`$(date +%F)_dynip_stdout.log 2>/dev/null
 "@
 $result = Invoke-Remote $verify
 $result | ForEach-Object { Write-Host "  $_" }

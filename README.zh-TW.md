@@ -285,6 +285,7 @@ DDNS:Provider:noip
 - `LOG_FILE_LEVEL`
 - `LOG_MAX_AGE_DAYS`
 - `LOG_MAX_SIZE_MB`
+- `LOG_STDIO_TO_FILE`（`control.sh start` 會自動帶 `true`，見下方「stdout 日誌」）
 - `LOG_SEQ_ENABLED`
 - `LOG_SEQ_LEVEL`
 - `LOG_SEQ_SERVER_URL`
@@ -551,18 +552,19 @@ bash control.sh update    # 完整更新：stop -> move -> start
 - `UPLOAD_BIN_DIR`：上傳目錄，預設 `/tmp`
 - `UPLOAD_BIN_FILE`：直接指定新執行檔的完整路徑，優先於 `UPLOAD_BIN_DIR`
 - `STOP_WAIT_SECONDS`：`stop` 等待舊程序結束的秒數上限，預設 `60`
-- `STDOUT_LOG_MAX_SIZE_MB`：`start` 前輪轉 `log/general_stdout.log` 的大小門檻，預設 `10`（`0` 停用）
-- `STDOUT_LOG_KEEP`：`log/general_stdout.log` 保留的備份份數，預設 `3`
 
-### `log/general_stdout.log` 為什麼會變大
+### stdout 日誌：`log/YYYY-MM-DD_dynip_stdout.log`
 
-這個檔收的是程式的 stdout/stderr（`start` 的 `nohup ... >>` 重導向），內容和 `log/*.log`
-幾乎重複——程式的 console 輸出與檔案日誌本來就是同一批訊息。差別在於 `log/*.log` 由程式
-自己輪轉與清理，而這個檔沒有任何人管，只會一直 append，跑幾週就會累積到數十 MB。
+一般模式下，程式的 stdout/stderr 依日期寫在 `log/YYYY-MM-DD_dynip_stdout.log`。
+內容是 console 輸出（受 `LOG_CONSOLE_LEVEL` 過濾），以及 panic、logger 初始化前的錯誤
+這類來不及進 `log/*.log` 的輸出。
 
-`control.sh start` 會在啟動前檢查它，超過 `STDOUT_LOG_MAX_SIZE_MB` 就改名備份，
-並只保留最近 `STDOUT_LOG_KEEP` 份。只能在啟動前處理：服務跑起來後，重導向綁的是已開啟的
-fd（inode），改名或刪檔都不會讓執行中的程序改寫到新檔。
+shell 的 `nohup ... >>檔案` 只能在啟動當下綁定一個檔案，服務久不重啟就會無限長大。
+所以 `control.sh start` 會帶 `LOG_STDIO_TO_FILE=true` 啟動，由程式自己在跨日時用 `dup2`
+把 fd 1/2 換到新日期的檔案。檔名沿用 `log/*.log` 的日期規則，過期的檔案會依
+`LOG_MAX_AGE_DAYS` 一併自動刪除。
 
-想從源頭少寫一點，把 `.env` 的 `LOG_CONSOLE_LEVEL` 調成 `warn` 或 `error`；
-檔案日誌與 Seq 不受影響，仍由 `LOG_FILE_LEVEL` 與 `LOG_SEQ_LEVEL` 各自控制。
+- Docker 模式不要開 `LOG_STDIO_TO_FILE`，否則 `docker logs` 會看不到輸出。
+- 舊版的單一檔 `log/general_stdout.log` 已不再寫入，確認不需要後可直接刪除。
+- 想從源頭少寫一點，把 `.env` 的 `LOG_CONSOLE_LEVEL` 調成 `warn` 或 `error`；
+  檔案日誌與 Seq 不受影響，仍由 `LOG_FILE_LEVEL` 與 `LOG_SEQ_LEVEL` 各自控制。

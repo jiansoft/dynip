@@ -12,6 +12,7 @@
 //! - `logging/format.zig`：本地時間取得、log 行格式化、console 輸出。
 //! - `logging/rotate.zig`：依日期與大小輪轉檔案、清除過期日誌。
 //! - `logging/seq.zig`：把同一筆 log 以 CLEF 格式送到 Seq。
+//! - `logging/stdio.zig`：把行程的 stdout / stderr 依日期導向 `log/` 下的檔案。
 //!
 //! 這一層做的事：
 //! - 依日誌等級分成 `info`、`warn`、`error`、`debug` 四個檔案，各自一個 `Rotate`。
@@ -33,11 +34,15 @@ const rotate_mod = @import("logging/rotate.zig");
 /// Seq 遠端日誌推送。
 const seq_mod = @import("logging/seq.zig");
 
+/// stdout / stderr 依日期導向檔案。
+const stdio_mod = @import("logging/stdio.zig");
+
 // 讓子模組的測試也被 `zig build test` 收進來。
 test {
     _ = format_mod;
     _ = rotate_mod;
     _ = seq_mod;
+    _ = stdio_mod;
 
     // Zig 是惰性分析：沒有被引用到的函式不會做語意檢查。
     // `Logger` 與這裡的公開 API 只有 exe 路徑（`cli.zig`）才會用到，
@@ -103,6 +108,8 @@ const Logger = struct {
     seq_sink: ?seq_mod.SeqSink = null,
     /// 避免 Seq 故障時每筆 log 都在 console 洗版。
     seq_failure_reported: bool = false,
+    /// stdout / stderr 依日期導向檔案的狀態；預設停用。
+    stdio: stdio_mod.StdioRedirect = .{},
 
     /// 關閉 logger 裡所有已開啟檔案。
     fn deinit(self: *Logger) void {
@@ -147,6 +154,10 @@ const Logger = struct {
         // 寫檔前上鎖，避免多個 log 同時寫入造成內容交錯。
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+
+        // 跨日時先把 stdout / stderr 換到新日期的檔案，`logFn` 接著寫 console 時就會落在新檔。
+        // 同一天只是比較日期欄位，不產生 syscall。
+        self.stdio.ensure(self.io, now);
 
         if (shouldWriteLevel(level, self.file_level)) {
             // 找到這個 level 對應的檔案輪替器。
@@ -224,8 +235,11 @@ pub fn configure(
         logger.error_rotate.max_size_bytes = logger.max_size_bytes;
         logger.debug_rotate.max_size_bytes = logger.max_size_bytes;
         logger.seq_sink = try seq_mod.SeqSink.init(allocator, io, logging_config.seq, default_log_name);
+        logger.stdio.enabled = logging_config.stdio_to_file;
 
         if (format_mod.localNow()) |now| {
+            // 設定一讀完就導向，不必等到下一筆 log。
+            logger.stdio.ensure(logger.io, now);
             logger.info_rotate.cleanupOldFiles(logger.io, now);
         } else |_| {}
     }

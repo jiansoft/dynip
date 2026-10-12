@@ -179,6 +179,12 @@ pub const Logging = struct {
     /// 程式再開一個同名的空檔繼續寫（詳見 `src/io/logging.zig`）。
     /// 有效值會收斂到 1 MB ～ 1024 MB。
     max_size_mb: i64 = 10,
+    /// 是否把行程的 stdout / stderr 依日期導向 `log/YYYY-MM-DD_dynip_stdout.log`。
+    ///
+    /// 給 `control.sh` 這類「用 nohup 重導向到檔案」的背景執行方式使用：
+    /// shell 重導向在啟動時就綁死一個檔案，服務久不重啟就會無限長大。
+    /// Docker 模式不要開，否則 `docker logs` 會看不到輸出。Windows 上無作用。
+    stdio_to_file: bool = false,
     /// Seq HTTP ingestion 設定。
     seq: SeqLogging = .{},
 };
@@ -518,6 +524,7 @@ const env_overrides = [_]EnvOverride{
     .{ .key = "LOG_FILE_LEVEL", .field = "logging.file_level", .kind = .str },
     .{ .key = "LOG_MAX_AGE_DAYS", .field = "logging.max_age_days", .kind = .i64 },
     .{ .key = "LOG_MAX_SIZE_MB", .field = "logging.max_size_mb", .kind = .i64 },
+    .{ .key = "LOG_STDIO_TO_FILE", .field = "logging.stdio_to_file", .kind = .bool },
     .{ .key = "LOG_SEQ_ENABLED", .field = "logging.seq.enabled", .kind = .bool },
     .{ .key = "LOG_SEQ_LEVEL", .field = "logging.seq.level", .kind = .str },
     .{ .key = "LOG_SEQ_SERVER_URL", .field = "logging.seq.server_url", .kind = .str },
@@ -780,6 +787,7 @@ test "dotenv text overrides config values" {
         \\DASHBOARD_HOST=127.0.0.1
         \\DASHBOARD_PORT=18080
         \\LOG_CONSOLE_LEVEL=debug
+        \\LOG_STDIO_TO_FILE=true
         \\LOG_FILE_LEVEL=info
         \\LOG_MAX_AGE_DAYS=14
         \\LOG_MAX_SIZE_MB=32
@@ -817,6 +825,7 @@ test "dotenv text overrides config values" {
     try std.testing.expectEqualStrings("127.0.0.1", config.dashboard.host);
     try std.testing.expectEqual(@as(u32, 18080), config.dashboard.port);
     try std.testing.expectEqualStrings("debug", config.logging.console_level);
+    try std.testing.expect(config.logging.stdio_to_file);
     try std.testing.expectEqualStrings("info", config.logging.file_level);
     try std.testing.expectEqual(@as(i64, 14), config.logging.max_age_days);
     try std.testing.expectEqual(@as(i64, 32), config.logging.max_size_mb);

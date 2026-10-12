@@ -285,6 +285,7 @@ When `ddns.redis.enabled = false`:
 - `LOG_FILE_LEVEL`
 - `LOG_MAX_AGE_DAYS`
 - `LOG_MAX_SIZE_MB`
+- `LOG_STDIO_TO_FILE` (`control.sh start` sets it to `true`; see "stdout log" below)
 - `LOG_SEQ_ENABLED`
 - `LOG_SEQ_LEVEL`
 - `LOG_SEQ_SERVER_URL`
@@ -558,20 +559,20 @@ Environment variables:
 - `UPLOAD_BIN_DIR`: upload directory, default `/tmp`
 - `UPLOAD_BIN_FILE`: explicit full path to the new binary, takes precedence over `UPLOAD_BIN_DIR`
 - `STOP_WAIT_SECONDS`: upper bound in seconds for `stop` to wait for the old process, default `60`
-- `STDOUT_LOG_MAX_SIZE_MB`: size threshold for rotating `log/general_stdout.log` before `start`, default `10` (`0` disables it)
-- `STDOUT_LOG_KEEP`: how many `log/general_stdout.log` backups to keep, default `3`
 
-### Why `log/general_stdout.log` keeps growing
+### stdout log: `log/YYYY-MM-DD_dynip_stdout.log`
 
-That file captures the process stdout/stderr (the `nohup ... >>` redirection in `start`), which
-largely duplicates `log/*.log` — console output and file logs are the same messages. The difference
-is that `log/*.log` is rotated and cleaned up by the program itself, while nothing manages this
-file, so it only ever grows; after a few weeks it reaches tens of megabytes.
+In general mode the process stdout/stderr goes to `log/YYYY-MM-DD_dynip_stdout.log`, one file per
+day. It holds console output (filtered by `LOG_CONSOLE_LEVEL`) plus anything that cannot reach
+`log/*.log`, such as panics and errors before the logger is initialized.
 
-`control.sh start` checks it before launching: past `STDOUT_LOG_MAX_SIZE_MB` it is renamed to a
-timestamped backup and only the newest `STDOUT_LOG_KEEP` backups are kept. This can only happen
-before launch — once the service is running, the redirection is bound to an already-open fd
-(inode), so renaming or deleting the file does not redirect the running process.
+A shell `nohup ... >>file` redirection is bound to a single file at launch, so it grows without
+bound when the service runs for a long time. `control.sh start` therefore launches with
+`LOG_STDIO_TO_FILE=true`, and the program itself uses `dup2` to point fd 1/2 at the new day's file
+when the date changes. The filename follows the same date scheme as `log/*.log`, so expired files are
+deleted automatically according to `LOG_MAX_AGE_DAYS`.
 
-To write less at the source, set `LOG_CONSOLE_LEVEL` to `warn` or `error` in `.env`; file logs and
-Seq are unaffected and stay controlled by `LOG_FILE_LEVEL` and `LOG_SEQ_LEVEL`.
+- Do not enable `LOG_STDIO_TO_FILE` in Docker mode, or `docker logs` will show nothing.
+- The old single `log/general_stdout.log` is no longer written; delete it once you no longer need it.
+- To write less at the source, set `LOG_CONSOLE_LEVEL` to `warn` or `error` in `.env`; file logs and
+  Seq are unaffected and stay controlled by `LOG_FILE_LEVEL` and `LOG_SEQ_LEVEL`.
